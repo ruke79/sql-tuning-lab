@@ -116,5 +116,63 @@ echo "  ①→② 에서 시간이 줄고 ②가 ④보다 빨라졌다면, 결�
 echo "  ②→③ 의 이득이 작다면, 남은 비용은 B-tree 하강 자체이므로 ②에서 멈추는 것이 옳다."
 echo "  (probe 74,024회 × 약 3 buffers ≈ 222,000 이 NL 의 하한이다)"
 echo
+
+# ── 3) 병목이 옮겨간 orders probe 에 같은 기법을 적용한다 ─────────────
+echo "════════════════════════════════════════════════════════════════"
+echo "이어서: orders probe (②를 적용하면 여기가 새 병목이 된다)"
+echo "════════════════════════════════════════════════════════════════"
+echo
+
+setidx "$IDX_COMBINED"   # ② 상태로 고정
+run_sql "SET client_min_messages=warning;
+         DROP INDEX IF EXISTS idx_ord_custkey_orderdate;
+         CREATE INDEX IF NOT EXISTS idx_orders_custkey ON orders(o_custkey);
+         ANALYZE orders;" >/dev/null 2>&1
+one "SET enable_nestloop=on;" >/dev/null
+
+show_orders() {
+  run_sql "SET enable_nestloop=on; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) $QUERY" \
+    | awk '/on orders/{f=1} f{print; if(/Buffers: shared hit/) exit}' \
+    | grep -E "on orders|Index Cond|Filter:|Rows Removed|Buffers: shared hit" | sed 's/^ */  /'
+}
+echo "[개선 전]"; show_orders; echo
+
+# 결합 인덱스를 만들어도 옵티마이저가 쓰지 않는다는 것을 보여준다
+run_sql "CREATE INDEX idx_ord_custkey_orderdate ON orders (o_custkey, o_orderdate); ANALYZE orders;" >/dev/null 2>&1
+one "SET enable_nestloop=on;" >/dev/null
+echo "[결합 인덱스를 만든 직후 — 좁은 인덱스가 아직 남아 있음]"; show_orders
+echo "  ↑ 만들었는데도 좁은 인덱스를 계속 쓴다면, 그것이 이 실습의 핵심이다."
+echo "     추정 비용 차이가 2% 미만이라 더 작은 쪽이 이긴다:"
+run_sql "EXPLAIN $QUERY" | grep -E "Index Scan.*orders" | sed 's/^ */       /'
+echo
+
+run_sql "SET client_min_messages=warning; DROP INDEX IF EXISTS idx_orders_custkey; ANALYZE orders;" >/dev/null 2>&1
+one "SET enable_nestloop=on;" >/dev/null
+echo "[좁은 인덱스를 지운 뒤]"; show_orders; echo
+
+# orders 단계 시간 비교 (교차)
+D=""; E=""
+for r in $(seq 1 "$ROUNDS"); do
+  run_sql "SET client_min_messages=warning; DROP INDEX IF EXISTS idx_ord_custkey_orderdate;
+           CREATE INDEX IF NOT EXISTS idx_orders_custkey ON orders(o_custkey); ANALYZE orders;" >/dev/null 2>&1
+  one "SET enable_nestloop=on;" >/dev/null
+  D="$D $(one 'SET enable_nestloop=on;')"
+  run_sql "SET client_min_messages=warning; DROP INDEX IF EXISTS idx_orders_custkey;
+           CREATE INDEX IF NOT EXISTS idx_ord_custkey_orderdate ON orders(o_custkey,o_orderdate); ANALYZE orders;" >/dev/null 2>&1
+  one "SET enable_nestloop=on;" >/dev/null
+  E="$E $(one 'SET enable_nestloop=on;')"
+  printf "."
+done
+echo; echo
+stat "$D" "② orders 좁은 인덱스"
+stat "$E" "③ orders 결합 인덱스"
+echo
+echo "해석:"
+echo "  (A) 와 (A,B) 가 공존하면 PostgreSQL 은 '더 작다'는 이유로 좁은 쪽을 계속 고른다."
+echo "  (A) 는 (A,B) 의 선행 부분집합이라 기능적으로 중복인데도 그렇다."
+echo "  → 넓은 인덱스를 만들었다면 좁은 것을 반드시 지워야 한다."
+echo
 echo "정리:"
-echo "  psql -d tpch -c 'DROP INDEX IF EXISTS idx_li_orderkey_shipdate, idx_li_cover;'"
+echo "  psql -d tpch -c \"DROP INDEX IF EXISTS idx_li_orderkey_shipdate, idx_li_cover,"
+echo "                    idx_ord_custkey_orderdate;"
+echo "                    CREATE INDEX IF NOT EXISTS idx_orders_custkey ON orders(o_custkey);\""
