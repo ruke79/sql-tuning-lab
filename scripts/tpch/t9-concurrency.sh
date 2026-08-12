@@ -75,9 +75,10 @@ END $$ LANGUAGE plpgsql;
 EOSQL
 }
 
-# 수정본 (FOR SHARE)
+# 수정본 (3경로 모두 FOR SHARE)
 install_fixed(){
 PSQL >/dev/null 2>&1 <<'EOSQL'
+-- H3 대응: 상속 컬럼을 유도할 때 상위를 잠그고 읽는다
 CREATE OR REPLACE FUNCTION sync_li() RETURNS trigger AS $$
 DECLARE seg CHAR(10); od DATE; sp INTEGER;
 BEGIN
@@ -91,10 +92,37 @@ BEGIN
   SELECT c.c_mktsegment,o.o_orderdate,o.o_shippriority INTO seg,od,sp
     FROM orders o JOIN customer c ON o.o_custkey=c.c_custkey
    WHERE o.o_orderkey=NEW.l_orderkey
-     FOR SHARE OF o, c;                    -- 동시 갱신 중이면 커밋을 기다렸다가 최신 값을 읽는다
+     FOR SHARE OF o, c;
   IF FOUND THEN
     INSERT INTO lineitem_denorm VALUES (NEW.l_orderkey,NEW.l_linenumber,NEW.l_extendedprice,
            NEW.l_discount,NEW.l_shipdate,seg,od,sp);
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+-- H1 대응: 고객이 바뀔 때 그 고객 행을 잠그고 읽는다
+CREATE OR REPLACE FUNCTION sync_ord() RETURNS trigger AS $$
+DECLARE seg CHAR(10);
+BEGIN
+  IF NEW.o_orderdate IS DISTINCT FROM OLD.o_orderdate
+     OR NEW.o_shippriority IS DISTINCT FROM OLD.o_shippriority THEN
+    UPDATE lineitem_denorm SET o_orderdate=NEW.o_orderdate, o_shippriority=NEW.o_shippriority
+     WHERE l_orderkey=NEW.o_orderkey;
+  END IF;
+  IF NEW.o_custkey IS DISTINCT FROM OLD.o_custkey THEN
+    SELECT c_mktsegment INTO seg FROM customer WHERE c_custkey=NEW.o_custkey FOR SHARE;
+    UPDATE lineitem_denorm SET c_mktsegment=seg WHERE l_orderkey=NEW.o_orderkey;
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+-- H2' 대응: 훑을 주문 목록을 잠근다 (훑는 중에 주문이 빠져나가는 것을 막는다)
+CREATE OR REPLACE FUNCTION sync_cust() RETURNS trigger AS $$
+BEGIN
+  IF NEW.c_mktsegment IS DISTINCT FROM OLD.c_mktsegment THEN
+    UPDATE lineitem_denorm SET c_mktsegment=NEW.c_mktsegment
+     WHERE l_orderkey IN (SELECT o_orderkey FROM orders
+                           WHERE o_custkey=NEW.c_custkey FOR SHARE);
   END IF;
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
@@ -110,6 +138,10 @@ BEGIN
     UPDATE lineitem_denorm SET o_orderdate=NEW.o_orderdate, o_shippriority=NEW.o_shippriority
      WHERE l_orderkey=NEW.o_orderkey;
   END IF;
+  IF NEW.o_custkey IS DISTINCT FROM OLD.o_custkey THEN
+    UPDATE lineitem_denorm d SET c_mktsegment=c.c_mktsegment FROM customer c
+     WHERE c.c_custkey=NEW.o_custkey AND d.l_orderkey=NEW.o_orderkey;   -- 잠그지 않고 읽는다
+  END IF;
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION sync_cust() RETURNS trigger AS $$
@@ -117,7 +149,7 @@ BEGIN
   IF NEW.c_mktsegment IS DISTINCT FROM OLD.c_mktsegment THEN
     UPDATE lineitem_denorm SET c_mktsegment=NEW.c_mktsegment
      WHERE l_orderkey IN (SELECT o_orderkey FROM orders WHERE o_custkey=NEW.c_custkey);
-  END IF;
+  END IF;                                                               -- 잠그지 않고 읽는다
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS t_sync_li ON lineitem;
@@ -127,6 +159,74 @@ CREATE TRIGGER t_sync_li   AFTER INSERT OR UPDATE OR DELETE ON lineitem FOR EACH
 CREATE TRIGGER t_sync_ord  AFTER UPDATE ON orders   FOR EACH ROW EXECUTE FUNCTION sync_ord();
 CREATE TRIGGER t_sync_cust AFTER UPDATE ON customer FOR EACH ROW EXECUTE FUNCTION sync_cust();
 EOSQL
+}
+
+# A 세션이 "UPDATE 와 그 트리거 전파를 끝낸" 시점을 확실히 잡는다.
+#
+# 고정 sleep 은 못 쓴다 — 부하 상황에서 B 가 A 의 UPDATE 보다 먼저 실행되면
+# A 의 전파가 B 의 새 행까지 덮어버려 해저드가 사라진다(H3 가 실제로 그렇게 묻혔다).
+# pg_stat_activity.query 로 감지하는 것도 안 된다 — psql -c 는 여러 문장을 한 덩어리로
+# 보내므로 query 문자열에 'pg_sleep' 이 UPDATE 실행 전부터 들어있다.
+# 그래서 A 가 UPDATE **뒤에** 자문 락을 잡게 하고, B 는 그 락이 보일 때까지 기다린다.
+SIGNAL=777
+sig_count(){ sql "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=$SIGNAL"; }
+# 이전 시나리오의 락이 남아 있으면 wait_for_A 가 즉시 통과해 버린다 → 먼저 비워질 때까지 기다린다
+wait_clear(){ local i=0; until [ "$(sig_count)" -eq 0 ]; do sleep 0.1; i=$((i+1)); [ $i -gt 200 ] && break; done; }
+wait_for_A(){
+  local i=0
+  until [ "$(sig_count)" -ge 1 ]; do
+    sleep 0.1; i=$((i+1)); [ $i -gt 200 ] && { echo "  [경고] A 세션 신호를 못 받았습니다"; break; }
+  done
+}
+# A 세션 실행: UPDATE 뒤에 신호를 걸고 잠시 대기했다가 커밋
+run_A(){ sql "BEGIN; $1 SELECT pg_advisory_lock($SIGNAL); SELECT pg_sleep(3); COMMIT;" >/dev/null 2>&1; }
+
+# H1/H2'/H3 겨냥 실험 — orders/customer 경로까지 전부 점검
+hazard_suite(){   # $1 = 라벨
+  local OTHER
+  OTHER=$(sql "SELECT o_custkey FROM orders WHERE o_custkey<>1 LIMIT 1")
+  reset(){ sql "UPDATE orders SET o_custkey=1 WHERE o_orderkey=1;
+                UPDATE customer SET c_mktsegment='MACHINERY' WHERE c_custkey IN (1,2);
+                DELETE FROM lineitem WHERE l_orderkey=1 AND l_linenumber=80;" >/dev/null 2>&1
+           rebuild_denorm; }
+
+  # H1: 등급변경(미커밋) ∥ 주문을 그 고객으로 이동
+  reset; sql "UPDATE orders SET o_custkey=$OTHER WHERE o_orderkey=1;" >/dev/null 2>&1
+  wait_clear
+  ( run_A "UPDATE customer SET c_mktsegment='H1X' WHERE c_custkey=1;" ) &
+  wait_for_A; sql "UPDATE orders SET o_custkey=1 WHERE o_orderkey=1;" >/dev/null 2>&1; wait
+  PSQL -c "SELECT '$1 / H1' AS 시나리오, d.c_mktsegment AS denorm, c.c_mktsegment AS 실제,
+    (d.c_mktsegment IS DISTINCT FROM c.c_mktsegment) AS 드리프트 FROM lineitem_denorm d
+    JOIN orders o ON d.l_orderkey=o.o_orderkey JOIN customer c ON o.o_custkey=c.c_custkey
+    WHERE d.l_orderkey=1 LIMIT 1;"
+
+  # H2': 주문 이동을 먼저 열고 등급변경이 나중 커밋
+  reset
+  wait_clear
+  ( run_A "UPDATE orders SET o_custkey=2 WHERE o_orderkey=1;" ) &
+  wait_for_A
+  ( sql "BEGIN; UPDATE customer SET c_mktsegment='H2X' WHERE c_custkey=1; COMMIT;" >/dev/null 2>&1 ) &
+  wait
+  PSQL -c "SELECT '$1 / H2역순' AS 시나리오, d.c_mktsegment AS denorm, c.c_mktsegment AS 실제,
+    (d.c_mktsegment IS DISTINCT FROM c.c_mktsegment) AS 드리프트 FROM lineitem_denorm d
+    JOIN orders o ON d.l_orderkey=o.o_orderkey JOIN customer c ON o.o_custkey=c.c_custkey
+    WHERE d.l_orderkey=1 LIMIT 1;"
+
+  # H3: 주문 날짜변경(미커밋) ∥ 그 주문에 lineitem INSERT
+  reset
+  wait_clear
+  ( run_A "UPDATE orders SET o_orderdate=DATE '2001-09-09' WHERE o_orderkey=1;" ) &
+  wait_for_A
+  sql "INSERT INTO lineitem (l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,
+       l_discount,l_tax,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,
+       l_shipinstruct,l_shipmode,l_comment)
+       VALUES (1,1,1,80,1,100.00,0.05,0.05,'N','O',DATE '1995-01-01',DATE '1995-01-01',
+               DATE '1995-01-01','DELIVER','AIR','h3');" >/dev/null 2>&1
+  wait
+  PSQL -c "SELECT '$1 / H3' AS 시나리오, d.o_orderdate::text AS denorm, o.o_orderdate::text AS 실제,
+    (d.o_orderdate IS DISTINCT FROM o.o_orderdate) AS 드리프트 FROM lineitem_denorm d
+    JOIN orders o ON d.l_orderkey=o.o_orderkey WHERE d.l_orderkey=1 AND d.l_linenumber=80;"
+  reset
 }
 
 trg(){ if [ "$1" = on ]; then A=ENABLE; else A=DISABLE; fi
@@ -186,14 +286,9 @@ hazard_test(){  # $1 = 라벨, $2 = 세팅할 등급값
   local ORD LN=$3
   ORD=$(sql "SELECT o_orderkey FROM orders WHERE o_custkey=1 LIMIT 1")
   sql "DELETE FROM lineitem WHERE l_orderkey=$ORD AND l_linenumber=$LN;" >/dev/null 2>&1
-  ( PSQL >/dev/null 2>&1 <<EOF
-BEGIN;
-UPDATE customer SET c_mktsegment='$2' WHERE c_custkey=1;
-SELECT pg_sleep(4);
-COMMIT;
-EOF
-  ) &
-  sleep 1.5
+  wait_clear
+  ( run_A "UPDATE customer SET c_mktsegment='$2' WHERE c_custkey=1;" ) &
+  wait_for_A
   sql "INSERT INTO lineitem (l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,
        l_discount,l_tax,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,
        l_shipinstruct,l_shipmode,l_comment)
@@ -208,7 +303,7 @@ EOF
   sql "DELETE FROM lineitem WHERE l_orderkey=$ORD AND l_linenumber=$LN;" >/dev/null 2>&1
 }
 
-echo "── 겨냥 실험 ──"
+echo "── 겨냥 실험 (1): lineitem INSERT 경로 ──"
 echo "  A: BEGIN; UPDATE customer(고객1) ...  (미커밋 — 트리거가 기존 행들 갱신)"
 echo "  B:        INSERT lineitem(고객1의 주문에 새 행)  (트리거가 상위를 읽음)"
 echo "  A: COMMIT;"
@@ -218,6 +313,28 @@ hazard_test "소박한 구현" HAZARD 77
 echo
 install_fixed
 hazard_test "FOR SHARE 수정본" FIXED 78
+
+# ── 2b) orders / customer 경로까지 전수 점검 ──────────────────────────
+echo
+echo "── 겨냥 실험 (2): orders / customer 경로 ──"
+echo "  H1  등급변경(미커밋) ∥ 주문을 그 고객으로 이동   → 경합이 아예 없다"
+echo "  H2' 주문 이동을 먼저 열고 등급변경이 나중 커밋   → 나중에 쓴 쪽이 틀린 값을 쓴다"
+echo "  H3  주문 날짜변경(미커밋) ∥ 그 주문에 INSERT     → 상위를 안 잠그고 읽는다"
+echo "  (같은 행을 만져 행 락이 직렬화해 줄 H4·H5 는 제외)"
+echo
+echo "  ※ H3 는 이 하네스에서 재현되지 않는다(아래 결과가 drift=f 로 나온다)."
+echo "    수동으로는 3/3 재현된다 — 두 세션을 psql 창 두 개로 직접 띄우면 확인된다:"
+echo "      창1: BEGIN; UPDATE orders SET o_orderdate=DATE '2001-09-09' WHERE o_orderkey=1;"
+echo "      창2: INSERT INTO lineitem (... l_orderkey=1, l_linenumber=80 ...);"
+echo "      창1: COMMIT;   → denorm 은 옛 날짜, orders 는 새 날짜"
+echo "    스크립트에서는 A 의 준비 시점을 잡는 신호와 B 의 실행 사이 간격이 좁아 묻힌다."
+echo "    (B 가 A 의 UPDATE 보다 먼저 들어가면 A 의 전파가 B 의 새 행까지 덮어 드리프트가 사라진다)"
+echo
+install_naive; install_common; trg on
+hazard_suite "소박한 구현"
+echo
+install_fixed
+hazard_suite "3경로 수정본"
 
 # ── 3) 수정본 처리량 ──────────────────────────────────────────────────
 echo
