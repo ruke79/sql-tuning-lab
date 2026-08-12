@@ -260,8 +260,8 @@ ON CONFLICT DO NOTHING;
 END;
 EOF
 
-bench(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -f /tmp/t9_concurrent.sql \
-           -c "$CLIENTS" -j 4 -T "$SECS" -n 2>&1 | grep -E "^tps|latency average"; }
+bench(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner -f /tmp/t9_concurrent.sql \
+           -c "$CLIENTS" -j 4 -T "$SECS" -n tpch 2>&1 | grep -E "^tps|latency average"; }
 
 echo "§T-9 동시성 — ${CLIENTS} clients / ${SECS}초"
 echo
