@@ -1,0 +1,20 @@
+spring:
+  main:
+    web-application-type: none
+
+clickhouse:
+  datasource:
+    url: jdbc:clickhouse://localhost:8123/default
+    username: tuner
+    password: tuner
+
+# GH Archive 다운로드 원본
+gharchive:
+  base-url: https://data.gharchive.org
+
+logging:
+  level:
+    root: info
+    com.tuninglab: info
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level %logger{0} - %msg%n"

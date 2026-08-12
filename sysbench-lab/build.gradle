@@ -1,0 +1,13 @@
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    implementation project(':common')
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    runtimeOnly "com.mysql:mysql-connector-j:${mysqlDriverVersion}"
+}
+
+springBoot {
+    mainClass = 'com.tuninglab.sysbench.SysbenchApplication'
+}

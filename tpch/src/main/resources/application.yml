@@ -1,0 +1,22 @@
+spring:
+  main:
+    web-application-type: none
+
+# --db=postgres | mysql 선택에 따라 사용할 접속 정보
+tpch:
+  datasource:
+    postgres:
+      url: jdbc:postgresql://localhost:5432/tpch?reWriteBatchedInserts=true
+      username: tuner
+      password: tuner
+    mysql:
+      url: jdbc:mysql://localhost:3306/tpch?rewriteBatchedStatements=true&useSSL=false&allowPublicKeyRetrieval=true
+      username: tuner
+      password: tuner
+
+logging:
+  level:
+    root: info
+    com.tuninglab: info
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level %logger{0} - %msg%n"

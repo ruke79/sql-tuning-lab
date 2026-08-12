@@ -1,0 +1,21 @@
+spring:
+  main:
+    web-application-type: none
+
+tpcds:
+  datasource:
+    postgres:
+      url: jdbc:postgresql://localhost:5432/tpcds?reWriteBatchedInserts=true
+      username: tuner
+      password: tuner
+    mysql:
+      url: jdbc:mysql://localhost:3306/tpcds?rewriteBatchedStatements=true&useSSL=false&allowPublicKeyRetrieval=true
+      username: tuner
+      password: tuner
+
+logging:
+  level:
+    root: info
+    com.tuninglab: info
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level %logger{0} - %msg%n"

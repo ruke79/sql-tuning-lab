@@ -1,0 +1,69 @@
+version: "3.8"
+
+# SQL Tuning Lab - 벤치마크용 DB 3종
+#   PostgreSQL : TPC-H / TPC-DS / pgbench (OLAP + OLTP)
+#   MySQL      : TPC-H / TPC-DS / sysbench (OLAP + OLTP)
+#   ClickHouse : GitHub Archive (Columnar OLAP)
+#
+# 시작:  docker compose up -d
+# 중지:  docker compose down        (데이터 유지)
+#        docker compose down -v     (데이터까지 삭제)
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: tuninglab-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: tuner
+      POSTGRES_PASSWORD: tuner
+      POSTGRES_DB: tuninglab
+    command:
+      - "postgres"
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    shm_size: 1g          # parallel hash join 등에서 공유메모리 부족 방지
+
+  mysql:
+    image: mysql:8.4
+    container_name: tuninglab-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_USER: tuner
+      MYSQL_PASSWORD: tuner
+      MYSQL_DATABASE: tuninglab
+    command:
+      - "--local-infile=1"
+    volumes:
+      - mysqldata:/var/lib/mysql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/tuning.cnf:ro
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: tuninglab-clickhouse
+    ports:
+      - "8123:8123"   # HTTP (JDBC 기본)
+      - "9000:9000"   # Native TCP
+    environment:
+      CLICKHOUSE_USER: tuner
+      CLICKHOUSE_PASSWORD: tuner
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - chdata:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  pgdata:
+  mysqldata:
+  chdata:

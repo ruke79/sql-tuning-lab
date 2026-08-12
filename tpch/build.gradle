@@ -1,0 +1,14 @@
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    implementation project(':common')
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    runtimeOnly "org.postgresql:postgresql:${postgresqlDriverVersion}"
+    runtimeOnly "com.mysql:mysql-connector-j:${mysqlDriverVersion}"
+}
+
+springBoot {
+    mainClass = 'com.tuninglab.tpch.TpchApplication'
+}

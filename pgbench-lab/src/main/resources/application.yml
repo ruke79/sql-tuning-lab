@@ -1,0 +1,16 @@
+spring:
+  main:
+    web-application-type: none
+
+pgbench:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/pgbench_lab?reWriteBatchedInserts=true
+    username: tuner
+    password: tuner
+
+logging:
+  level:
+    root: info
+    com.tuninglab: info
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level %logger{0} - %msg%n"

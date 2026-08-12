@@ -1,0 +1,15 @@
+pluginManagement {
+    repositories {
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'sql-tuning-lab'
+
+include 'common'
+include 'tpch'
+include 'tpcds'
+include 'pgbench-lab'
+include 'sysbench-lab'
+include 'clickhouse-lab'

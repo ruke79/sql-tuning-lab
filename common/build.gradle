@@ -1,0 +1,9 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    api 'org.springframework:spring-jdbc'
+    api 'com.zaxxer:HikariCP'
+    api 'org.slf4j:slf4j-api'
+}
