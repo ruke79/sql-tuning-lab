@@ -27,7 +27,10 @@ SECS="${2:-20}"
 PGHOST_="${PGHOST:-localhost}"
 PGPORT_="${PGPORT:-5432}"
 
-PSQL(){ PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
+# export 해야 pgbench(아래 bench())도 같은 자격증명을 쓴다. 함수 안에만 두면 pgbench 가
+# 인증에 실패해 tps 가 빈 값으로 나온다.
+export PGPASSWORD=tuner
+PSQL(){ psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
 sql(){ PSQL -tAc "$1"; }
 
 # ── 선행 조건 점검 ────────────────────────────────────────────────────

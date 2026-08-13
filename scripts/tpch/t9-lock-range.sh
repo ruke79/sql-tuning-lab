@@ -6,8 +6,8 @@
 # 문제가 안 보이지만, 실무에는 주문 수천 건짜리 대형 계정이 있다.
 #
 # 이 스크립트가 답하는 질문
-#   1) 잠그는 행이 많아지면 FOR SHARE 자체가 느려지는가?      → 아니다 (단일 세션은 공짜)
-#   2) 그럼 비용은 어디서 나오는가?                            → 경합. 피해자가 통째로 막힌다
+#   1) 잠그는 행이 많아지면 FOR SHARE 자체가 느려지는가?      → 그렇다. 5,000행에서 약 1.45배
+#   2) 그럼 비용의 대부분은 어디서 나오는가?                   → 경합. 피해자가 통째로 막힌다
 #   3) 대기 길이가 고객 크기에 비례하는가?                     → 아니다. 크기는 "막히는 범위"를 키운다
 #   4) 그래서 처리량 손해는 무엇을 따라가는가?                 → 워크로드가 잠긴 범위와 겹치는 비율
 #
@@ -22,8 +22,14 @@ set -uo pipefail
 
 PGHOST_="${PGHOST:-localhost}"
 PGPORT_="${PGPORT:-5432}"
-PSQL(){ PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
+# PGPASSWORD 은 export 한다. pgbench 도 이 환경변수를 쓰고, timeout 으로 감쌀 psql 도
+# 셸 함수가 아니라 실제 명령이어야 하기 때문이다(아래 tsql 주석 참고).
+export PGPASSWORD=tuner
+PSQL(){ psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
 sql(){ PSQL -tAc "$1"; }
+# timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
+#   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
+tsql(){ timeout "$1" psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q -tAc "$2"; }
 
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
 [ "${NIDX:-0}" -lt 2 ] && { echo "  [중단] index 를 먼저 실행하세요."; exit 1; }
@@ -80,7 +86,11 @@ mn(){ echo "$1"|tr ' ' '\n'|grep -v '^$'|sort -g|head -1; }
 
 # ── ① 단일 세션 비용 ──────────────────────────────────────────────────
 echo "── ① 단일 세션: 잠그는 행이 많아지면 FOR SHARE 가 느려지는가 ──"
-one(){ PSQL -c "\timing on" -c "BEGIN; UPDATE customer SET c_mktsegment='S'||(random()*9)::int
+# 등급값은 시퀀스로 매번 다르게 만든다. random() 로는 새 값이 옛 값과 같아
+# IS DISTINCT FROM 가드에 걸려 트리거가 no-op 이 되는 시행이 섞이고,
+# **최소값을 취하는 순간 정확히 그 no-op 만 골라내게 된다**(정정 목록 11번).
+sql "DROP SEQUENCE IF EXISTS seg_seq; CREATE SEQUENCE seg_seq;" >/dev/null 2>&1
+one(){ PSQL -c "\timing on" -c "BEGIN; UPDATE customer SET c_mktsegment='S'||nextval('seg_seq')
                                  WHERE c_custkey=1; ROLLBACK;" 2>/dev/null \
         | grep -m1 "^Time:" | grep -oE "[0-9]+\.[0-9]+"; }
 printf "  %-10s %-11s %11s %12s %8s\n" "주문수" "denorm행" "naive(ms)" "FOR SHARE" "배수"
@@ -92,7 +102,8 @@ for N in 10 100 1000 5000; do
   a=$(mn "$A"); b=$(mn "$B")
   printf "  %-10s %-11s %11s %12s %8s\n" "$N" "$LD" "$a" "$b" "$(awk -v x=$a -v y=$b 'BEGIN{printf "%.2f배",y/x}')"
 done
-echo "  → 시간이 늘어난 것은 denorm 행 갱신 비용이지 락 비용이 아니다. 혼자 돌면 FOR SHARE 는 공짜."
+echo "  → 몸통은 denorm 행 갱신 비용이 맞다. 다만 같은 행 수에서 비교하면 1,000건 이상에서"
+echo "     1.4~1.5배가 붙는다 — 행 공유 락 획득 비용은 실재한다. 단, 아래 경합 비용보다는 작다."
 echo
 
 # ── ② 경합 비용 ───────────────────────────────────────────────────────
@@ -103,7 +114,7 @@ for T in sync_cust_naive sync_cust_fs; do
   usetrg $T
   ( sql "BEGIN; UPDATE customer SET c_mktsegment='LK' WHERE c_custkey=1; SELECT pg_sleep(5); ROLLBACK;" >/dev/null 2>&1 ) &
   sleep 2.5
-  s=$(date +%s%N); timeout 20 sql "UPDATE orders SET o_shippriority=7 WHERE o_orderkey=$V;" >/dev/null 2>&1; e=$(date +%s%N)
+  s=$(date +%s%N); tsql 20 "UPDATE orders SET o_shippriority=7 WHERE o_orderkey=$V;" >/dev/null 2>&1; e=$(date +%s%N)
   printf "  %-18s 무관한 UPDATE orders 소요: %6d ms\n" "$T" $(( (e-s)/1000000 ))
   wait
 done
