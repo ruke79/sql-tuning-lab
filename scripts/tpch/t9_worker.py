@@ -9,12 +9,20 @@
 
 의존성: psycopg2  (pip install psycopg2-binary)
 
+세 가지 깨우는 방식
+  poll     : 큐가 비면 고정 간격으로 잠들었다 다시 본다
+  notify   : 알림이 올 때까지 블록한다 (즉시 기동)
+  debounce : 알림이 오면 **곧바로 처리하지 않고** 창(window) 동안 더 모은 뒤 한 번에 처리한다
+             → 쓰기가 잦을 때 notify 가 트랜잭션마다 깨어나 바쁜 폴링으로 퇴화하는 것을 막는다.
+               대가는 창 길이만큼의 지연이다.
+
 사용:
-  ./t9_worker.py --mode poll   --sleep-ms 20 --batch 2000 --secs 30 --stats /tmp/w.txt
-  ./t9_worker.py --mode notify --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode poll     --sleep-ms 20    --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode notify                    --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode debounce --debounce-ms 20 --batch 2000 --secs 30 --stats /tmp/w.txt
 
 --stats 파일에는 "처리배치수 빈폴링수 처리항목수" 를 한 줄로 남긴다.
-빈 폴링 수 = 큐가 비어 있는데 깨어나 헛일한 횟수 = 폴링이 낭비하는 왕복.
+빈 폴링 수 = 큐가 비어 있는데 깨어나 헛일한 횟수 = 깨우는 방식이 낭비하는 왕복.
 """
 import argparse, select, signal, time, sys
 
@@ -25,8 +33,9 @@ except ImportError:
     sys.exit(2)
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--mode', choices=['poll', 'notify'], default='poll')
+ap.add_argument('--mode', choices=['poll', 'notify', 'debounce'], default='poll')
 ap.add_argument('--sleep-ms', type=float, default=20.0)
+ap.add_argument('--debounce-ms', type=float, default=20.0)
 ap.add_argument('--batch', type=int, default=2000)
 ap.add_argument('--secs', type=float, default=30.0)
 ap.add_argument('--host', default='localhost')
@@ -38,7 +47,7 @@ conn = psycopg2.connect(host=a.host, port=a.port, user='tuner', password='tuner'
 # autocommit: 배치 하나가 곧 트랜잭션 하나다 (plpgsql 워커의 COMMIT 과 같은 단위).
 conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 cur = conn.cursor()
-if a.mode == 'notify':
+if a.mode in ('notify', 'debounce'):
     cur.execute("LISTEN denorm_q")
 
 deadline = time.monotonic() + a.secs
@@ -74,18 +83,31 @@ while time.monotonic() < deadline:
         time.sleep(min(a.sleep_ms / 1000.0, remaining))
         continue
 
-    # ── notify: 알림이 올 때까지 블록한다 ──
+    # ── notify / debounce: 알림을 기다린다 ──
     # 놓친 알림이 없도록 순서가 중요하다.
-    #   1) 이미 도착해 버퍼에 있는 알림을 먼저 확인한다(있으면 즉시 재시도).
+    #   1) 이미 도착해 버퍼에 있는 알림을 먼저 확인한다.
     #   2) 없으면 소켓에서 기다린다. drain 과 select 사이에 도착한 알림은
     #      소켓 버퍼에 남아 select 가 곧바로 readable 로 보고하므로 유실되지 않는다.
-    # 타임아웃은 깨우는 수단이 아니라 종료 판정용 안전장치일 뿐이다.
+    # 타임아웃은 깨우는 수단이 아니라 안전장치일 뿐이다 — 알림은 저장되지 않으므로
+    # (워커가 죽어 있는 동안 발행된 알림은 사라진다) 주기적으로 큐를 직접 확인해야 한다.
     conn.poll()
-    if conn.notifies:
+    got = bool(conn.notifies)
+    if got:
         del conn.notifies[:]
-        continue
-    if select.select([conn], [], [], min(0.5, remaining))[0]:
-        conn.poll()
-        del conn.notifies[:]
+    else:
+        if select.select([conn], [], [], min(0.5, remaining))[0]:
+            conn.poll()
+            got = bool(conn.notifies)
+            del conn.notifies[:]
+
+    # debounce: 첫 알림을 받았어도 곧바로 처리하지 않고 창 동안 더 모은다.
+    # notify 는 트랜잭션마다 깨어나므로 쓰기가 잦으면 한 건씩 처리하며 왕복만 늘어난다.
+    # 창을 두면 그 사이 커밋된 변경들이 한 배치로 묶인다. 대가는 창 길이만큼의 지연.
+    if a.mode == 'debounce' and got:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(a.debounce_ms / 1000.0, remaining))
+            conn.poll()
+            del conn.notifies[:]
 
 write_stats()
