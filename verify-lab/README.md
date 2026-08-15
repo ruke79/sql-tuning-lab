@@ -98,6 +98,8 @@ docker compose -f docker/verify/compose.yaml up -d kafka
 ```
 
 이 환경 실행 결과: **7건 전부 CONFIRMED** (로컬 KRaft 3.9.1).
+
+![Kafka 섹션](../docs/img/grafana-kafka-section.png)
 결과는 같은 `verify_result` 테이블에 적재되므로 Grafana 대시보드에
 `kafka` 분류가 수정 없이 그대로 나타난다.
 
