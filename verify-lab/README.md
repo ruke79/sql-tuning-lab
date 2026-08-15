@@ -46,9 +46,18 @@ docker compose -f docker/verify/compose.yaml up -d
 # http://localhost:3000  (admin/admin) → "Verification Lab"
 ```
 
-대시보드 구성: 판정별 stat(CONFIRMED/REFUTED/INCONCLUSIVE/ERROR) · 합격률 ·
-분류별 판정 막대 · 실행별 합격률 추이 · 케이스별 결과 테이블(필터 가능) ·
-느린 케이스 Top 10 · 실행 이력.
+대시보드 구성(3개 섹션):
+- **전체 요약** — 판정별 stat 4종 · 합격률 · 분류별 판정 막대 · 실행별 합격률 추이
+- **케이스 상세** — 케이스별 결과 테이블(필터 가능) · 느린 케이스 Top 10 · 실행 이력
+- **Kafka(실물 브로커)** — 케이스 수 · CONFIRMED · **미판정 수(브로커 부재 신호)** ·
+  마지막 실행 시각 · 케이스별 결과 · 소요시간 · 분류별 총 소요시간 비교
+
+상단 `분류` 변수로 특정 분류만 걸러 볼 수 있다.
+
+> **"최근 실행"의 정의**: `verify-lab` 과 `verify-lab-kafka` 는 서로 다른 `run_id` 로 적재된다.
+> 그래서 패널들은 "가장 최근 run_id 하나"가 아니라 **분류별 최신 실행**을 본다 —
+> 그러지 않으면 나중에 돌린 모듈만 보이고 다른 모듈이 통째로 사라진다(실제로 그랬다).
+> `-Dverify.only=` 로 골라 돌린 실행(`*-selected`)은 전체 그림에서 제외한다.
 
 로컬 PostgreSQL 을 쓰는 경우 Grafana 만 띄운다:
 
