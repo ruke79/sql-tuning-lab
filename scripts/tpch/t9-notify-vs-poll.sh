@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §T-9 확장: 워커를 어떻게 깨울 것인가 — 폴링 / NOTIFY / 고정 창 / 적응형 창 비교.
+# §T-9 확장: 워커를 어떻게 깨울 것인가 — NOTIFY / 고정 창 / 적응형(시간) / 적응형(큐깊이).
 #
 # t9-queue-tuning.sh 는 저부하(-R 200)에서 배치 100/2000 둘 다 57~59ms 가 나왔다.
 # 배치와 무관하게 바닥이 잡혀 있다는 뜻이고, 유력한 용의자는 워커의 **20ms 고정 sleep** 이다.
@@ -11,16 +11,20 @@
 #      쓰기가 잦아지면 NOTIFY 가 트랜잭션마다 깨어나 바쁜 폴링으로 퇴화하는가?
 #      그렇다면 **디바운스**(첫 알림 후 창 동안 더 모았다가 한 번에 처리)가 그걸 되돌리는가?
 #      고정 창은 한산할 때 순손해였다 — **적응형 창**(대기 시간을 그때그때 계산)이 그걸 없애는가?
+#      적응형은 시간만 보므로 일이 쌓여 있어도 기다린다 — **큐 깊이 신호**가 그걸 없애는가?
 #   ③ NOTIFY 는 공짜인가?                          → 아니다. 쓰기 경로에 1.6배가 붙는다
 #
-# 네 방식이 겨루는 지점
+# 다섯 방식이 겨루는 지점
 #   폴링      : 지연 하한 = 간격/2. 간격을 줄이면 지연은 주지만 헛왕복이 폭증한다
 #   NOTIFY    : 지연 하한이 사라진다. 대신 **쓰기 트랜잭션 수만큼** 깨어난다
 #   고정 창    : 알림으로 깨우되 창을 두어 여러 알림을 한 번에 접는다.
 #              바쁠 때는 왕복이 줄지만, 한산할 때는 모을 것이 없어 지연만 붙는다
-#   적응형 창  : 창 대신 **drain 사이 최소 간격**을 보장한다. 대기 시간을 계산하므로
+#   적응형(시간): 창 대신 **drain 사이 최소 간격**을 보장한다. 대기 시간을 계산하므로
 #              한산하면 0 을 기다리고(=NOTIFY), 바쁘면 자동으로 모은다(=고정 창).
-#              "한 설정으로 두 구간을 다 감당하는가"가 이 절의 질문이다
+#              약점은 시간만 본다는 것 — 일이 쌓여 있어도 간격을 채운다
+#   적응형(큐깊이): 남은 깊이 >= 임계치면 페이싱을 건너뛰고 즉시 다음 배치를 간다.
+#              깊이는 drain 이 함께 돌려주므로 **추가 왕복이 없다**.
+#              "기다려도 더 모을 게 없을 때만 기다린다"가 목적이다
 #
 # 적체 구간(워커가 못 따라잡는 상태)에서의 비교는 **이 스크립트로 재현하지 못했다.**
 # 편중 워크로드로 적체를 만들려 했으나 워커가 배치를 한 번도 적용하지 못한 채 큐가 비는
@@ -28,7 +32,7 @@
 # 적체가 지배하며 배치 크기조차 총 처리량을 못 바꾼다. 여기서의 재현은 남은 과제다.
 #
 # 공정성을 위한 설계
-#   · 네 방식이 **같은 클라이언트(t9_worker.py)** 로 돈다. plpgsql vs 파이썬을 비교하면
+#   · 모든 방식이 **같은 클라이언트(t9_worker.py)** 로 돈다. plpgsql vs 파이썬을 비교하면
 #     깨우는 방식이 아니라 언어와 왕복 비용을 비교하게 된다.
 #   · ①② 는 **전부 NOTIFY 를 발행하는 트리거**로 돈다(poll 워커는 무시할 뿐).
 #     그래야 쓰기 경로가 동일해져 지연 차이만 남는다. NOTIFY 의 쓰기 비용은 ③에서 따로 잰다.
@@ -55,7 +59,7 @@ NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
 [ "${NIDX:-0}" -lt 2 ] && { echo "  [중단] index 를 먼저 실행하세요."; exit 1; }
 python3 -c "import psycopg2" 2>/dev/null || { echo "  [중단] pip install psycopg2-binary"; exit 1; }
 
-echo "§T-9 워커를 깨우는 방식 4파 비교 — ${CLIENTS} clients / ${SECS}초 / $(nproc) CPU / ${ROUNDS}라운드 교차"
+echo "§T-9 워커를 깨우는 방식 비교 — ${CLIENTS} clients / ${SECS}초 / $(nproc) CPU / ${ROUNDS}라운드 교차"
 echo
 
 # ── 스키마 (t9-queue-tuning.sh 와 동일 + NOTIFY 판) ───────────────────
@@ -129,7 +133,16 @@ BEGIN
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION denorm_drain(batch INT DEFAULT 500) RETURNS INT AS $$
+-- 반환형이 int → record 로 바뀌었다. CREATE OR REPLACE 는 **반환형을 바꿀 수 없으므로**
+-- 명시적으로 DROP 해야 한다. 처음에 이걸 빼먹었는데 heredoc 이 2>/dev/null 이라 에러가
+-- 조용히 삼켜졌고, 옛 함수가 그대로 남아 워커가 매 루프 실패했다(전 지표 0 — 정정 목록 15번).
+DROP FUNCTION IF EXISTS denorm_drain(INT);
+
+-- applied 와 함께 **남은 큐 깊이**를 돌려준다. 깊이를 따로 조회하면 왕복이 하나 더 드는데,
+-- 그러면 "왕복을 줄이려는 제어"가 스스로 왕복을 만드는 자가당착이 된다.
+-- 깊이를 안 쓰는 모드도 같은 함수를 호출하므로 이 추가 비용은 모든 모드가 똑같이 낸다.
+CREATE OR REPLACE FUNCTION denorm_drain(batch INT DEFAULT 500,
+                                        OUT applied INT, OUT depth INT) AS $$
 DECLARE ck BIGINT[]; ok BIGINT[]; lk BIGINT[]; ln INT[];
         n INT; ci INT; cknt INT; al NUMERIC; ml NUMERIC;
 BEGIN
@@ -144,7 +157,7 @@ BEGIN
          array_agg(DISTINCT k1) FILTER (WHERE kind='ord'),
          array_agg(k1) FILTER (WHERE kind='line'), array_agg(k2) FILTER (WHERE kind='line')
     INTO n, ci, cknt, al, ml, ck, ok, lk, ln FROM claimed;
-  IF n = 0 THEN RETURN 0; END IF;
+  IF n = 0 THEN applied := 0; depth := 0; RETURN; END IF;
   IF ck IS NOT NULL THEN
     UPDATE lineitem_denorm d SET c_mktsegment = cu.c_mktsegment
       FROM orders o JOIN customer cu ON o.o_custkey = cu.c_custkey
@@ -173,7 +186,8 @@ BEGIN
           o_shippriority=EXCLUDED.o_shippriority;
   END IF;
   INSERT INTO denorm_stat(applied,cust_items,cust_keys,avg_lag,max_lag) VALUES (n,ci,cknt,al,ml);
-  RETURN n;
+  applied := n;
+  depth := (SELECT count(*) FROM denorm_queue);
 END $$ LANGUAGE plpgsql;
 EOSQL
 
@@ -248,7 +262,7 @@ run_case(){   # $1=모드지정("poll:20"|"notify") $2=목표rate("" 면 무제�
   local m="${1%%:*}" v="${1##*:}"; [ "$m" = notify ] && v=0
   rm -f /tmp/t9n_w.txt
   python3 "$HERE/t9_worker.py" --mode "$m" --sleep-ms "$v" --debounce-ms "$v" \
-      --min-interval-ms "$v" --batch 2000 \
+      --min-interval-ms "$v" --depth-threshold 500 --batch 2000 \
       --secs $((SECS+25)) --host "$PGHOST_" --port "$PGPORT_" --stats /tmp/t9n_w.txt \
       >/dev/null 2>&1 & local WP=$!
   sleep 0.4
@@ -286,12 +300,13 @@ show(){ printf "  %-16s %7s %8s %-12s %8s %8s %8s %9s\n" "$2" \
         "$(med "$(col "$1" 3)")" "$(med "$(col "$1" 8)")" "$(med "$(col "$1" 5)")" \
         "$(med "$(col "$1" 9)")"; }
 
-MODES=("poll:20" "notify" "debounce:5" "debounce:20" "adaptive:5" "adaptive:20")
+MODES=("notify" "debounce:20" "adaptive:5" "adaptive:20" "qdepth:5" "qdepth:20")
 lbl(){ case $1 in poll:200) echo "폴링 200ms";; poll:20) echo "폴링 20ms";;
                   poll:1) echo "폴링 1ms";; notify) echo "NOTIFY";;
                   debounce:5) echo "고정창 5ms";; debounce:20) echo "고정창 20ms";;
                   debounce:50) echo "고정창 50ms";;
-                  adaptive:5) echo "적응형 5ms";; adaptive:20) echo "적응형 20ms";; esac; }
+                  adaptive:5) echo "적응형 5ms";; adaptive:20) echo "적응형 20ms";;
+                  qdepth:5) echo "큐깊이 5ms";; qdepth:20) echo "큐깊이 20ms";; esac; }
 
 # ── ① 아주 낮은 부하 ──────────────────────────────────────────────────
 echo "── ① 저부하(-R 50) · 자연 분포 · 배치 2000 (${ROUNDS}라운드 중앙값) ──"
