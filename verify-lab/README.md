@@ -70,6 +70,23 @@ curl -X POST "localhost:8080/verify/run-and-store?category=db" # 분류만
 | `wal_level=logical` | DB-10(CDC) 논리 디코딩 | DB-10 만 판정 불가 |
 | 스트리밍 레플리카 (`REPLICA_PORT` 또는 `verify.replica.url`) | DB-24(복제 지연 / read-your-writes) | DB-24 가 INCONCLUSIVE 로 남는다 (비결정 케이스라 실패는 아니다) |
 
+## :verify-lab-kafka — Kafka 실물 검증 8케이스 (별도 모듈)
+
+MSA 답변을 흉내가 아니라 **실물 브로커**로 검증한다 — 파티션 순서 보증, 컨슈머 랙,
+DLQ 재처리, Exactly-Once, 리밸런스와 오토스케일 한계, 핫 파티션, Avro 스키마 호환성.
+
+```bash
+# 브로커: 도커 또는 로컬 KRaft (둘 중 하나)
+docker compose -f docker/verify/compose.yaml up -d kafka
+./scripts/verify/kafka-local.sh start          # Docker 없이 (이 세션의 검증 방식)
+
+./gradlew :verify-lab-kafka:test               # 브로커 없으면 실패가 아니라 '건너뜀'
+```
+
+이 환경 실행 결과: **7건 전부 CONFIRMED** (로컬 KRaft 3.9.1).
+결과는 같은 `verify_result` 테이블에 적재되므로 Grafana 대시보드에
+`kafka` 분류가 수정 없이 그대로 나타난다.
+
 ## 원본과 달라진 것
 
 - 원본 verify-labs 의 11개 분류 중 5개만 이식 — security/graphql/redis/wiremock/otel 의존성 제거

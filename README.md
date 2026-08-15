@@ -177,6 +177,9 @@ docker compose -f docker/verify/compose.yaml up -d
 # → http://localhost:3000 (admin/admin) → "Verification Lab"
 ```
 
+Kafka 검증(`:verify-lab-kafka`, 실물 브로커 8케이스 중 7건 등록)도 있다 —
+`./scripts/verify/kafka-local.sh start` (Docker 없이) 또는 compose 의 kafka 서비스.
+
 자세한 내용: [`verify-lab/README.md`](verify-lab/README.md)
 
 ## DB 파라미터 튜닝
