@@ -1,189 +1,809 @@
 {
   "uid": "verify-lab",
   "title": "Verification Lab",
-  "tags": ["verify", "sql-tuning-lab"],
+  "tags": [
+    "verify",
+    "sql-tuning-lab"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "refresh": "30s",
-  "time": { "from": "now-7d", "to": "now" },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
         "name": "category",
         "label": "분류",
         "type": "query",
-        "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+        "datasource": {
+          "type": "postgres",
+          "uid": "verifylab-pg"
+        },
         "query": "SELECT DISTINCT category FROM verify_result ORDER BY 1",
         "multi": true,
         "includeAll": true,
-        "current": { "text": "All", "value": "$__all" },
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
         "refresh": 1
       }
     ]
   },
   "panels": [
     {
-      "type": "row", "title": "전체 요약 (분류별 최신 실행 기준)", "id": 100,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false, "panels": []
+      "type": "row",
+      "title": "전체 요약 (분류별 최신 실행 기준)",
+      "id": 100,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
     },
     {
-      "type": "stat", "title": "CONFIRMED", "id": 1,
+      "type": "stat",
+      "title": "CONFIRMED",
+      "id": 1,
       "description": "verify-lab 과 verify-lab-kafka 는 서로 다른 run_id 로 적재된다. 그래서 '최근 실행'을 run_id 하나가 아니라 분류별 최신 실행으로 정의한다 — 그러지 않으면 나중에 돌린 모듈만 보인다.",
-      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='CONFIRMED'" }]
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='CONFIRMED'"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "REFUTED", "id": 2,
-      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='REFUTED'" }]
+      "type": "stat",
+      "title": "REFUTED",
+      "id": 2,
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='REFUTED'"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "INCONCLUSIVE", "id": 3,
-      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "yellow" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='INCONCLUSIVE'" }]
+      "type": "stat",
+      "title": "INCONCLUSIVE",
+      "id": 3,
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "yellow"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='INCONCLUSIVE'"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "ERROR", "id": 4,
-      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "dark-red" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='ERROR'" }]
+      "type": "stat",
+      "title": "ERROR",
+      "id": 4,
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "dark-red"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT count(*) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) AND v.verdict='ERROR'"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "합격률 (acceptable)", "id": 5,
-      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 1 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "unit": "percent", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 90 }, { "color": "green", "value": 100 } ] } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT round(100.0*count(*) FILTER (WHERE v.acceptable)/nullif(count(*),0),1) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category)" }]
+      "type": "stat",
+      "title": "합격률 (acceptable)",
+      "id": 5,
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 90
+              },
+              {
+                "color": "green",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT round(100.0*count(*) FILTER (WHERE v.acceptable)/nullif(count(*),0),1) FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category)"
+        }
+      ]
     },
     {
-      "type": "barchart", "title": "분류별 판정", "id": 6,
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "options": { "stacking": "normal", "xTickLabelRotation": 0 },
-      "fieldConfig": { "defaults": {}, "overrides": [
-        { "matcher": { "id": "byName", "options": "confirmed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] },
-        { "matcher": { "id": "byName", "options": "refuted" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
-        { "matcher": { "id": "byName", "options": "inconclusive" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } } ] },
-        { "matcher": { "id": "byName", "options": "error" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "dark-red" } } ] }
-      ] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.category, count(*) FILTER (WHERE verdict='CONFIRMED') AS confirmed, count(*) FILTER (WHERE verdict='REFUTED') AS refuted, count(*) FILTER (WHERE verdict='INCONCLUSIVE') AS inconclusive, count(*) FILTER (WHERE verdict='ERROR') AS error FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) GROUP BY v.category ORDER BY v.category" }]
+      "type": "barchart",
+      "title": "분류별 판정",
+      "id": 6,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "options": {
+        "stacking": "normal",
+        "xTickLabelRotation": 0
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "confirmed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "refuted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "inconclusive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "error"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.category, count(*) FILTER (WHERE verdict='CONFIRMED') AS confirmed, count(*) FILTER (WHERE verdict='REFUTED') AS refuted, count(*) FILTER (WHERE verdict='INCONCLUSIVE') AS inconclusive, count(*) FILTER (WHERE verdict='ERROR') AS error FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) GROUP BY v.category ORDER BY v.category"
+        }
+      ]
     },
     {
-      "type": "timeseries", "title": "실행별 합격률 추이", "id": 7,
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "showPoints": "always" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "time_series", "rawSql": "SELECT min(run_at) AS time, round(100.0*count(*) FILTER (WHERE acceptable)/count(*),1) AS \"합격률\" FROM verify_result WHERE $__timeFilter(run_at) AND category IN ($category) GROUP BY run_id ORDER BY time" }]
+      "type": "timeseries",
+      "title": "실행별 합격률 추이",
+      "id": 7,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "showPoints": "always"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT min(run_at) AS time, round(100.0*count(*) FILTER (WHERE acceptable)/count(*),1) AS \"합격률\" FROM verify_result WHERE $__timeFilter(run_at) AND category IN ($category) GROUP BY run_id ORDER BY time"
+        }
+      ]
     },
     {
-      "type": "row", "title": "케이스 상세", "id": 101,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }, "collapsed": false, "panels": []
+      "type": "row",
+      "title": "케이스 상세",
+      "id": 101,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "collapsed": false,
+      "panels": []
     },
     {
-      "type": "table", "title": "케이스별 결과 (분류별 최신 실행)", "id": 8,
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "custom": { "filterable": true } }, "overrides": [
-        { "matcher": { "id": "byName", "options": "verdict" }, "properties": [
-          { "id": "mappings", "value": [ { "type": "value", "options": {
-            "CONFIRMED": { "color": "green", "index": 0 },
-            "REFUTED": { "color": "red", "index": 1 },
-            "INCONCLUSIVE": { "color": "yellow", "index": 2 },
-            "ERROR": { "color": "dark-red", "index": 3 } } } ] },
-          { "id": "custom.cellOptions", "value": { "type": "color-background" } } ] },
-        { "matcher": { "id": "byName", "options": "elapsed_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] }
-      ] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.case_id, v.category, v.verdict, v.elapsed_ms, v.question, v.expectations FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) ORDER BY v.category, v.case_id" }]
+      "type": "table",
+      "title": "케이스별 결과 (분류별 최신 실행)",
+      "id": 8,
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "verdict"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "CONFIRMED": {
+                        "color": "green",
+                        "index": 0
+                      },
+                      "REFUTED": {
+                        "color": "red",
+                        "index": 1
+                      },
+                      "INCONCLUSIVE": {
+                        "color": "yellow",
+                        "index": 2
+                      },
+                      "ERROR": {
+                        "color": "dark-red",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "elapsed_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.case_id, v.category, v.verdict, v.elapsed_ms, v.question, v.expectations FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) ORDER BY v.category, v.case_id"
+        }
+      ]
     },
     {
-      "type": "barchart", "title": "느린 케이스 Top 10", "id": 9,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "options": { "orientation": "horizontal" },
-      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.case_id, v.elapsed_ms FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) ORDER BY v.elapsed_ms DESC LIMIT 10" }]
+      "type": "barchart",
+      "title": "느린 케이스 Top 10",
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "options": {
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.case_id, v.elapsed_ms FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id WHERE v.category IN ($category) ORDER BY v.elapsed_ms DESC LIMIT 10"
+        }
+      ]
     },
     {
-      "type": "table", "title": "실행 이력", "id": 10,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": {}, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT min(run_at) AS \"실행시각\", string_agg(DISTINCT category, ',') AS \"분류\", max(trigger_kind) AS \"트리거\", count(*) AS \"케이스\", count(*) FILTER (WHERE verdict='CONFIRMED') AS confirmed, count(*) FILTER (WHERE verdict='REFUTED') AS refuted, count(*) FILTER (WHERE verdict='INCONCLUSIVE') AS inconclusive, count(*) FILTER (WHERE verdict='ERROR') AS error FROM verify_result GROUP BY run_id ORDER BY \"실행시각\" DESC LIMIT 20" }]
+      "type": "table",
+      "title": "실행 이력",
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT min(run_at) AS \"실행시각\", string_agg(DISTINCT category, ',') AS \"분류\", max(trigger_kind) AS \"트리거\", count(*) AS \"케이스\", count(*) FILTER (WHERE verdict='CONFIRMED') AS confirmed, count(*) FILTER (WHERE verdict='REFUTED') AS refuted, count(*) FILTER (WHERE verdict='INCONCLUSIVE') AS inconclusive, count(*) FILTER (WHERE verdict='ERROR') AS error FROM verify_result GROUP BY run_id ORDER BY \"실행시각\" DESC LIMIT 20"
+        }
+      ]
     },
     {
-      "type": "row", "title": "Kafka — 실물 브로커 검증 (:verify-lab-kafka)", "id": 102,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 }, "collapsed": false, "panels": []
+      "type": "row",
+      "title": "Kafka — 실물 브로커 검증 (:verify-lab-kafka)",
+      "id": 102,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "collapsed": false,
+      "panels": []
     },
     {
-      "type": "stat", "title": "Kafka 케이스", "id": 11,
+      "type": "stat",
+      "title": "Kafka 케이스",
+      "id": 11,
       "description": "verify-lab-kafka 는 브로커가 없으면 케이스를 INCONCLUSIVE 로 남기고 테스트는 '건너뜀'이 된다. 여기가 0 이면 아직 한 번도 안 돌린 것이고, INCONCLUSIVE 가 많으면 브로커가 안 떠 있는 것이다.",
-      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 37 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE category='kafka' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1)" }]
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 37
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) FROM verify_result WHERE category='kafka' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1)"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "Kafka CONFIRMED", "id": 12,
-      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 37 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE category='kafka' AND verdict='CONFIRMED' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1)" }]
+      "type": "stat",
+      "title": "Kafka CONFIRMED",
+      "id": 12,
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 37
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) FROM verify_result WHERE category='kafka' AND verdict='CONFIRMED' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1)"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "Kafka 미판정 (브로커 부재 신호)", "id": 13,
-      "gridPos": { "h": 5, "w": 6, "x": 8, "y": 37 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE category='kafka' AND verdict IN ('INCONCLUSIVE','ERROR') AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1)" }]
+      "type": "stat",
+      "title": "Kafka 미판정 (브로커 부재 신호)",
+      "id": 13,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 8,
+        "y": 37
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) FROM verify_result WHERE category='kafka' AND verdict IN ('INCONCLUSIVE','ERROR') AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1)"
+        }
+      ]
     },
     {
-      "type": "stat", "title": "Kafka 마지막 실행", "id": 14,
-      "gridPos": { "h": 5, "w": 10, "x": 14, "y": 37 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "options": { "textMode": "value", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "dateTimeAsIso", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT max(run_at) FROM verify_result WHERE category='kafka'" }]
+      "type": "stat",
+      "title": "Kafka 마지막 실행",
+      "id": 14,
+      "gridPos": {
+        "h": 5,
+        "w": 10,
+        "x": 14,
+        "y": 37
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "options": {
+        "textMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT extract(epoch FROM max(run_at))*1000 AS \"마지막 실행\" FROM verify_result WHERE category='kafka'"
+        }
+      ],
+      "description": "stat 패널은 숫자 값 필드를 요구한다 — timestamptz 를 그대로 돌려주면 'No data' 가 된다. epoch 밀리초로 바꾸고 dateTimeAsIso 단위로 표시한다."
     },
     {
-      "type": "table", "title": "Kafka 케이스별 결과", "id": 15,
-      "gridPos": { "h": 10, "w": 14, "x": 0, "y": 42 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "fieldConfig": { "defaults": { "custom": { "filterable": true } }, "overrides": [
-        { "matcher": { "id": "byName", "options": "verdict" }, "properties": [
-          { "id": "mappings", "value": [ { "type": "value", "options": {
-            "CONFIRMED": { "color": "green", "index": 0 },
-            "REFUTED": { "color": "red", "index": 1 },
-            "INCONCLUSIVE": { "color": "yellow", "index": 2 },
-            "ERROR": { "color": "dark-red", "index": 3 } } } ] },
-          { "id": "custom.cellOptions", "value": { "type": "color-background" } } ] },
-        { "matcher": { "id": "byName", "options": "elapsed_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] }
-      ] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT case_id, verdict, elapsed_ms, question, expectations FROM verify_result WHERE category='kafka' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1) ORDER BY case_id" }]
+      "type": "table",
+      "title": "Kafka 케이스별 결과",
+      "id": 15,
+      "gridPos": {
+        "h": 10,
+        "w": 14,
+        "x": 0,
+        "y": 42
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "verdict"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "CONFIRMED": {
+                        "color": "green",
+                        "index": 0
+                      },
+                      "REFUTED": {
+                        "color": "red",
+                        "index": 1
+                      },
+                      "INCONCLUSIVE": {
+                        "color": "yellow",
+                        "index": 2
+                      },
+                      "ERROR": {
+                        "color": "dark-red",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "elapsed_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT case_id, verdict, elapsed_ms, question, expectations FROM verify_result WHERE category='kafka' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1) ORDER BY case_id"
+        }
+      ]
     },
     {
-      "type": "barchart", "title": "Kafka 케이스 소요시간", "id": 16,
+      "type": "barchart",
+      "title": "Kafka 케이스 소요시간",
+      "id": 16,
       "description": "브로커 왕복·리밸런스 대기가 있어 DB 케이스(ms 단위)와 자릿수가 다르다. 실물 인프라를 쓰는 검증의 고유 비용이다.",
-      "gridPos": { "h": 10, "w": 10, "x": 14, "y": 42 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "options": { "orientation": "horizontal" },
-      "fieldConfig": { "defaults": { "unit": "ms", "color": { "mode": "fixed", "fixedColor": "purple" } }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT case_id, elapsed_ms FROM verify_result WHERE category='kafka' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1) ORDER BY elapsed_ms DESC" }]
+      "gridPos": {
+        "h": 10,
+        "w": 10,
+        "x": 14,
+        "y": 42
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "options": {
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT case_id, elapsed_ms FROM verify_result WHERE category='kafka' AND run_id=(SELECT run_id FROM verify_result WHERE category='kafka' AND trigger_kind NOT LIKE '%selected%' ORDER BY run_at DESC LIMIT 1) ORDER BY elapsed_ms DESC"
+        }
+      ]
     },
     {
-      "type": "barchart", "title": "분류별 총 소요시간 — 실물 인프라의 비용", "id": 17,
+      "type": "barchart",
+      "title": "분류별 총 소요시간 — 실물 인프라의 비용",
+      "id": 17,
       "description": "kafka 가 압도적으로 길다. 브로커를 실제로 띄워 검증한다는 것의 대가가 이 그림이다.",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 52 },
-      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
-      "options": { "orientation": "horizontal" },
-      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
-      "targets": [{ "refId": "A", "format": "table", "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.category, sum(v.elapsed_ms) AS \"총 소요\", round(avg(v.elapsed_ms)) AS \"케이스당 평균\" FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id GROUP BY v.category ORDER BY sum(v.elapsed_ms) DESC" }]
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "verifylab-pg"
+      },
+      "options": {
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "WITH latest AS (SELECT DISTINCT ON (category) category, run_id FROM verify_result WHERE trigger_kind NOT LIKE '%selected%' ORDER BY category, run_at DESC) SELECT v.category, sum(v.elapsed_ms) AS \"총 소요\", round(avg(v.elapsed_ms)) AS \"케이스당 평균\" FROM verify_result v JOIN latest l ON v.category=l.category AND v.run_id=l.run_id GROUP BY v.category ORDER BY sum(v.elapsed_ms) DESC"
+        }
+      ]
     }
   ]
 }

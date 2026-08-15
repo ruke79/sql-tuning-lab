@@ -54,6 +54,8 @@ docker compose -f docker/verify/compose.yaml up -d
 
 상단 `분류` 변수로 특정 분류만 걸러 볼 수 있다.
 
+![Verification Lab 대시보드](../docs/img/grafana-verification-lab.png)
+
 > **"최근 실행"의 정의**: `verify-lab` 과 `verify-lab-kafka` 는 서로 다른 `run_id` 로 적재된다.
 > 그래서 패널들은 "가장 최근 run_id 하나"가 아니라 **분류별 최신 실행**을 본다 —
 > 그러지 않으면 나중에 돌린 모듈만 보이고 다른 모듈이 통째로 사라진다(실제로 그랬다).
@@ -109,6 +111,9 @@ docker compose -f docker/verify/compose.yaml up -d kafka
 - `POST /verify/run-and-store` 추가 — 코어의 `/verify/run` 은 저장하지 않는다(코어를 저장소에 안 붙이기 위해).
 
 ## 이 환경에서의 검증 결과
+
+대시보드는 Grafana 11.2.0 을 실제로 띄워 렌더링까지 확인했다(위 스크린샷) —
+패널 17개 + 템플릿 변수, 콘솔 에러 0.
 
 PostgreSQL 16.13 (로컬 프라이머리 5432 + 스트리밍 레플리카 5433) —
 **51건 전부 CONFIRMED. REFUTED 0 / INCONCLUSIVE 0 / ERROR 0.**
