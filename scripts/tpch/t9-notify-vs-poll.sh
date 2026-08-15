@@ -342,6 +342,28 @@ echo "     두 축 모두에서 이긴다.** 같은 파라미터끼리 비교하
 echo "     (5ms 기준 지연 3→6ms, 왕복 4,213→1,380)."
 echo
 
+# ── ④ 버스트 소진: 큐 깊이 신호가 발화하는 유일한 구간 ─────────────────
+echo "── ④ 버스트 소진 · 워커 정지 중 2만 건 적체 → 기동 후 소진 시간 (3회) ──"
+trg notify
+for MODE in adaptive qdepth; do
+  T=""
+  for i in 1 2 3; do
+    sql "TRUNCATE denorm_queue; TRUNCATE denorm_stat;" >/dev/null 2>&1
+    sql "UPDATE orders SET o_shippriority=(o_shippriority+1)%7 WHERE o_orderkey<=20000;" >/dev/null 2>&1
+    python3 "$HERE/t9_worker.py" --mode $MODE --min-interval-ms 20 --depth-threshold 500 \
+        --batch 2000 --secs 30 --stats /tmp/t9n_bw.txt >/dev/null 2>&1 & WP=$!
+    s=$(date +%s%N)
+    until [ "$(sql 'SELECT count(*) FROM denorm_queue')" -eq 0 ]; do sleep 0.05; done
+    e=$(date +%s%N)
+    kill $WP 2>/dev/null; wait $WP 2>/dev/null
+    T="$T $(( (e-s)/1000000 ))"
+  done
+  printf "  %-14s 소진: %s ms (중앙 %s)\n" "$(lbl ${MODE}:20 2>/dev/null || echo $MODE)" "$T" "$(med "$T")"
+done
+echo "  → 이론상 큐깊이가 페이싱(20ms × 배치 9회 ≈ 180ms)을 아껴야 하는 구간인데,"
+echo "     실측에서는 그 절약이 배치 작업 시간(1.5~1.9초)에 묻혀 구분되지 않았다."
+echo
+
 # ── ③ NOTIFY 자체의 쓰기 비용 ─────────────────────────────────────────
 echo "── ③ NOTIFY 는 공짜인가 · 포화 부하 · 워커 없음(쓰기 경로만) (${ROUNDS}라운드 중앙값) ──"
 NOTPS=""; PLTPS=""
@@ -378,6 +400,14 @@ echo "    (고부하에서 빈 폴링이 0 에 수렴한다). 파라미터의 �
 echo "    '얼마나 기다릴까'가 아니라 **'초당 몇 번까지 DB 를 찌를까'** 다."
 echo "  · 다만 적응형도 공짜는 아니다. 부하가 높으면 페이싱이 곧 지연이 되므로"
 echo "    (5ms → 6ms, 20ms → 15ms) 값은 **허용 지연**을 보고 정해야 한다."
+echo "  · **큐 깊이 신호는 잰 어떤 구간에서도 이득이 없었다.**"
+echo "      - 정상 구간: 페이싱 간격(5~20ms) 동안 쌓이는 항목이 임계치(500)에 한참 못 미쳐"
+echo "        신호가 발화하지 않는다 — 적응형과 수치가 동일하다"
+echo "      - 버스트 소진(④): 발화하지만 절약분이 배치 작업 시간에 묻힌다"
+echo "    '페이싱이 곧 지연'을 깊이 신호로 피하려면 임계치를 페이싱당 도착량(~4건)까지"
+echo "    낮춰야 하는데, 그건 NOTIFY 로 돌아가는 것이다. **합침은 기다림 그 자체다 —**"
+echo "    **기다림을 건너뛰면 합침도 같이 사라진다.** 신호를 늘릴 게 아니라 허용 지연으로"
+echo "    페이싱 값을 정하는 것이 맞다."
 echo "  · 부하가 높으면 '창을 두고 모으는 것'과 '주기적으로 훑는 것'이 같은 동작으로 수렴한다 —"
 echo "    고정창 20ms(9ms/1,988)와 폴링 20ms(9ms/2,066)가 거의 겹치는 것이 그 증거다."
 echo "  · 그래서 NOTIFY 는 처리량 대책이 아니라 **응답성 대책**이고, 심지어 처리량을 깎는다."
