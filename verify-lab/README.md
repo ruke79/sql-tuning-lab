@@ -21,7 +21,10 @@
 # 1) DB 준비 (한 번만) — verifylab DB/계정 생성. tpch 실습 데이터와 완전히 분리된다.
 ./scripts/verify/setup-verifylab.sh
 
-# 2) 전건 실행 (51건, 약 1분)
+# 2) (선택) DB-24 용 스트리밍 레플리카 — 없으면 DB-24 만 INCONCLUSIVE 로 남는다
+./scripts/verify/setup-replica.sh
+
+# 3) 전건 실행 (51건, 약 1분)
 ./gradlew :verify-lab:test
 
 # 골라 돌리기
@@ -68,7 +71,7 @@ curl -X POST "localhost:8080/verify/run-and-store?category=db" # 분류만
 | `verifylab` DB/계정 | 케이스가 테이블을 만들고 지운다 — tpch 와 분리 필수 | 전건 실패 |
 | `CREATEROLE` + `createrole_self_grant='set,inherit'` | DB-13(RLS)이 테넌트 롤을 만들어 `SET ROLE` 한다. PG16 부터 CREATEROLE 은 SET 권한을 자동으로 받지 못한다 | DB-13 만 판정 불가 |
 | `wal_level=logical` | DB-10(CDC) 논리 디코딩 | DB-10 만 판정 불가 |
-| 스트리밍 레플리카 (`REPLICA_PORT` 또는 `verify.replica.url`) | DB-24(복제 지연 / read-your-writes) | DB-24 가 INCONCLUSIVE 로 남는다 (비결정 케이스라 실패는 아니다) |
+| 스트리밍 레플리카 (`scripts/verify/setup-replica.sh`, 기본 5433) | DB-24(복제 지연 / read-your-writes) | DB-24 가 INCONCLUSIVE 로 남는다 (비결정 케이스라 실패는 아니다) |
 
 ## :verify-lab-kafka — Kafka 실물 검증 8케이스 (별도 모듈)
 
@@ -98,5 +101,11 @@ docker compose -f docker/verify/compose.yaml up -d kafka
 
 ## 이 환경에서의 검증 결과
 
-PostgreSQL 16.13 (로컬, 단일 인스턴스) — **51건 중 50 CONFIRMED / 1 INCONCLUSIVE / 0 REFUTED / 0 ERROR**.
-INCONCLUSIVE 는 DB-24 하나로, 레플리카가 없는 환경의 설계된 결과다.
+PostgreSQL 16.13 (로컬 프라이머리 5432 + 스트리밍 레플리카 5433) —
+**51건 전부 CONFIRMED. REFUTED 0 / INCONCLUSIVE 0 / ERROR 0.**
+
+레플리카를 붙이기 전에는 DB-24 가 INCONCLUSIVE 였다. `setup-replica.sh` 로
+`pg_basebackup` 스탠바이를 만들고 `recovery_min_apply_delay=2s` 를 걸자
+"쓰기 직후 레플리카에서 0행 → LSN 까지 따라온 뒤 1행"이 관측되며 CONFIRMED 로 바뀌었다.
+그 2초 지연은 결과를 만든 것이 아니라, 같은 호스트에서는 수 ms 만에 따라잡혀
+**관측 창 자체가 열리지 않는 현상을 볼 수 있는 크기로 고정**한 것이다(PostgreSQL 정식 기능).
