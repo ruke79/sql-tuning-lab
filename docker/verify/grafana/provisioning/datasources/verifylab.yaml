@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: verifylab
+    uid: verifylab-pg
+    type: postgres
+    access: proxy
+    url: ${GF_DS_HOST}:${GF_DS_PORT}
+    database: verifylab
+    user: verifylab
+    secureJsonData:
+      password: verifylab
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+    isDefault: true

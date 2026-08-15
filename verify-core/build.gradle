@@ -1,0 +1,12 @@
+// 검증 프레임워크 (problem-solving 레포에서 이식).
+// 케이스 1개 = 면접 질문 1개 = VerificationCase 빈 1개.
+// 이 모듈은 어떤 인프라에도 붙지 않는다 — 붙는 쪽(verify-lab)이 결정한다.
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    api 'org.springframework.boot:spring-boot-starter'
+    compileOnly 'org.springframework.boot:spring-boot-starter-web'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+}

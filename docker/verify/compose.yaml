@@ -1,0 +1,47 @@
+# verify-lab 전용 인프라: PostgreSQL 16 + Grafana.
+#
+#   docker compose -f docker/verify/compose.yaml up -d
+#   ./gradlew :verify-lab:test            # 51건 실행 → verify_result 적재
+#   http://localhost:3000                 # Grafana (admin / admin) → "Verification Lab" 대시보드
+#
+# 이미 로컬 PostgreSQL 을 쓰고 있다면 postgres 서비스는 빼고 grafana 만 띄워도 된다 —
+# 그때는 GF_DS_HOST 를 host.docker.internal 로 준다:
+#   GF_DS_HOST=host.docker.internal docker compose -f docker/verify/compose.yaml up -d grafana
+services:
+  postgres:
+    image: postgres:16
+    container_name: verifylab-postgres
+    environment:
+      POSTGRES_DB: verifylab
+      POSTGRES_USER: verifylab
+      POSTGRES_PASSWORD: verifylab
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"     # DB-06(풀 진단)이 커넥션 20개를 동시에 잡는다
+      - "-c"
+      - "wal_level=logical"       # DB-10(CDC) 논리 디코딩
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verifylab -d verifylab"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana-oss:11.2.0
+    container_name: verifylab-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # 대시보드가 읽을 PG. 로컬 인스턴스를 쓰면 host.docker.internal 로 덮어쓴다.
+      GF_DS_HOST: ${GF_DS_HOST:-postgres}
+      GF_DS_PORT: ${GF_DS_PORT:-5432}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # 리눅스에서도 로컬 PG 접근 가능하게
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro

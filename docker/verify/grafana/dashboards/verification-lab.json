@@ -1,0 +1,97 @@
+{
+  "uid": "verify-lab",
+  "title": "Verification Lab",
+  "tags": ["verify", "sql-tuning-lab"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-7d", "to": "now" },
+  "panels": [
+    {
+      "type": "stat", "title": "CONFIRMED (최근 실행)", "id": 1,
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) AND verdict='CONFIRMED'" }]
+    },
+    {
+      "type": "stat", "title": "REFUTED", "id": 2,
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) AND verdict='REFUTED'" }]
+    },
+    {
+      "type": "stat", "title": "INCONCLUSIVE", "id": 3,
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "yellow" } }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) AND verdict='INCONCLUSIVE'" }]
+    },
+    {
+      "type": "stat", "title": "ERROR", "id": 4,
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "dark-red" } }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT count(*) FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) AND verdict='ERROR'" }]
+    },
+    {
+      "type": "stat", "title": "합격률 (acceptable)", "id": 5,
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "unit": "percent", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 90 }, { "color": "green", "value": 100 } ] } }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT round(100.0*count(*) FILTER (WHERE acceptable)/count(*),1) FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1)" }]
+    },
+    {
+      "type": "barchart", "title": "분류별 판정 (최근 실행)", "id": 6,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "options": { "stacking": "normal", "xTickLabelRotation": 0 },
+      "fieldConfig": { "defaults": {}, "overrides": [
+        { "matcher": { "id": "byName", "options": "confirmed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] },
+        { "matcher": { "id": "byName", "options": "refuted" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+        { "matcher": { "id": "byName", "options": "inconclusive" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } } ] },
+        { "matcher": { "id": "byName", "options": "error" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "dark-red" } } ] }
+      ] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT category, count(*) FILTER (WHERE verdict='CONFIRMED') AS confirmed, count(*) FILTER (WHERE verdict='REFUTED') AS refuted, count(*) FILTER (WHERE verdict='INCONCLUSIVE') AS inconclusive, count(*) FILTER (WHERE verdict='ERROR') AS error FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) GROUP BY category ORDER BY category" }]
+    },
+    {
+      "type": "timeseries", "title": "실행별 합격률 추이", "id": 7,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "showPoints": "always" } }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "time_series", "rawSql": "SELECT min(run_at) AS time, round(100.0*count(*) FILTER (WHERE acceptable)/count(*),1) AS \"합격률\" FROM verify_result WHERE $__timeFilter(run_at) GROUP BY run_id ORDER BY time" }]
+    },
+    {
+      "type": "table", "title": "최근 실행 — 케이스별 결과", "id": 8,
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 14 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": { "custom": { "filterable": true } }, "overrides": [
+        { "matcher": { "id": "byName", "options": "verdict" }, "properties": [
+          { "id": "mappings", "value": [ { "type": "value", "options": {
+            "CONFIRMED": { "color": "green", "index": 0 },
+            "REFUTED": { "color": "red", "index": 1 },
+            "INCONCLUSIVE": { "color": "yellow", "index": 2 },
+            "ERROR": { "color": "dark-red", "index": 3 } } } ] },
+          { "id": "custom.cellOptions", "value": { "type": "color-background" } } ] },
+        { "matcher": { "id": "byName", "options": "elapsed_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] }
+      ] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT case_id, category, verdict, elapsed_ms, question, expectations FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) ORDER BY category, case_id" }]
+    },
+    {
+      "type": "barchart", "title": "느린 케이스 Top 10 (최근 실행)", "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "options": { "orientation": "horizontal" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT case_id, elapsed_ms FROM verify_result WHERE run_id=(SELECT run_id FROM verify_result ORDER BY run_at DESC LIMIT 1) ORDER BY elapsed_ms DESC LIMIT 10" }]
+    },
+    {
+      "type": "table", "title": "실행 이력", "id": 10,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "datasource": { "type": "postgres", "uid": "verifylab-pg" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [{ "refId": "A", "format": "table", "rawSql": "SELECT min(run_at) AS 실행시각, max(trigger_kind) AS 트리거, count(*) AS 케이스, count(*) FILTER (WHERE verdict='CONFIRMED') AS confirmed, count(*) FILTER (WHERE verdict='REFUTED') AS refuted, count(*) FILTER (WHERE verdict='INCONCLUSIVE') AS inconclusive, count(*) FILTER (WHERE verdict='ERROR') AS error FROM verify_result GROUP BY run_id ORDER BY 실행시각 DESC LIMIT 20" }]
+    }
+  ]
+}

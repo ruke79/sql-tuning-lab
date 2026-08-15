@@ -162,6 +162,23 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 **1억 건**: 약 30일치 `load --from=2024-01-01 --to=2024-01-30 --hours=0-23` (시간당 10~20만 이벤트)
 **30억 건+**: `scripts/clickhouse/load-official-github-events.sh` (공식 s3 스냅샷, 디스크 200GB+)
 
+## :verify-lab — 면접 답변 검증 (51케이스 + Grafana)
+
+`ruke79/problem-solving` 에서 이식한 실행형 검증 랩. 면접 질문 1개 = 검증 케이스 1개로,
+답변의 명제를 실제 실행으로 재현한다 — spring 7 · jpa 7 · concurrency 5 · jvm 7 · db(PostgreSQL 16 실물) 25.
+
+```bash
+./scripts/verify/setup-verifylab.sh    # verifylab DB/계정 (한 번만)
+./gradlew :verify-lab:test             # 51건 전부 (~1분)
+./gradlew :verify-lab:test -Dverify.only=DB-14   # 하나만
+
+# Grafana 대시보드 (결과가 verify_result 테이블에 자동 적재된다)
+docker compose -f docker/verify/compose.yaml up -d
+# → http://localhost:3000 (admin/admin) → "Verification Lab"
+```
+
+자세한 내용: [`verify-lab/README.md`](verify-lab/README.md)
+
 ## DB 파라미터 튜닝
 
 - PostgreSQL: `docker/postgres/postgresql.conf` 수정 → `docker compose restart postgres`

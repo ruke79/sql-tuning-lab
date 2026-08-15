@@ -1,0 +1,46 @@
+// 검증 랩 (problem-solving 레포에서 이식한 51케이스).
+//   spring 7 · jpa 7 · concurrency 5 · jvm 7 · db 25
+//
+// 원본 verify-labs 에서 이 다섯 분류만 가져왔으므로 의존성도 그만큼만 필요하다 —
+// security/graphql/redis/wiremock/otel 은 다른 분류(sec·api·obs·res)의 것이라 뺐다.
+//
+// 실행:
+//   ./gradlew :verify-lab:test                          # 51건 전부
+//   ./gradlew :verify-lab:test -Dverify.only=DB-14      # 하나만
+//   ./gradlew :verify-lab:test -Dverify.only=jpa        # 분류 전체
+//   ./gradlew :verify-lab:bootRun                       # 웹으로: POST /verify/run
+//
+// 선행 조건: PostgreSQL 16 에 verifylab DB (scripts/verify/setup-verifylab.sh)
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    implementation project(':verify-core')
+
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-aop'
+    implementation 'org.springframework.boot:spring-boot-starter-cache'
+
+    // db 분류 25건은 PostgreSQL 16 실물에서 돈다
+    runtimeOnly 'org.postgresql:postgresql'
+}
+
+tasks.named('test') {
+    // 케이스를 골라 돌리는 스위치 (원본 그대로).
+    String only = System.getProperty('verify.only')
+    if (only) {
+        systemProperty 'verify.only', only
+        outputs.upToDateWhen { false }
+    }
+
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        // 골라 돌릴 때만 판정 근거를 콘솔에 보여 준다 (전건이면 수천 줄이 된다)
+        showStandardStreams = (only as boolean)
+    }
+
+    // sql-tuning-lab 은 도커 포트 자동감지가 없다 — 로컬 PG 를 기본으로 쓰고
+    // 다른 인스턴스는 DB_URL/DB_PORT/REPLICA_PORT 환경변수로 지정한다.
+}
