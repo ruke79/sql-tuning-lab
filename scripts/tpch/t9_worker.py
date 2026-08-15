@@ -9,17 +9,24 @@
 
 의존성: psycopg2  (pip install psycopg2-binary)
 
-세 가지 깨우는 방식
+네 가지 깨우는 방식
   poll     : 큐가 비면 고정 간격으로 잠들었다 다시 본다
   notify   : 알림이 올 때까지 블록한다 (즉시 기동)
-  debounce : 알림이 오면 **곧바로 처리하지 않고** 창(window) 동안 더 모은 뒤 한 번에 처리한다
+  debounce : 알림이 오면 **곧바로 처리하지 않고** 고정 창(window) 동안 더 모은 뒤 처리한다
              → 쓰기가 잦을 때 notify 가 트랜잭션마다 깨어나 바쁜 폴링으로 퇴화하는 것을 막는다.
-               대가는 창 길이만큼의 지연이다.
+               대가는 창 길이만큼의 지연이고, **한산할 때는 모을 것이 없어 순손해**다.
+  adaptive : 고정 창 대신 **drain 사이의 최소 간격**을 보장한다. 기다릴 시간을 그때그때
+             계산한다 — 직전 drain 이후 이미 그만큼 지났으면 0 을 기다린다.
+             · 한산: 알림이 드물어 간격이 이미 벌어져 있다 → 대기 0 → notify 와 같은 지연
+             · 바쁨: 연속으로 깨어나므로 간격이 걸린다 → 자동으로 모아 큰 배치가 된다
+             즉 한 설정으로 두 구간을 다 감당하는 것이 목적이다. 설정값의 의미는
+             "초당 drain 을 최대 1000/M 회로 제한한다"이다.
 
 사용:
-  ./t9_worker.py --mode poll     --sleep-ms 20    --batch 2000 --secs 30 --stats /tmp/w.txt
-  ./t9_worker.py --mode notify                    --batch 2000 --secs 30 --stats /tmp/w.txt
-  ./t9_worker.py --mode debounce --debounce-ms 20 --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode poll     --sleep-ms 20        --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode notify                        --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode debounce --debounce-ms 20     --batch 2000 --secs 30 --stats /tmp/w.txt
+  ./t9_worker.py --mode adaptive --min-interval-ms 20 --batch 2000 --secs 30 --stats /tmp/w.txt
 
 --stats 파일에는 "처리배치수 빈폴링수 처리항목수" 를 한 줄로 남긴다.
 빈 폴링 수 = 큐가 비어 있는데 깨어나 헛일한 횟수 = 깨우는 방식이 낭비하는 왕복.
@@ -33,9 +40,10 @@ except ImportError:
     sys.exit(2)
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--mode', choices=['poll', 'notify', 'debounce'], default='poll')
+ap.add_argument('--mode', choices=['poll', 'notify', 'debounce', 'adaptive'], default='poll')
 ap.add_argument('--sleep-ms', type=float, default=20.0)
 ap.add_argument('--debounce-ms', type=float, default=20.0)
+ap.add_argument('--min-interval-ms', type=float, default=20.0)
 ap.add_argument('--batch', type=int, default=2000)
 ap.add_argument('--secs', type=float, default=30.0)
 ap.add_argument('--host', default='localhost')
@@ -47,7 +55,7 @@ conn = psycopg2.connect(host=a.host, port=a.port, user='tuner', password='tuner'
 # autocommit: 배치 하나가 곧 트랜잭션 하나다 (plpgsql 워커의 COMMIT 과 같은 단위).
 conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 cur = conn.cursor()
-if a.mode in ('notify', 'debounce'):
+if a.mode in ('notify', 'debounce', 'adaptive'):
     cur.execute("LISTEN denorm_q")
 
 deadline = time.monotonic() + a.secs
@@ -66,8 +74,22 @@ def on_term(_sig, _frm):
 signal.signal(signal.SIGTERM, on_term)
 signal.signal(signal.SIGINT, on_term)
 
+last_drain = 0.0    # 마지막 drain 시각 (adaptive 의 페이싱 기준)
+
 while time.monotonic() < deadline:
+    # adaptive: drain 사이에 최소 간격을 둔다. **기다릴 시간을 계산한다** —
+    # 직전 drain 이후 이미 간격만큼 지났으면 한 톨도 기다리지 않는다.
+    # 그래서 한산할 때는 고정 창과 달리 지연이 붙지 않고, 바쁠 때만 모으는 효과가 난다.
+    if a.mode == 'adaptive' and last_drain:
+        wait = a.min_interval_ms / 1000.0 - (time.monotonic() - last_drain)
+        remaining = deadline - time.monotonic()
+        if wait > 0 and remaining > 0:
+            time.sleep(min(wait, remaining))
+            conn.poll()
+            del conn.notifies[:]
+
     cur.execute("SELECT denorm_drain(%s)", (a.batch,))
+    last_drain = time.monotonic()
     n = cur.fetchone()[0]
     if n:
         batches += 1
@@ -83,7 +105,7 @@ while time.monotonic() < deadline:
         time.sleep(min(a.sleep_ms / 1000.0, remaining))
         continue
 
-    # ── notify / debounce: 알림을 기다린다 ──
+    # ── notify / debounce / adaptive: 알림을 기다린다 ──
     # 놓친 알림이 없도록 순서가 중요하다.
     #   1) 이미 도착해 버퍼에 있는 알림을 먼저 확인한다.
     #   2) 없으면 소켓에서 기다린다. drain 과 select 사이에 도착한 알림은
