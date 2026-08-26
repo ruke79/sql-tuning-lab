@@ -20,6 +20,10 @@
 set -uo pipefail
 
 QNAME="${1:-q03}"
+# 모듈을 바꿔 쓸 수 있게 한 곳으로 모았다. 기본값은 tpch 라 기존 사용법은 그대로다.
+# tpcds 로 쓰려면 scripts/tpcds/join-method-compare.sh 를 쓴다(같은 스크립트를 호출한다).
+MODULE="${MODULE:-tpch}"
+DBNAME="${DBNAME:-$MODULE}"
 REPEAT="${2:-4}"
 TIMEOUT="${TIMEOUT:-60s}"
 PGHOST_="${PGHOST:-localhost}"
@@ -28,23 +32,23 @@ CONTAINER="${CONTAINER:-tuninglab-postgres}"
 
 # 쿼리 파일 위치 (프로젝트 루트 기준 / 스크립트 위치 기준 모두 시도)
 HERE="$(cd "$(dirname "$0")" && pwd)"
-for CAND in "$HERE/../../tpch/src/main/resources/queries/$QNAME.sql" \
-            "./tpch/src/main/resources/queries/$QNAME.sql"; do
+for CAND in "$HERE/../../$MODULE/src/main/resources/queries/$QNAME.sql" \
+            "./$MODULE/src/main/resources/queries/$QNAME.sql"; do
   [ -f "$CAND" ] && QFILE="$CAND" && break
 done
 if [ -z "${QFILE:-}" ]; then
   echo "쿼리 파일을 찾을 수 없습니다: $QNAME.sql"
-  echo "사용 가능: $(ls "$HERE/../../tpch/src/main/resources/queries/" 2>/dev/null | tr '\n' ' ')"
+  echo "사용 가능: $(ls "$HERE/../../$MODULE/src/main/resources/queries/" 2>/dev/null | sed 's/\.sql$//' | tr '\n' ' ')"
   exit 1
 fi
 QUERY=$(grep -v '^\s*--' "$QFILE" | sed 's/;\s*$//')
 
 if command -v psql >/dev/null 2>&1; then
-  run_file() { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -q -f "$1"; }
-  run_sql()  { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -tAc "$1"; }
+  run_file() { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d "$DBNAME" -q -f "$1"; }
+  run_sql()  { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d "$DBNAME" -tAc "$1"; }
 else
-  run_file() { docker exec -i -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d tpch -q < "$1"; }
-  run_sql()  { docker exec -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d tpch -tAc "$1"; }
+  run_file() { docker exec -i -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d "$DBNAME" -q < "$1"; }
+  run_sql()  { docker exec -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d "$DBNAME" -tAc "$1"; }
 fi
 
 echo "쿼리: $QNAME   (반복 ${REPEAT}회, 최소값 기준, 개별 제한시간 ${TIMEOUT})"
@@ -55,7 +59,7 @@ if [ "${NIDX:-0}" -eq 0 ]; then
   echo
   echo "  [경고] lineitem/orders/customer 에 인덱스가 하나도 없습니다."
   echo "         NL 강제는 반복 풀스캔이 되어 반드시 제한시간에 걸립니다."
-  echo "         먼저 실행하세요:  ./gradlew :tpch:bootRun --args=\"index --db=postgres\""
+  echo "         먼저 실행하세요:  ./gradlew :$MODULE:bootRun --args=\"index --db=postgres\""
 fi
 echo
 printf "%-26s %-42s %12s %10s\n" "강제 조건" "실제 사용된 조인" "buffers" "시간(ms)"
