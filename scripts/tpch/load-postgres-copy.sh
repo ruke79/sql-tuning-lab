@@ -3,6 +3,13 @@
 # dbgen -C n -S i 로 분할된 lineitem.tbl.1 같은 파일도 자동으로 모두 적재한다.
 #
 # 사용법: ./load-postgres-copy.sh [데이터디렉토리]
+#
+# ⚠️ §T-1 지점 A(통계 없는 상태)를 측정할 거라면 이 스크립트를 쓰지 말 것.
+#    맨 아래에서 ANALYZE 를 수행하므로 A 가 B(통계 있음)와 같아진다.
+#    그때는 JDBC load 로 넣거나, 이 스크립트의 마지막 ANALYZE 줄만 빼고 돌린다.
+#    추가로 autovacuum 도 꺼야 한다 — 안 끄면 길어야 1분 뒤 통계가 생긴다:
+#      ALTER TABLE lineitem SET (autovacuum_enabled = off);   -- 측정 후 되돌릴 것
+#    자세한 내용은 docs 매핑 문서 §T-0 ⑥ 참고.
 set -euo pipefail
 
 DIR="${1:-./data/tpch}"
@@ -24,5 +31,6 @@ for t in region nation supplier customer part partsupp orders lineitem; do
   done
 done
 
+# 운영에서는 옳지만 §T-1 지점 A 측정에서는 이 줄이 실험을 깨뜨린다(§T-0 ⑥).
 $PSQL -c "ANALYZE"
 echo "완료. 인덱스 생성: ./gradlew :tpch:bootRun --args=\"index --db=postgres\""

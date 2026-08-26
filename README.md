@@ -58,6 +58,19 @@ cd docker && docker compose up -d && cd ..
 # 자세한 실험 설계는 docs 매핑 문서 §T-0, §T-1 참고.
 ```
 
+> **①(통계 없는 상태)을 재려면 두 가지를 먼저 막아야 한다.** 안 막으면 ①이 조용히 ②가 된다.
+>
+> - **COPY 적재 스크립트(`load-postgres-copy.sh`)를 쓰지 않는다** — 마지막 줄에서 `ANALYZE` 를 돈다.
+>   JDBC `load` 에는 없다. 대용량이라 COPY 가 필요하면 그 마지막 줄만 빼고 돌린다.
+> - **대상 테이블의 autovacuum 을 끈다** — 기본 설정에서 대량 적재 직후 임계치를 즉시 넘으므로
+>   **길어야 1분 뒤 자동 ANALYZE** 가 걸린다. 적재하고 자리를 비우면 ①은 이미 사라져 있다.
+>   ```sql
+>   ALTER TABLE lineitem SET (autovacuum_enabled = off);  -- 측정 후 반드시 되돌릴 것
+>   ```
+>
+> "없음"을 재는 실험은 "있음"을 재는 실험보다 깨지기 쉽다 — 시스템이 알아서 채워 넣기 때문이다.
+> 근거와 일반화는 §T-0 ⑥.
+
 모든 모듈은 인자 없이 실행하면 사용법을 출력한다: `./gradlew :tpch:bootRun`
 
 ## 모듈별 사용법
@@ -86,6 +99,7 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 
 **1억 건 이상**: `scripts/tpch/gen-official-dbgen.sh 100` (docker로 공식 dbgen 빌드/실행)
 → 대용량 적재는 `scripts/tpch/load-postgres-copy.sh` (COPY, JDBC 대비 5~10배 빠름)
+  단 이 스크립트는 끝에 `ANALYZE` 를 돌므로 **§T-1 지점 A 측정에는 쓰면 안 된다**(위 주의 참고)
 
 ### :tpcds — Star/눈꽃송이 조인 / 윈도우 함수
 
@@ -103,6 +117,10 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 (스케일 100 = store_sales 약 2.9억 건. 이 프로젝트가 쓰는 9개 테이블만 생성하므로 약 40GB,
 세 번째 인자는 병렬도. 분할된 `store_sales_1_8.dat` 등은 `load`가 자동 인식한다)
 처음이라면 스케일 10(약 2,880만 건, ~4GB)으로 시작하길 권한다.
+대용량 적재는 `scripts/tpcds/load-postgres-copy.sh` 가 JDBC 대비 5~10배 빠르지만,
+끝에 `ANALYZE` 를 돌므로 **§T-1 지점 A 측정에는 쓰면 안 된다**(위 "빠른 시작"의 주의 참고).
+`dsdgen` 은 store_sales 와 함께 store_returns 도 생성하는데, 이 프로젝트 스키마에는
+store_returns 가 없어 적재 시 **조용히 무시**된다(오류가 아니다).
 WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성해야 I/O가 몇 배 빠르다.
 
 ### :pgbench-lab — B-Tree Split / Shared Buffers / WAL Flush / HOT
