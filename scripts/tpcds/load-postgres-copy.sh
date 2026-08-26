@@ -4,20 +4,60 @@
 #
 # 사용법: ./load-postgres-copy.sh [데이터디렉토리]
 #
-# ⚠️ §T-1 지점 A(통계 없는 상태)를 측정할 거라면 이 스크립트를 쓰지 말 것.
-#    맨 아래에서 ANALYZE 를 수행하므로 A 가 B(통계 있음)와 같아진다.
-#    그때는 JDBC load 로 넣거나, 이 스크립트의 마지막 ANALYZE 줄만 빼고 돌린다.
-#    추가로 autovacuum 도 꺼야 한다 — 안 끄면 길어야 1분 뒤 통계가 생긴다:
-#      ALTER TABLE store_sales SET (autovacuum_enabled = off);   -- 측정 후 되돌릴 것
-#    자세한 내용은 docs 매핑 문서 §T-0 ⑥ 참고.
+# 사용법:
+#   ./load-postgres-copy.sh [데이터디렉토리] [옵션]
+#
+#   (옵션 없음)            적재 후 ANALYZE 수행 — **평소에는 이쪽**.
+#                          §T-2 이후 대부분의 실습은 통계가 있어야 의미 있는 계획이 나온다.
+#   --no-analyze           적재 후 ANALYZE 를 하지 않고, 대상 테이블의 autovacuum 도 끈다.
+#                          §T-1 지점 A(통계 없는 상태)를 재기 위한 모드다.
+#                          ANALYZE 만 건너뛰고 autovacuum 을 두면 길어야 1분 뒤 통계가
+#                          생겨 버리므로(§T-0 ⑥ 실측), 둘을 같이 처리한다.
+#   --restore-autovacuum   위에서 끈 autovacuum 을 되돌린다(적재는 하지 않는다).
+#                          A 측정이 끝나면 반드시 실행할 것 — 안 그러면 §T-0 ⑤(VACUUM 이
+#                          계획을 바꾸는 문제)가 대신 생긴다.
+#
+# 예)
+#   ./load-postgres-copy.sh ./data/tpcds                       # 평소
+#   ./load-postgres-copy.sh ./data/tpcds --no-analyze          # T-1 지점 A 준비
+#   ./load-postgres-copy.sh --restore-autovacuum           # A 측정 후 원복
+#
 set -euo pipefail
 
-DIR="${1:-./data/tpcds}"
+DIR="./data/tpcds"
+DO_ANALYZE=true
+RESTORE_ONLY=false
+for arg in "$@"; do
+  case "$arg" in
+    --no-analyze)         DO_ANALYZE=false ;;
+    --restore-autovacuum) RESTORE_ONLY=true ;;
+    -*) echo "알 수 없는 옵션: $arg" >&2; exit 2 ;;
+    *)  DIR="$arg" ;;
+  esac
+done
 export PGPASSWORD=tuner
 PSQL="psql -h localhost -U tuner -d tpcds -v ON_ERROR_STOP=1"
 
 # 차원 → 팩트 순서
 TABLES="date_dim item store customer_address customer_demographics household_demographics customer promotion store_sales"
+
+set_autovacuum() {   # $1 = on|off
+  for t in $TABLES; do
+    $PSQL -c "ALTER TABLE $t SET (autovacuum_enabled = $1);" >/dev/null
+  done
+}
+
+if [ "$RESTORE_ONLY" = true ]; then
+  set_autovacuum on
+  echo "autovacuum 을 다시 켰다 ($TABLES)"
+  exit 0
+fi
+
+if [ "$DO_ANALYZE" = false ]; then
+  # ANALYZE 를 건너뛰는 것만으로는 부족하다 — autovacuum 이 1분 뒤 통계를 만든다.
+  set_autovacuum off
+  echo "[--no-analyze] autovacuum 을 껐다. 적재 후에도 통계는 생기지 않는다."
+fi
 
 for t in $TABLES; do
   # {table}.dat 와 {table}_<child>_<parallel>.dat 만 매칭 (customer 가 customer_address 를 삼키지 않도록)
@@ -35,6 +75,12 @@ for t in $TABLES; do
   done
 done
 
-# 운영에서는 옳지만 §T-1 지점 A 측정에서는 이 줄이 실험을 깨뜨린다(§T-0 ⑥).
-$PSQL -c "ANALYZE"
+if [ "$DO_ANALYZE" = true ]; then
+  $PSQL -c "ANALYZE"
+else
+  echo
+  echo "[--no-analyze] ANALYZE 를 건너뛰었고 autovacuum 도 꺼져 있다 — §T-1 지점 A 상태다."
+  echo "  확인:  SELECT count(*) FROM pg_stats WHERE tablename = '$(echo $TABLES | awk '{print $NF}')';   -- 0 이어야 한다"
+  echo "  원복:  $0 --restore-autovacuum        <- A 측정이 끝나면 반드시"
+fi
 echo "완료. 인덱스 생성: ./gradlew :tpcds:bootRun --args=\"index --db=postgres\""
