@@ -50,7 +50,24 @@ public class QueryResourceRunner {
         ExplainService explainService = new ExplainService(jdbc, dialect);
         List<BenchmarkResult> results = new ArrayList<>();
 
-        for (Resource r : listQueries()) {
+        List<Resource> queries = listQueries();
+
+        // --query 에 없는 이름을 주면 예전에는 아무것도 실행하지 않고 조용히 끝났다
+        // ("SUMMARY (POSTGRES, 0 queries)" 만 INFO 로 찍혀 눈에 띄지 않는다).
+        // 모듈마다 쿼리 이름이 다르므로(tpch=q03, tpcds=q03_brand_by_year) 오타가 잦은 지점이고,
+        // 돌지도 않은 것을 돌았다고 착각하게 만든다. 그래서 여기서 걸러 목록을 보여준다.
+        if (onlyQuery != null) {
+            boolean known = queries.stream().anyMatch(r -> onlyQuery.equalsIgnoreCase(baseName(r)));
+            if (!known) {
+                String available = queries.stream().map(this::baseName).sorted()
+                        .collect(java.util.stream.Collectors.joining(", "));
+                throw new IllegalArgumentException(
+                        "이런 쿼리가 없다: '" + onlyQuery + "'\n  사용 가능: "
+                        + (available.isEmpty() ? "(없음)" : available));
+            }
+        }
+
+        for (Resource r : queries) {
             String name = baseName(r);
             if (onlyQuery != null && !onlyQuery.equalsIgnoreCase(name)) continue;
             String sql = read(r);
