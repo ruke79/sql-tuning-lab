@@ -113,6 +113,17 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpch/t9-notify-vs-poll.sh             # 폴링/NOTIFY/고정창/적응형/큐깊이 5파 비교
 ```
 
+> **실험 스크립트 공통 손잡이 — `work_mem`.** `t*` / `join-method-compare` 스크립트는
+> 자기가 여는 세션에만 `work_mem=4096MB` 를 건다(`PGOPTIONS`). **서버 기본값은 안 건드린다** —
+> 다른 실습의 측정 조건을 바꾸지 않기 위해서다. RAM 이 작은 장비면 낮춰 잡는다:
+> `WORK_MEM=512MB ./scripts/tpch/t8-combined-index.sh`
+>
+> 다만 **작은 데이터에서는 올려도 아무 일도 안 일어난다.** `work_mem` 은 미리 잡아 두는
+> 양이 아니라 상한이라, 넘칠 일이 없으면 그대로다 — SF=0.5 tpch·200만 행 tpcds 에서
+> 64MB 와 4GB 의 `Batches: 1  Memory Usage` 가 바이트까지 같았고 실행시간도 같았다.
+> 실제로 듣는 것은 해시가 넘치기 시작하는 대규모(대략 팩트 1.5억 행 이후)부터다.
+> 넘치는지는 `EXPLAIN` 에 `Batches: N(N>1)` 이나 `Disk` 가 뜨는지로 판별한다.
+
 **1억 건 이상**: `scripts/tpch/gen-official-dbgen.sh 100` (docker로 공식 dbgen 빌드/실행)
 → 대용량 적재는 `scripts/tpch/load-postgres-copy.sh` (COPY, JDBC 대비 5~10배 빠름)
   기본은 적재 후 `ANALYZE` 까지 한다. §T-1 지점 A 를 잴 때만 `--no-analyze` (위 주의 참고)

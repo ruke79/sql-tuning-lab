@@ -34,12 +34,23 @@ done
 [ -z "${QFILE:-}" ] && { echo "q03.sql 을 찾을 수 없습니다."; exit 1; }
 Q=$(grep -v '^\s*--' "$QFILE" | sed 's/;[[:space:]]*$//' | tr '\n' ' ')
 
+# work_mem — 큰 해시·정렬이 디스크로 넘치지 않게 **이 스크립트가 여는 세션에만** 건다.
+# PGOPTIONS 는 libpq 환경변수라 psql 과 pgbench 모두에 전달된다.
+# 서버 기본값은 건드리지 않는다 — 다른 실습의 측정 조건을 바꾸지 않기 위해서다.
+#
+# work_mem 은 **미리 잡아 두는 양이 아니라 상한**이다. 넘칠 일이 없으면 올려도
+# 아무 일도 안 일어난다(SF=0.5 tpch·200만 행 tpcds 에서 Batches:1 / Memory Usage 동일 확인).
+# 다만 연산 노드당·병렬 워커당 붙으므로 RAM 이 작은 장비에서는 낮춰 잡을 것:
+#   WORK_MEM=512MB ./<script>.sh
+WORK_MEM="${WORK_MEM:-4096MB}"
+export PGOPTIONS="-c work_mem=$WORK_MEM"
+
 if command -v psql >/dev/null 2>&1; then
   sql()  { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q -tAc "$1"; }
   sqlv() { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q -c "$1"; }
 else
-  sql()  { docker exec -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d tpch -X -q -tAc "$1"; }
-  sqlv() { docker exec -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d tpch -X -q -c "$1"; }
+  sql()  { docker exec -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" psql -U tuner -d tpch -X -q -tAc "$1"; }
+  sqlv() { docker exec -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" psql -U tuner -d tpch -X -q -c "$1"; }
 fi
 
 ms()  { sql "EXPLAIN (ANALYZE, BUFFERS) $1" | grep "Execution Time" | grep -oE "[0-9]+\.[0-9]+"; }
