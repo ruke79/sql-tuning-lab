@@ -47,6 +47,31 @@ best_ms() {
 node_of() { sql "EXPLAIN (COSTS OFF) $1" | grep -oE '(Parallel )?(Hash|Nested Loop|Merge) (Right |Left |Anti |Right Anti )?(Join|Anti Join)?' | head -1; }
 
 echo "§T-7 복잡한 SQL 의 함정 — TPC-DS"
+
+# ── 규모 경고 ────────────────────────────────────────────────────────
+# ②의 NOT IN 은 ss_customer_sk 전량으로 해시를 만든다. 그게 이 실습의 요점이지만
+# (그래서 느리다는 것이 결론이다), 팩트가 커지면 work_mem 을 넘겨 디스크로 흘러
+# 실행시간이 행수보다 가파르게 는다. 재보기 전에 규모를 알려 준다.
+NROWS=$(sql "SELECT count(*) FROM store_sales" | tr -d ' ')
+WMEM=$(sql "SHOW work_mem" | tr -d ' ')
+printf "store_sales %s 행 / work_mem %s / 조건당 %s회 측정\n" "$NROWS" "$WMEM" "$REPEAT"
+if [ "${NROWS:-0}" -gt 20000000 ]; then
+  cat <<WARN
+
+  [규모 경고] store_sales 가 2천만 행을 넘는다.
+  ②의 NOT IN 은 ss_customer_sk **전량**으로 해시를 만든다 — 이 실습의 요점이
+  "NOT IN 은 Anti Join 이 안 돼서 느리다"이므로 그 비용을 실제로 치러야 한다.
+  다만 해시가 work_mem(${WMEM}) 을 넘기면 디스크로 흘러 **행수보다 가파르게** 느려진다.
+  이 스크립트는 ②를 $((REPEAT + 1))회(워밍업 1 + 측정 ${REPEAT}) 돌린다.
+
+  권장:
+    ./t7-complex-sql.sh 1                 # 반복을 1회로 (총 2회 실행)
+    psql -c "SET work_mem='512MB'"        # 세션이 아니라 서버 기본값을 올려야 한다
+  ③의 UNION 도 두 매장의 행을 전부 모아 중복 제거하므로 같은 성질을 갖는다.
+  ①과 NULL 주입 실험은 규모와 거의 무관하다(아래 참고).
+
+WARN
+fi
 echo
 
 # ══════════════════════════════════════════════════════════════════════
@@ -100,16 +125,20 @@ echo "  서브쿼리에 NULL 이 한 건이라도 있으면 NOT IN 은 전체를
 echo "  옵티마이저는 컬럼이 nullable 인 이상 그 가능성을 배제할 수 없어 안전한(느린) 길을 택한다."
 echo
 echo "  실제로 그런지 NULL 을 한 건 넣어 본다:"
+# DISTINCT 로 뜬다. NOT IN 은 서브쿼리를 **집합**으로 보므로 중복을 지워도 답이 같고
+# (세 결과가 전량 복사본과 일치하는 것을 확인했다), 크기는 팩트 행수가 아니라
+# 고객 수로 묶인다 — 200만 행에서 70MB → 2.5MB, 2억 행이면 7GB 를 안 쓰고 끝난다.
 sql "SET client_min_messages=warning;
      DROP TABLE IF EXISTS ss_probe;
-     CREATE TABLE ss_probe AS SELECT ss_customer_sk FROM store_sales;" >/dev/null 2>&1
+     CREATE TABLE ss_probe AS SELECT DISTINCT ss_customer_sk FROM store_sales;" >/dev/null 2>&1
+NPROBE=$(sql "SELECT count(*) FROM ss_probe")
 N0=$(sql "SELECT count(*) FROM customer c WHERE c.c_customer_sk NOT IN (SELECT ss_customer_sk FROM ss_probe)")
 sql "INSERT INTO ss_probe VALUES (NULL)" >/dev/null 2>&1
 N1=$(sql "SELECT count(*) FROM customer c WHERE c.c_customer_sk NOT IN (SELECT ss_customer_sk FROM ss_probe)")
 N2=$(sql "SELECT count(*) FROM customer c WHERE NOT EXISTS (SELECT 1 FROM ss_probe p WHERE p.ss_customer_sk = c.c_customer_sk)")
 sql "SET client_min_messages=warning; DROP TABLE IF EXISTS ss_probe;" >/dev/null 2>&1
 printf "    NULL 0건  NOT IN     → %s 행\n" "$N0"
-printf "    NULL 1건  NOT IN     → %s 행   ← 200만 건 중 단 1건의 NULL 이 답을 지웠다\n" "$N1"
+printf "    NULL 1건  NOT IN     → %s 행   ← %s개 값 중 단 1건의 NULL 이 답을 지웠다\n" "$N1" "$NPROBE"
 printf "    NULL 1건  NOT EXISTS → %s 행   ← 영향 없음\n" "$N2"
 echo
 echo "  → NOT IN 은 느린 게 문제가 아니라 **틀릴 수 있는 것**이 문제다."
