@@ -16,6 +16,7 @@
 #   ./t7-complex-sql.sh 5
 #   ONLY=2 ./t7-complex-sql.sh      # ②만 실행 (절끼리 독립이다)
 #   ONLY=13 ./t7-complex-sql.sh 1   # ①③만, 반복 1회
+#   WORK_MEM=512MB ./t7-complex-sql.sh   # work_mem 낮춰 잡기 (기본 4096MB)
 #
 # 병렬로 돌려 빠르게 하고 싶을 수 있는데 — 하면 안 된다. 절들을 동시에 실행하면
 # 서로 CPU·버퍼를 다투어 **측정값 자체가 오염된다**(§T-0 원칙 ⑥ 계열).
@@ -27,6 +28,25 @@ set -uo pipefail
 REPEAT="${1:-3}"
 ONLY="${ONLY:-123}"        # 예: ONLY=2 ./t7-complex-sql.sh  → ②만 실행
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
+
+# work_mem — ②의 NOT IN 해시와 ③의 HashAggregate 가 디스크로 넘치지 않게 한다.
+# 서버 기본값을 고치는 대신 **이 스크립트가 여는 세션에만** 건다(PGOPTIONS).
+# 다른 실습의 측정 조건을 건드리지 않기 위해서다.
+#
+# 주의 1: work_mem 은 세션당이 아니라 **연산 노드당, 그리고 병렬 워커당** 붙는다.
+# 정렬·해시 노드가 여럿인 계획을 워커 4개로 돌리면 이 값의 몇 배를 잡을 수 있다.
+# 팩트가 크고 RAM 이 작은 장비에서는 낮춰 잡아야 한다:  WORK_MEM=512MB ./t7-complex-sql.sh
+#
+# 주의 2: **작은 데이터에서는 올려도 아무 일도 안 일어난다.** 실측으로 확인했다 —
+# store_sales 200만 행에서 ③의 HashAggregate 는 64MB 든 4GB 든 똑같이
+#   Batches: 1  Memory Usage: 28689kB
+# 로 끝난다. 애초에 넘치지 않으니 더 줘도 쓸 데가 없다. 전체 실행시간도 동일했다
+# (4GB 9.0~9.7초 vs 64MB 9.6초). work_mem 이 실제로 듣기 시작하는 것은
+# 28.7MB 짜리 해시가 work_mem 을 넘길 때, 즉 이 형상에서 대략 팩트 1.5억 행 이후다.
+# 그 전까지 이 값은 "혹시 몰라 열어 둔 여유"이지 튜닝이 아니다.
+WORK_MEM="${WORK_MEM:-4096MB}"
+export PGOPTIONS="-c work_mem=$WORK_MEM"
+
 PGHOST_="${PGHOST:-localhost}"
 PGPORT_="${PGPORT:-5432}"
 CONTAINER="${CONTAINER:-tuninglab-postgres}"
@@ -34,7 +54,7 @@ CONTAINER="${CONTAINER:-tuninglab-postgres}"
 if command -v psql >/dev/null 2>&1; then
   sql() { PGPASSWORD=tuner psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpcds -X -q -tAc "$1"; }
 else
-  sql() { docker exec -e PGPASSWORD=tuner "$CONTAINER" psql -U tuner -d tpcds -X -q -tAc "$1"; }
+  sql() { docker exec -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" psql -U tuner -d tpcds -X -q -tAc "$1"; }
 fi
 
 if ! sql "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
@@ -75,7 +95,13 @@ echo "§T-7 복잡한 SQL 의 함정 — TPC-DS"
 # 실행시간이 행수보다 가파르게 는다. 재보기 전에 규모를 알려 준다.
 NROWS=$(sql "SELECT count(*) FROM store_sales" | tr -d ' ')
 WMEM=$(sql "SHOW work_mem" | tr -d ' ')
-printf "store_sales %s 행 / work_mem %s / 조건당 %s회 측정\n" "$NROWS" "$WMEM" "$REPEAT"
+printf "store_sales %s 행 / work_mem %s (이 세션만) / 조건당 %s회 측정\n" "$NROWS" "$WMEM" "$REPEAT"
+# 문자열로 비교하면 안 된다 — SHOW 는 '4GB' 로 정규화해 돌려주므로 '4096MB' 와 안 맞는다.
+# 바이트로 환산해 비교한다.
+if [ "$(sql "SELECT pg_size_bytes(current_setting('work_mem')) = pg_size_bytes('$WORK_MEM')")" != "t" ]; then
+  printf "  [경고] work_mem 이 요청한 %s 로 안 잡혔다(실제 %s). PGOPTIONS 가 서버에 전달됐는지 확인할 것.\n" \
+         "$WORK_MEM" "$WMEM"
+fi
 if [ "${NROWS:-0}" -gt 20000000 ]; then
   cat <<WARN
 
@@ -85,9 +111,13 @@ if [ "${NROWS:-0}" -gt 20000000 ]; then
   다만 해시가 work_mem(${WMEM}) 을 넘기면 디스크로 흘러 **행수보다 가파르게** 느려진다.
   이 스크립트는 ②를 $((REPEAT + 1))회(워밍업 1 + 측정 ${REPEAT}) 돌린다.
 
+  work_mem 은 이 스크립트가 이미 ${WMEM} 로 잡아 두었다(PGOPTIONS, 이 세션만).
+  그래도 넘친다면 EXPLAIN 에 'Batches: N(N>1)' 이나 'Disk' 가 뜬다 — 그때 더 올린다.
+
   권장:
     ./t7-complex-sql.sh 1                 # 반복을 1회로 (총 2회 실행)
-    psql -c "SET work_mem='512MB'"        # 세션이 아니라 서버 기본값을 올려야 한다
+    ONLY=2 ./t7-complex-sql.sh 1          # 느린 절만 따로
+    WORK_MEM=512MB ./t7-complex-sql.sh    # RAM 이 부족한 장비면 낮춘다
   ③의 UNION 도 두 매장의 행을 전부 모아 중복 제거하므로 같은 성질을 갖는다.
   ①과 NULL 주입 실험은 규모와 거의 무관하다(아래 참고).
 
