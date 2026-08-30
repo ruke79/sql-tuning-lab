@@ -97,6 +97,20 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpch/t2-selectivity-sweep.sh 4.0      # random_page_cost=4.0 (HDD 가정) 비교
 ./scripts/tpch/t2-crossover-verify.sh           # 두 방식을 강제 실행해 '진짜 교차점' 측정
 ./scripts/tpch/join-method-compare.sh q03       # 조인 방식(NL/Hash/Merge) 강제 비교 (§T-3)
+./scripts/tpch/t8-combined-index.sh             # 조인키+필터 결합 인덱스 (§T-8)
+./scripts/tpch/t9-preaggregation.sh             # 반정규화 / 사전 집계와 그 대가 (§T-9)
+```
+
+§T-9 의 **유지 전략**(비정규화 값을 최신으로 유지하는 방법)은 별도 6종이다.
+스키마와 무관한 주제라 tpch 쪽에만 있다:
+
+```bash
+./scripts/tpch/t9-trigger-sync.sh               # 트리거 동기화의 쓰기 오버헤드
+./scripts/tpch/t9-concurrency.sh                # 동시성에서 드리프트가 생기는 지점
+./scripts/tpch/t9-lock-range.sh                 # FOR SHARE 의 락 범위 비용
+./scripts/tpch/t9-change-queue.sh               # 변경 큐 + 비동기 전파 (5방식 비교)
+./scripts/tpch/t9-queue-tuning.sh               # 워커 수 × 배치 크기 → 지연창
+./scripts/tpch/t9-notify-vs-poll.sh             # 폴링/NOTIFY/고정창/적응형/큐깊이 5파 비교
 ```
 
 **1억 건 이상**: `scripts/tpch/gen-official-dbgen.sh 100` (docker로 공식 dbgen 빌드/실행)
@@ -114,6 +128,31 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ```
 
 수록 쿼리: q03(기본 star join) q07(dim 4개) q19(6-way+비등가) q67(윈도우 rank)
+
+> 쿼리 이름이 tpch 와 다르다 — `--query=q03` 은 tpcds 에 없고 `q03_brand_by_year` 로 써야 한다.
+> 틀린 이름을 주면 사용 가능한 목록과 함께 실패한다.
+
+스타 스키마용 실험 스크립트 8종. tpch 판과 **결론이 갈리는 지점**이 있어 따로 두었다
+(자세한 실측은 매핑 문서 §T-2·§T-4·§T-6~§T-9):
+
+```bash
+./scripts/tpcds/t2-selectivity-sweep.sh         # 팩트 직접 vs 차원 경유 — 전환점이 다르다 (§T-2)
+./scripts/tpcds/t2-crossover-verify.sh 4        # 강제 실행으로 '진짜 전환점' 측정
+./scripts/tpcds/join-method-compare.sh q03_brand_by_year   # 조인 방식 강제 비교 (§T-3·T-5)
+./scripts/tpcds/t4-index-defeat.sh              # 인덱스를 무력화하는 5가지 (§T-4)
+./scripts/tpcds/t6-query-diagram.sh             # 필터를 약화시키면 진입점이 옮겨간다 (§T-6)
+./scripts/tpcds/t7-complex-sql.sh               # 아우터조인 필터위치 / NOT IN / UNION (§T-7)
+./scripts/tpcds/t8-combined-index.sh            # 조인키+필터 결합 인덱스 (§T-8)
+./scripts/tpcds/t9-preaggregation.sh            # 반정규화 / 사전 집계와 그 대가 (§T-9)
+```
+
+tpch 에서 얻은 결론을 그대로 옮기면 틀리는 곳이 셋 있다:
+
+| | tpch 결론 | tpcds 실측 |
+|---|---|---|
+| §T-8 커버링 인덱스 | "②에서 멈춰라 (이득 작음)" | ③이 ②를 **4.1배** 이긴다 (`Heap Fetches: 0`) |
+| §T-8 중복 인덱스 | "**좁은** 인덱스를 지워라" | 규칙은 "**작은** 쪽이 이긴다" — PK 를 못 지워도 결합 인덱스가 선택됨 |
+| §T-9 MV 유지비 | "접혀 있으니 유지도 쌀 것" | 점 변경 반영이 반정규화의 **38배** (REFRESH 는 증분이 아니다) |
 
 **1억 건 이상**: `scripts/tpcds/gen-official-dsdgen.sh 100 ./data/tpcds 8`
 (스케일 100 = store_sales 약 2.9억 건. 이 프로젝트가 쓰는 9개 테이블만 생성하므로 약 40GB,
