@@ -17,6 +17,7 @@
 #   ONLY=2 ./t7-complex-sql.sh      # ②만 실행 (절끼리 독립이다)
 #   ONLY=13 ./t7-complex-sql.sh 1   # ①③만, 반복 1회
 #   WORK_MEM=512MB ./t7-complex-sql.sh   # work_mem 낮춰 잡기 (기본 4096MB)
+#   DIAG=1 ./t7-complex-sql.sh           # 규모 진단만 (측정 없이 work_mem 적정치 확인)
 #
 # 병렬로 돌려 빠르게 하고 싶을 수 있는데 — 하면 안 된다. 절들을 동시에 실행하면
 # 서로 CPU·버퍼를 다투어 **측정값 자체가 오염된다**(§T-0 원칙 ⑥ 계열).
@@ -48,11 +49,23 @@ want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 #    8MB → Batches: 5   Memory Usage: 20529kB  Disk 7072kB 511 ms   ← 넘치기 시작
 #    4MB → HashAggregate 를 포기하고 Sort+Unique(external merge)로 계획이 바뀐다  375 ms
 #
-# 즉 이 쿼리 형상은 팩트 200만 행당 약 28.7MB 를 쓴다. 기본값 64MB 를 넘기는 지점은
-#   2,000,000 × 64MB / 28.7MB ≈ **457만 행**
-# 이다. 억 단위가 아니라 **수백만 행에서 이미 넘친다.**
-# (여기 "1.5억 행 이후"라고 적어 뒀다가 30배 틀린 것이 실사용에서 드러났다 —
-#  대규모 데이터에서 이 스크립트가 몇 시간 걸리던 것이 4GB 로 올리자 몇 분에 끝났다.)
+# 즉 ③은 팩트 200만 행당 약 28.7MB 를 쓴다. 기본값 64MB 를 넘기는 지점은 약 457만 행이다.
+#
+# 주의 3: **그런데 진짜 위험한 것은 ③이 아니라 ②다.** ③의 유출은 2배쯤 느려지는 일이지만,
+# ②는 work_mem 이 모자라면 **계획 자체가 무너진다.**
+#   work_mem ≥ 32MB → `hashed SubPlan`  : 해시 한 번 만들고 끝    (2M행에서 약 1초)
+#   work_mem ≤ 30MB → `SubPlan`         : **바깥 행마다 재실행**  (2M행에서 180초 초과)
+# 디스크로 흘리는 게 아니라 재실행이라 비용이 곱셈으로 뛴다. 실측 전환점은
+# 서브쿼리 **추정 행수** 기준 약 **17바이트/행** 이다(2,000,091행에서 30MB 부족 / 32MB 충분).
+#
+#   필요 work_mem ≈ 팩트 추정 행수 × 17B
+#     200만 행    →   32MB   (기본 64MB 로 충분)
+#     2,880만 행  →  490MB   ← 기본 64MB 로는 7.6배 부족 → SubPlan 으로 붕괴
+#     2.88억 행   →  4.9GB   ← **4096MB 로도 부족하다. 6GB 이상으로 잡을 것**
+#
+# 실제로 2,880만 행에서 이 스크립트가 몇 시간 걸리던 것이 4GB 로 올리자 몇 분에 끝났다.
+# 위 표가 그 이유다 — 4GB 가 490MB 요구를 넘겨서 hashed SubPlan 을 되찾은 것이다.
+# 규모를 바꿨다면 `DIAG=1 ./t7-complex-sql.sh` 로 먼저 확인할 것.
 WORK_MEM="${WORK_MEM:-4096MB}"
 export PGOPTIONS="-c work_mem=$WORK_MEM"
 
@@ -97,6 +110,96 @@ best_ms() { best_ms2 "$1" | cut -d'|' -f1; }
 node_of() { sql "EXPLAIN (COSTS OFF) $1" | grep -oE '(Parallel )?(Hash|Nested Loop|Merge) (Right |Left |Anti |Right Anti )?(Join|Anti Join)?' | head -1; }
 
 echo "§T-7 복잡한 SQL 의 함정 — TPC-DS"
+
+# ── 규모 진단 모드 (DIAG=1) ───────────────────────────────────────────
+# "지금 넘치는가, 10배 키우면 넘치는가"를 **추정이 아니라 실측으로** 답한다.
+#
+# 왜 필요한가: work_mem 을 얼마로 잡아야 하는지는 팩트 행수만으로 못 정한다.
+# ③이 훑는 것은 팩트 전체가 아니라 **매장 2곳의 몫**인데, 그 비율이 데이터 생성기에
+# 따라 다르기 때문이다 — 이 프로젝트 생성기는 store 를 12개로 고정하지만(2곳 = 약 17%),
+# 공식 dsdgen 은 스케일과 함께 store 도 늘린다(SF10 = 102개 → 2곳 = 약 2%).
+# 같은 팩트 행수라도 해시 크기가 8배 넘게 차이 난다. 그래서 재 봐야 한다.
+if [ "${DIAG:-0}" = "1" ]; then
+  NST=$(sql "SELECT count(*) FROM store")
+  NSS=$(sql "SELECT count(*) FROM store_sales")
+  N12=$(sql "SELECT count(*) FROM store_sales WHERE ss_store_sk IN (1,2)")
+  PCT=$(sql "SELECT round(100.0*$N12/$NSS,2)")
+  echo "── 규모 진단 ──"
+  printf "  store_sales %s 행 / store %s 개\n" "$NSS" "$NST"
+  printf "  ③ 이 훑는 2개 매장 = %s 행 (%s%%)\n" "$N12" "$PCT"
+  printf "  현재 work_mem = %s\n\n" "$(sql "SHOW work_mem")"
+
+  # 세 절의 무거운 쿼리를 각각 한 번씩 돌려 **어디가 넘치는지** 짚는다.
+  # 'temp read=/written=' 은 노드 종류를 가리지 않는 디스크 유출 지표다
+  # (HashAggregate 는 Disk Usage 도 같이 내지만, hashed SubPlan 은 안 낸다).
+  NI_DIAG="SELECT count(*) FROM customer c
+           WHERE c.c_customer_sk NOT IN (SELECT ss_customer_sk FROM store_sales)"
+
+  # ── 가장 중요한 점검: ②가 hashed SubPlan 을 받았는가 ──────────────
+  # 이건 "디스크로 흘렀다"(느려짐)와 **차원이 다른 문제**다.
+  # work_mem 이 모자라면 PostgreSQL 은 hashed SubPlan 을 **아예 포기하고**
+  # 평범한 SubPlan 으로 떨어진다 = 바깥 행마다 서브쿼리를 다시 실행한다.
+  # 해시를 디스크로 흘리는 게 아니라 **재실행**이라 비용이 곱셈으로 뛴다.
+  # 200만 행에서도 1초 → 180초 초과였다. 팩트가 커지면 시간 단위가 된다.
+  SP=$(sql "EXPLAIN $NI_DIAG" | grep -oE '(hashed SubPlan|SubPlan)' | head -1)
+  echo "  ② NOT IN 의 서브플랜 형태: ${SP:-?}"
+  if [ "$SP" = "hashed SubPlan" ]; then
+    echo "    ✓ 해시로 한 번에 처리한다 (정상)"
+  else
+    echo "    ✗ **평범한 SubPlan 이다 — 바깥 행마다 재실행한다.**"
+    echo "      work_mem 이 모자라 hashed 를 포기한 것이다. 올리면 즉시 해결된다."
+  fi
+  # 필요량 = 서브쿼리 **추정 행수** × 약 17바이트 (2,000,091행에서 30MB 부족 / 32MB 충분 실측)
+  ERows=$(sql "EXPLAIN SELECT ss_customer_sk FROM store_sales" | grep -oE 'rows=[0-9]+' | head -1 | grep -oE '[0-9]+')
+  sql "SELECT '    필요 work_mem ≈ '||pg_size_pretty((${ERows:-0}::bigint*17))||
+              '  (추정 행수 '||${ERows:-0}||' × 17B)   10배 규모면 ≈ '||
+              pg_size_pretty((${ERows:-0}::bigint*170))"
+  echo
+
+  echo "  절별 디스크 유출 점검 (temp = work_mem 을 넘겨 디스크로 흘린 양):"
+  diag_one() {  # $1 = 라벨, $2 = 쿼리
+    local o t s
+    o=$(sql "EXPLAIN (ANALYZE, BUFFERS) $2")
+    t=$(echo "$o" | grep -oE 'temp read=[0-9]+ written=[0-9]+' | head -1)
+    s=$(echo "$o" | grep -oE 'Execution Time: [0-9.]+' | grep -oE '[0-9.]+')
+    printf "    %-26s %10s ms   %s\n" "$1" "$s" "${t:-temp 없음 (넘치지 않음)}"
+  }
+  diag_one "① 아우터 조인" \
+    "SELECT count(*) FROM customer c LEFT JOIN store_sales s
+       ON c.c_customer_sk = s.ss_customer_sk AND s.ss_net_profit > 0"
+  diag_one "② NOT IN" \
+    "SELECT count(*) FROM customer c
+      WHERE c.c_customer_sk NOT IN (SELECT ss_customer_sk FROM store_sales)"
+  diag_one "③ UNION (서로소)" \
+    "SELECT ss_item_sk, ss_ticket_number FROM store_sales WHERE ss_store_sk=1
+     UNION SELECT ss_item_sk, ss_ticket_number FROM store_sales WHERE ss_store_sk=2"
+  echo
+
+  DQ="SELECT ss_item_sk, ss_ticket_number FROM store_sales WHERE ss_store_sk=1
+      UNION SELECT ss_item_sk, ss_ticket_number FROM store_sales WHERE ss_store_sk=2"
+  DOUT=$(sql "EXPLAIN (ANALYZE) $DQ")
+  ST=$(echo "$DOUT" | grep -oE 'Batches: [0-9]+  Memory Usage: [0-9]+kB( +Disk Usage: [0-9]+kB)?' | head -1)
+  KB=$(echo "$ST" | grep -oE 'Memory Usage: [0-9]+' | grep -oE '[0-9]+')
+  BAT=$(echo "$ST" | grep -oE 'Batches: [0-9]+' | grep -oE '[0-9]+')
+  echo "  ③ 의 중복 제거 노드 상세:"
+  echo "    ${ST:-(HashAggregate 가 아니라 Sort+Unique 로 계획이 잡혔다 — 이미 넘쳤다는 뜻)}"
+  if [ -n "$KB" ]; then
+    # 이 노드가 실제로 처리한 행당 비용으로만 외삽한다. 팩트 행수가 아니라
+    # **이 노드를 통과한 행수**가 기준이라야 store 수 변화에 속지 않는다.
+    echo
+    echo "  10배 규모 예측 (store 수가 그대로일 때):"
+    sql "SELECT '    필요 메모리 ≈ '||pg_size_pretty(($KB*10)::bigint*1024)||
+                '   → 현재 work_mem 으로 '||
+                CASE WHEN ($KB*10)::bigint*1024 < pg_size_bytes(current_setting('work_mem'))
+                     THEN '충분' ELSE '부족 (올려야 한다)' END"
+    echo "    ※ store 수가 함께 늘어나면(공식 dsdgen) 이 값은 그만큼 줄어든다."
+    echo "       스케일을 바꾼 뒤에는 DIAG=1 로 다시 재는 것이 정확하다."
+    [ "${BAT:-1}" -gt 1 ] && echo "    ※ 지금 이미 Batches>1 이다 — 현재 규모에서 벌써 넘치고 있다."
+  fi
+  echo
+  echo "  (측정은 건너뛴다. 본 실습은 DIAG 없이 실행할 것)"
+  exit 0
+fi
 
 # ── 규모 경고 ────────────────────────────────────────────────────────
 # ②의 NOT IN 은 ss_customer_sk 전량으로 해시를 만든다. 그게 이 실습의 요점이지만
