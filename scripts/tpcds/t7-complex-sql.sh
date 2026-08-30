@@ -14,11 +14,19 @@
 # 사용법:
 #   ./t7-complex-sql.sh          # 기본 3회 측정
 #   ./t7-complex-sql.sh 5
+#   ONLY=2 ./t7-complex-sql.sh      # ②만 실행 (절끼리 독립이다)
+#   ONLY=13 ./t7-complex-sql.sh 1   # ①③만, 반복 1회
+#
+# 병렬로 돌려 빠르게 하고 싶을 수 있는데 — 하면 안 된다. 절들을 동시에 실행하면
+# 서로 CPU·버퍼를 다투어 **측정값 자체가 오염된다**(§T-0 원칙 ⑥ 계열).
+# 빠르게 하려면 병렬이 아니라 ONLY 로 범위를 줄이거나 REPEAT 을 낮춘다.
 #
 # 선행 조건: tpcds schema → load → index (§0-4)
 set -uo pipefail
 
 REPEAT="${1:-3}"
+ONLY="${ONLY:-123}"        # 예: ONLY=2 ./t7-complex-sql.sh  → ②만 실행
+want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 PGHOST_="${PGHOST:-localhost}"
 PGPORT_="${PGPORT:-5432}"
 CONTAINER="${CONTAINER:-tuninglab-postgres}"
@@ -35,15 +43,28 @@ if ! sql "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
 fi
 
 ms_of() { echo "$1" | grep -oE 'Execution Time: [0-9.]+' | grep -oE '[0-9.]+'; }
-best_ms() {
-  local Q="$1" b="" v
-  sql "EXPLAIN (ANALYZE) $Q" >/dev/null 2>&1
+
+# best_ms 는 실행시간과 **결과 행수를 함께** 얻는다.
+# 행수를 따로 SELECT count(*) 로 재면 같은 스캔을 한 번 더 도는 셈인데,
+# EXPLAIN (ANALYZE) 의 최상위 노드 actual rows 가 이미 그 값이다.
+# (③에서 이 중복이 full scan 4회였다 — 측정과 무관한 순수 낭비였다.)
+#
+# 주의: 전역 변수에 담아 돌려주면 안 된다. 호출부가 $(best_ms ...) 라 **서브셸**에서
+# 실행되므로 대입이 부모에 안 남는다(실제로 그렇게 만들었다가 행수가 빈칸으로 나왔다).
+# 그래서 "시간|행수" 한 줄로 돌려주고 호출부에서 자른다.
+best_ms2() {
+  local Q="$1" b="" v out rows
+  sql "EXPLAIN (ANALYZE) $Q" >/dev/null 2>&1          # 워밍업
   for _ in $(seq "$REPEAT"); do
-    v=$(ms_of "$(sql "EXPLAIN (ANALYZE) $Q")")
+    out=$(sql "EXPLAIN (ANALYZE) $Q")
+    v=$(ms_of "$out")
     [ -z "$b" ] && b="$v" || b=$(awk -v a="$b" -v c="$v" 'BEGIN{print (c+0<a+0)?c:a}')
   done
-  echo "$b"
+  # 최상위 노드의 actual rows = 결과 행수
+  rows=$(echo "$out" | grep -oE 'rows=[0-9]+ loops=' | head -1 | grep -oE '[0-9]+')
+  echo "${b}|${rows}"
 }
+best_ms() { best_ms2 "$1" | cut -d'|' -f1; }
 node_of() { sql "EXPLAIN (COSTS OFF) $1" | grep -oE '(Parallel )?(Hash|Nested Loop|Merge) (Right |Left |Anti |Right Anti )?(Join|Anti Join)?' | head -1; }
 
 echo "§T-7 복잡한 SQL 의 함정 — TPC-DS"
@@ -75,6 +96,7 @@ fi
 echo
 
 # ══════════════════════════════════════════════════════════════════════
+if want 1; then
 echo "── ① 아우터 조인의 필터 위치: ON 절 vs WHERE 절 ──"
 echo "   \"매출이 있으면 이익 나는 건만, 없으면 없는 대로\" 를 뜻하는 질문이다."
 echo
@@ -105,8 +127,10 @@ echo "  WHERE 절의 s.ss_net_profit > 0 은 NULL 로 채워진 행을 전부 �
 echo "  옵티마이저는 그것을 알고 아우터 조인 자체를 이너로 되돌린다(join strength reduction)."
 echo "  → 에러도 경고도 없다. 행수를 세어 보지 않으면 영원히 모른다."
 echo
+fi
 
 # ══════════════════════════════════════════════════════════════════════
+if want 2; then
 echo "── ② NOT IN vs NOT EXISTS ──"
 echo
 
@@ -144,25 +168,25 @@ echo
 echo "  → NOT IN 은 느린 게 문제가 아니라 **틀릴 수 있는 것**이 문제다."
 echo "     느린 것은 그 위험을 감수하느라 치르는 대가일 뿐이다."
 echo
+fi
 
 # ══════════════════════════════════════════════════════════════════════
+if want 3; then
 echo "── ③ UNION vs UNION ALL ──"
 echo
 echo "   (가) 두 가지가 겹치는 경우 — 답이 다르므로 바꿔 쓰면 안 된다"
 O1="SELECT ss_customer_sk FROM store_sales WHERE ss_store_sk=1"
 O2="SELECT ss_customer_sk FROM store_sales WHERE ss_store_sk=2"
-UO=$(sql "SELECT count(*) FROM ($O1 UNION $O2) x")
-AO=$(sql "SELECT count(*) FROM ($O1 UNION ALL $O2) x")
-TUO=$(best_ms "$O1 UNION $O2"); TAO=$(best_ms "$O1 UNION ALL $O2")
+R=$(best_ms2 "$O1 UNION $O2");     TUO=${R%|*}; UO=${R#*|}
+R=$(best_ms2 "$O1 UNION ALL $O2"); TAO=${R%|*}; AO=${R#*|}
 printf "     UNION     %10s 행  %9s ms\n" "$UO" "$TUO"
 printf "     UNION ALL %10s 행  %9s ms   ← 행수가 다르다\n" "$AO" "$TAO"
 echo
 echo "   (나) 두 가지가 겹치지 않는 경우 — 답이 같은데 중복 제거만 한다"
 D1="SELECT ss_item_sk, ss_ticket_number FROM store_sales WHERE ss_store_sk=1"
 D2="SELECT ss_item_sk, ss_ticket_number FROM store_sales WHERE ss_store_sk=2"
-UD=$(sql "SELECT count(*) FROM ($D1 UNION $D2) x")
-AD=$(sql "SELECT count(*) FROM ($D1 UNION ALL $D2) x")
-TUD=$(best_ms "$D1 UNION $D2"); TAD=$(best_ms "$D1 UNION ALL $D2")
+R=$(best_ms2 "$D1 UNION $D2");     TUD=${R%|*}; UD=${R#*|}
+R=$(best_ms2 "$D1 UNION ALL $D2"); TAD=${R%|*}; AD=${R#*|}
 printf "     UNION     %10s 행  %9s ms   (%s)\n" "$UD" "$TUD" "$(sql "EXPLAIN (COSTS OFF) $D1 UNION $D2" | head -1 | sed 's/^ *//')"
 printf "     UNION ALL %10s 행  %9s ms   (%s)\n" "$AD" "$TAD" "$(sql "EXPLAIN (COSTS OFF) $D1 UNION ALL $D2" | head -1 | sed 's/^ *//')"
 if [ "$UD" = "$AD" ]; then
@@ -177,4 +201,5 @@ echo "    옵티마이저는 그것을 알 방법이 없어 (나)에서도 성�
 echo "    Millsap 12장의 6.5시간 → 10.9초 사례가 정확히 (나) 유형이다 —"
 echo "    분기가 서로소인 것을 개발자만 알고 있었고, DB 는 매번 전체를 정렬하고 있었다."
 echo
+fi
 echo "정리: 이 스크립트는 임시 테이블(ss_probe)을 만들고 스스로 지운다. 남는 것은 없다."
