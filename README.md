@@ -118,11 +118,16 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 > 다른 실습의 측정 조건을 바꾸지 않기 위해서다. RAM 이 작은 장비면 낮춰 잡는다:
 > `WORK_MEM=512MB ./scripts/tpch/t8-combined-index.sh`
 >
-> 다만 **작은 데이터에서는 올려도 아무 일도 안 일어난다.** `work_mem` 은 미리 잡아 두는
-> 양이 아니라 상한이라, 넘칠 일이 없으면 그대로다 — SF=0.5 tpch·200만 행 tpcds 에서
-> 64MB 와 4GB 의 `Batches: 1  Memory Usage` 가 바이트까지 같았고 실행시간도 같았다.
-> 실제로 듣는 것은 해시가 넘치기 시작하는 대규모(대략 팩트 1.5억 행 이후)부터다.
-> 넘치는지는 `EXPLAIN` 에 `Batches: N(N>1)` 이나 `Disk` 가 뜨는지로 판별한다.
+> **왜 4GB 인가 — 넘치는 순간 비용이 계단처럼 뛰기 때문이다.** `work_mem` 은 미리 잡아 두는
+> 양이 아니라 상한이라, 넘칠 일이 없으면 올려도 그대로다(200만 행 tpcds·SF=0.5 tpch 에서
+> 64MB 와 4GB 의 `Batches: 1  Memory Usage` 가 바이트까지 같았다). 그래서 **작은 데이터에서는
+> 효과가 없고, 넘기는 순간부터 지배적이 된다.** 그 경계는 생각보다 낮다 —
+> `t7` 의 `UNION` 은 팩트 200만 행당 약 28.7MB 를 쓰므로 기본값 64MB 를 넘기는 지점이
+> **약 457만 행**이다. 억 단위가 아니라 수백만 행이다.
+> (실제로 대규모 데이터에서 `t7-complex-sql.sh` 가 몇 시간 걸리던 것이 4GB 로 올리자 몇 분에 끝났다.)
+>
+> 넘치는지는 `EXPLAIN` 에 `Batches: N(N>1)` 이나 `Disk Usage` 가 뜨는지로 판별한다.
+> 그래도 뜨면 더 올린다 — 넘치는 쪽이 항상 더 비싸다.
 
 **1억 건 이상**: `scripts/tpch/gen-official-dbgen.sh 100` (docker로 공식 dbgen 빌드/실행)
 → 대용량 적재는 `scripts/tpch/load-postgres-copy.sh` (COPY, JDBC 대비 5~10배 빠름)

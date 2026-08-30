@@ -37,13 +37,22 @@ want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 # 정렬·해시 노드가 여럿인 계획을 워커 4개로 돌리면 이 값의 몇 배를 잡을 수 있다.
 # 팩트가 크고 RAM 이 작은 장비에서는 낮춰 잡아야 한다:  WORK_MEM=512MB ./t7-complex-sql.sh
 #
-# 주의 2: **작은 데이터에서는 올려도 아무 일도 안 일어난다.** 실측으로 확인했다 —
-# store_sales 200만 행에서 ③의 HashAggregate 는 64MB 든 4GB 든 똑같이
-#   Batches: 1  Memory Usage: 28689kB
-# 로 끝난다. 애초에 넘치지 않으니 더 줘도 쓸 데가 없다. 전체 실행시간도 동일했다
-# (4GB 9.0~9.7초 vs 64MB 9.6초). work_mem 이 실제로 듣기 시작하는 것은
-# 28.7MB 짜리 해시가 work_mem 을 넘길 때, 즉 이 형상에서 대략 팩트 1.5억 행 이후다.
-# 그 전까지 이 값은 "혹시 몰라 열어 둔 여유"이지 튜닝이 아니다.
+# 주의 2: **200만 행에서는** 올려도 아무 일도 안 일어난다. ③의 HashAggregate 가
+# 64MB 든 4GB 든 똑같이 Batches: 1 / Memory Usage: 28689kB 로 끝나기 때문이다.
+# 하지만 그건 이 규모 한정이고, **조금만 커지면 급격히 중요해진다.**
+#
+# work_mem 을 낮춰 가며 넘치는 지점을 실측했다(200만 행, 같은 ③ 쿼리):
+#   64MB → Batches: 1   Memory Usage: 28689kB              347 ms
+#   32MB → Batches: 1   Memory Usage: 26641kB              321 ms
+#   16MB → Batches: 1   Memory Usage: 25617kB              322 ms
+#    8MB → Batches: 5   Memory Usage: 20529kB  Disk 7072kB 511 ms   ← 넘치기 시작
+#    4MB → HashAggregate 를 포기하고 Sort+Unique(external merge)로 계획이 바뀐다  375 ms
+#
+# 즉 이 쿼리 형상은 팩트 200만 행당 약 28.7MB 를 쓴다. 기본값 64MB 를 넘기는 지점은
+#   2,000,000 × 64MB / 28.7MB ≈ **457만 행**
+# 이다. 억 단위가 아니라 **수백만 행에서 이미 넘친다.**
+# (여기 "1.5억 행 이후"라고 적어 뒀다가 30배 틀린 것이 실사용에서 드러났다 —
+#  대규모 데이터에서 이 스크립트가 몇 시간 걸리던 것이 4GB 로 올리자 몇 분에 끝났다.)
 WORK_MEM="${WORK_MEM:-4096MB}"
 export PGOPTIONS="-c work_mem=$WORK_MEM"
 
