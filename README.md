@@ -75,6 +75,28 @@ cd docker && docker compose up -d && cd ..
 
 모든 모듈은 인자 없이 실행하면 사용법을 출력한다: `./gradlew :tpch:bootRun`
 
+> **Docker 없이 호스트 PostgreSQL 로 돌리는 환경이라면 — 컨테이너·VM 이 재생성된 뒤 복구.**
+> ```bash
+> ./scripts/restore-lab.sh --check   # 점검만 (아무것도 바꾸지 않는다)
+> ./scripts/restore-lab.sh           # 빠진 것만 복구
+> ```
+> 클러스터 기동 → 롤 `tuner` → DB `tpch`/`tpcds` → **측정 조건**(`shared_buffers=1GB`,
+> `work_mem=64MB`, `max_parallel_workers_per_gather=4`) → 비어 있는 DB 만 재적재 순으로 확인한다.
+> **데이터가 있으면 건드리지 않는다.**
+>
+> 증상이 서로 비슷해 헷갈리므로 대응을 적어 둔다:
+>
+> | 증상 | 실제 원인 |
+> |---|---|
+> | `Connection refused` | 클러스터가 down |
+> | `password authentication failed for "tuner"` | 롤이 사라짐 |
+> | `database "tpcds" does not exist` | DB 가 사라짐 |
+> | `relation "store_sales" does not exist` | 데이터만 사라짐 |
+> | 측정값이 문서와 배수로 다름 | 서버 설정이 기본값으로 돌아감 |
+>
+> 마지막 항목이 제일 위험하다 — 아무 에러 없이 **숫자만 조용히 틀린다.**
+> 실습 잔여물(중간에 끊긴 스크립트가 남긴 `lineitem` 트리거 등)도 함께 경고한다.
+
 ## 모듈별 사용법
 
 ### :tpch — 다중 테이블 조인 / 서브쿼리 / 파티셔닝 / Parallel Scan
