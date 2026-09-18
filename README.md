@@ -121,6 +121,7 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpch/join-method-compare.sh q03       # 조인 방식(NL/Hash/Merge) 강제 비교 (§T-3)
 ./scripts/tpch/t8-combined-index.sh             # 조인키+필터 결합 인덱스 (§T-8)
 ./scripts/tpch/t9-preaggregation.sh             # 반정규화 / 사전 집계와 그 대가 (§T-9)
+./scripts/tpch/mt-tenant-isolation.sh           # 멀티테넌시 — 테넌트 키가 팩트에 없을 때 (§X-1)
 ```
 
 §T-9 의 **유지 전략**(비정규화 값을 최신으로 유지하는 방법)은 별도 6종이다.
@@ -198,6 +199,14 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 스키마** 를 같은 데이터로 놓고 여섯 가지를 잰다 — 테넌트 조회, RLS 오버헤드, `WHERE` 누락 유출,
 교차 테넌트 집계, DDL 팬아웃, 시끄러운 이웃. 파티션은 격리가 아니고, 스키마 분리는 CPU 를
 격리하지 않으며, 풀 모델의 진짜 이웃 문제는 흩어짐이라는 것이 실측으로 나온다.
+
+> **tpch 판(`scripts/tpch/mt-tenant-isolation.sh`)은 같은 주제의 다른 질문이다.** tpcds 는
+> 테넌트(매장)가 팩트에 **직접** 있어서 바로 전략을 고르면 되지만, tpch 는 테넌트(국가)가
+> `lineitem → orders → customer` 로 **2조인 떨어져 있다.** 그래서 RLS 정책을 쓸 컬럼도,
+> 파티션 키로 쓸 컬럼도 없고, **비정규화를 먼저 지불해야** 선택지가 열린다.
+> 대신 tpcds 에 없던 축이 생긴다 — **테넌트 이동**(고객이 국가를 옮긴다). 거기서는 정규화가
+> 압도한다(0.16ms vs 1.1~1.8ms). 두 판을 같이 읽어야 "테넌트 키가 팩트 행에 있는가"가
+> 먼저 답해야 할 질문이라는 게 보인다. 자세한 실측은 매핑 문서 §X-1.
 
 tpch 에서 얻은 결론을 그대로 옮기면 틀리는 곳이 셋 있다:
 
