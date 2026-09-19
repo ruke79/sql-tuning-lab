@@ -87,11 +87,19 @@ cd docker && docker compose up -d && cd ..
 > (`FATAL: password authentication failed for user "verifylab"`)은 HTML 리포트 안에 있다 —
 > `verify-lab/build/reports/tests/test/index.html`.
 >
-> 고치는 법은 한 줄이다:
+> 고치는 법 — **호스트에서** 실행한다. 컨테이너에 들어갈 필요 없다:
 > ```bash
 > ./scripts/verify/setup-verifylab.sh          # verifylab DB/계정 생성 (멱등)
 > ```
-> PostgreSQL 이 안 떠 있다면 `./scripts/restore-lab.sh` 를 먼저 돌린다.
+> 호스트에 `psql` 이 있으면 그걸로 붙고, 없거나 접속이 안 되면 `docker exec` 로 컨테이너
+> 안의 `psql` 을 쓴다. 어느 경로로 붙었는지 첫 줄에 출력한다.
+>
+> 슈퍼유저 기본값은 **`tuner`** 다 — compose 의 `POSTGRES_USER` 가 `tuner` 라서 그 인스턴스에는
+> `postgres` 롤이 아예 없다. 호스트에 직접 설치한 PostgreSQL 을 쓴다면 `PGSUPER=postgres` 를 준다.
+> 접속에 실패하면 무엇을 확인해야 하는지 안내를 출력하고 멈춘다.
+>
+> PostgreSQL 자체가 안 떠 있다면 `docker compose -f docker/docker-compose.yml up -d postgres`
+> (호스트 설치판이면 `./scripts/restore-lab.sh`) 를 먼저 돌린다.
 > Kafka 케이스는 브로커가 없으면 실패가 아니라 `SKIPPED` 로 넘어간다(정상).
 
 > **Docker 없이 호스트 PostgreSQL 로 돌리는 환경이라면 — 컨테이너·VM 이 재생성된 뒤 복구.**

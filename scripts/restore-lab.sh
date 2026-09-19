@@ -195,7 +195,8 @@ else
     say  "       ./scripts/verify/setup-verifylab.sh"
   else
     act "verifylab DB/계정을 만든다"
-    PGSUPER=tuner PGPASSWORD=tuner "$HERE/scripts/verify/setup-verifylab.sh" 2>&1 | sed 's/^/     /'
+    # 스크립트가 스스로 호스트/도커 경로와 슈퍼유저를 판별한다 — 여기서 넘기지 않는다.
+    "$HERE/scripts/verify/setup-verifylab.sh" 2>&1 | sed 's/^/     /'
     CHANGED=1
   fi
 fi
