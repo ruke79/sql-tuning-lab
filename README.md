@@ -228,6 +228,7 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpcds/t8-combined-index.sh            # 조인키+필터 결합 인덱스 (§T-8)
 ./scripts/tpcds/t9-preaggregation.sh            # 반정규화 / 사전 집계와 그 대가 (§T-9)
 ./scripts/tpcds/mt-tenant-isolation.sh          # 멀티테넌시 격리 3전략 비교 — 책 밖 주제 (§X-1)
+./scripts/tpcds/mt-tenant-isolation-mysql.sh    # 같은 데이터를 MySQL/InnoDB 로 (§X-1)
 ```
 
 `mt-tenant-isolation.sh` 는 매장을 테넌트로 삼아 **공유 테이블(+RLS) / LIST 파티션 / 테넌트별
@@ -242,6 +243,14 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 > 대신 tpcds 에 없던 축이 생긴다 — **테넌트 이동**(고객이 국가를 옮긴다). 거기서는 정규화가
 > 압도한다(0.16ms vs 1.1~1.8ms). 두 판을 같이 읽어야 "테넌트 키가 팩트 행에 있는가"가
 > 먼저 답해야 할 질문이라는 게 보인다. 자세한 실측은 매핑 문서 §X-1.
+
+> **MySQL 판(`mt-tenant-isolation-mysql.sh`)은 엔진 축을 더해 2×2 를 채운다.** InnoDB 는 PK 가
+> 곧 클러스터드 인덱스라, PostgreSQL 이 `CLUSTER`(일회성)로 풀던 흩어짐을 **PK 선두 설계로
+> 구조적으로 없앨 수 있다** — 한 매장 전체 집계가 365ms → 51ms. 커버링 인덱스로 같은 값이 나오는
+> 것이 비용의 정체가 '클러스터드 인덱스 되찾기'라는 증거다. 다만 이웃 문제는 그래도 안 풀린다 —
+> 이웃 1회가 6배 싸졌는데 피해는 오히려 늘었다(싸지면 더 자주 온다). tpch 판에서는 같은 PK 선두
+> 결정이 대량 이관 1.5배라는 청구서를 받았지만, tpcds 의 매장은 SCD Type 2 로 안 움직여 그
+> 청구서가 없다. **같은 전략이 칸에 따라 최선이기도 손해이기도 하다.**
 
 tpch 에서 얻은 결론을 그대로 옮기면 틀리는 곳이 셋 있다:
 
