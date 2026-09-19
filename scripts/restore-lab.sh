@@ -12,6 +12,7 @@
 #   database "tpcds" does not exist               DB 가 사라짐         DB 재생성
 #   relation "store_sales" does not exist         데이터만 사라짐      generate→schema→load→index
 #   측정값이 문서와 배수로 다름                   서버 설정이 기본값   측정 조건으로 되돌림
+#   gradlew build 가 verify-lab:test 에서 실패  verifylab DB 없음    setup-verifylab.sh 실행
 #
 # **데이터가 남아 있으면 건드리지 않는다.** 재적재는 비어 있을 때만 한다.
 #
@@ -183,6 +184,22 @@ fi
 # ── 6) 실습 잔여물 ────────────────────────────────────────────────────
 # 실험 스크립트는 스스로 지우지만, 중간에 끊기면 남는다. 남으면 다음 측정을 오염시킨다
 # (특히 lineitem 의 트리거는 **모든 쓰기**에 붙는다).
+# verify-lab 테스트가 쓰는 DB. 없으면 ./gradlew build 가 :verify-lab:test 에서 죽는데,
+# 콘솔 에러(DialectFactoryImpl:191)가 원인을 안 알려줘서 헤매기 쉽다 — 여기서 짚어 준다.
+VL=$(as_pg "SELECT count(*) FROM pg_database WHERE datname='verifylab'")
+if [ "${VL:-0}" = "1" ]; then
+  ok "verifylab DB 있음 (./gradlew build 가 이걸 요구한다)"
+else
+  if [ "$MODE" = "--check" ]; then
+    warn "verifylab DB 없음 — ./gradlew build 가 :verify-lab:test 에서 실패한다"
+    say  "       ./scripts/verify/setup-verifylab.sh"
+  else
+    act "verifylab DB/계정을 만든다"
+    PGSUPER=tuner PGPASSWORD=tuner "$HERE/scripts/verify/setup-verifylab.sh" 2>&1 | sed 's/^/     /'
+    CHANGED=1
+  fi
+fi
+
 LEFT=$(t_sql tpch "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't_sync%'")
 LEFT2=$(t_sql tpcds "SELECT count(*) FROM pg_class WHERE relname LIKE 'mt\_%' OR relname IN ('ss_probe','ss_denorm')")
 # 실험이 만든 인덱스도 잔여물이다. §T-8 은 정리 명령을 **출력만** 하므로 손으로 안 지우면 남고,

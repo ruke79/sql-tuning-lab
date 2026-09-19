@@ -75,6 +75,25 @@ cd docker && docker compose up -d && cd ..
 
 모든 모듈은 인자 없이 실행하면 사용법을 출력한다: `./gradlew :tpch:bootRun`
 
+> **`./gradlew build` 가 `:verify-lab:test` 에서 실패한다면 — DB 가 없어서다.**
+> ```
+> VerificationRegistryTest > ... FAILED
+>   Caused by: org.hibernate.HibernateException at DialectFactoryImpl.java:191
+> ```
+> `verify-lab` 의 테스트는 `@SpringBootTest` 라 JPA 컨텍스트를 띄우고, Hibernate 는 **살아 있는
+> JDBC 연결**로 방언(dialect)을 판정한다. `verifylab` DB/계정이 없으면 연결이 실패하고
+> "Unable to determine Dialect without JDBC metadata" 로 컨텍스트가 통째로 죽는다.
+> 콘솔에는 `DialectFactoryImpl:191` 까지만 보이고 진짜 원인
+> (`FATAL: password authentication failed for user "verifylab"`)은 HTML 리포트 안에 있다 —
+> `verify-lab/build/reports/tests/test/index.html`.
+>
+> 고치는 법은 한 줄이다:
+> ```bash
+> ./scripts/verify/setup-verifylab.sh          # verifylab DB/계정 생성 (멱등)
+> ```
+> PostgreSQL 이 안 떠 있다면 `./scripts/restore-lab.sh` 를 먼저 돌린다.
+> Kafka 케이스는 브로커가 없으면 실패가 아니라 `SKIPPED` 로 넘어간다(정상).
+
 > **Docker 없이 호스트 PostgreSQL 로 돌리는 환경이라면 — 컨테이너·VM 이 재생성된 뒤 복구.**
 > ```bash
 > ./scripts/restore-lab.sh --check   # 점검만 (아무것도 바꾸지 않는다)
@@ -122,7 +141,15 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpch/t8-combined-index.sh             # 조인키+필터 결합 인덱스 (§T-8)
 ./scripts/tpch/t9-preaggregation.sh             # 반정규화 / 사전 집계와 그 대가 (§T-9)
 ./scripts/tpch/mt-tenant-isolation.sh           # 멀티테넌시 — 테넌트 키가 팩트에 없을 때 (§X-1)
+./scripts/tpch/mt-tenant-isolation-mysql.sh     # 같은 질문을 MySQL/InnoDB 로 (§X-1)
 ```
+
+> **MySQL 판은 엔진 차이만 재는 실습이다.** 같은 데이터·같은 메모리(buffer pool 1GB)로 맞춰도
+> PostgreSQL 에서 나올 수 없는 것이 넷 나온다 — RLS 가 없어 **격리가 정책이 아니라 권한에서**
+> 나오고, InnoDB 의 PK 가 클러스터드라 **테넌트를 PK 선두에 두면 6배** 빨라지며(그 대신 테넌트
+> 이동이 1.5배 비싸진다), 파티션 키는 **PK 에 반드시 포함돼야 하고**(`ERROR 1503`), 스키마와
+> 데이터베이스가 같은 것이라 전략 C 와 D 의 경계가 흐리다.
+> `./gradlew :tpch:bootRun --args="load --db=mysql"` 로 적재해 두어야 한다.
 
 §T-9 의 **유지 전략**(비정규화 값을 최신으로 유지하는 방법)은 별도 6종이다.
 스키마와 무관한 주제라 tpch 쪽에만 있다:
