@@ -283,6 +283,19 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 
 **1억 건**: `--scale=1000` (Java 적재도 가능하지만 공식이 빠름: `scripts/pgbench/run-official-pgbench.sh init 1000`)
 
+인덱스의 **쓰기 비용**(§T-8 후반)은 스크립트로 자동화되어 있다. pgbench_lab 이 없으면 만든다:
+
+```bash
+./scripts/pgbench/t8-dml-cost.sh                # 전부 (약 6분)
+ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
+```
+
+> **"인덱스를 늘리면 TPS 가 떨어진다"는 절반만 맞다.** 같은 개수를 늘려도 `(filler)` 는 HOT 을
+> 안 깨고 `(abalance)` 는 0% 로 무너뜨린다 — 갱신되는 컬럼인가가 먼저다. 그리고 그 비용은
+> **TPS 에 거의 안 나타난다**: HOT 68%→0%, 레코드 WAL +75% 인데 TPS 는 3~6% 다(편차 안이다).
+> 전역 지표가 국소 변화를 삼킨 경우라 `n_tup_hot_upd` 와 `pg_stat_wal` 을 봐야 한다.
+> fillfactor 를 100→90 으로 내리면 HOT 이 100% 가 되고, 70 까지 더 내려도 남는 이득이 없다.
+
 실험 아이디어:
 - `docker/postgres/postgresql.conf` 의 `shared_buffers` 128MB↔4GB → hit ratio와 TPS
 - `synchronous_commit = off` → WAL flush 대기 제거 효과
