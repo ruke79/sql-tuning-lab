@@ -86,6 +86,7 @@ node()   { echo "$1" | grep -oE "(Parallel )?(Bitmap Heap Scan|Seq Scan|Index Sc
 lossy()  { echo "$1" | grep -oE "lossy=[0-9]+" | grep -oE "[0-9]+" | head -1; }
 exactb() { echo "$1" | grep -oE "exact=[0-9]+" | grep -oE "[0-9]+" | head -1; }
 recheck(){ echo "$1" | grep -oE "Rows Removed by Index Recheck: [0-9]+" | grep -oE "[0-9]+" | head -1; }
+wrk()    { local w; w=$(echo "$1" | grep -oE "Workers Planned: [0-9]+" | grep -oE "[0-9]+" | head -1); echo "${w:-직렬}"; }
 bufs()   { echo "$1" | awk '/Buffers: shared/{h=0;r=0;
              if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4);
              if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5);
@@ -139,29 +140,52 @@ fi
 if want 2; then
 echo "── ② q13 — 인덱스가 조인 방식을 갈아치웠다 ──"
 echo
-printf "  %s%10s %14s   %s\n" "$(padr 조건 30)" "$(padl 시간ms 10)" "$(padl buffers 14)" "계획 맨 위 조인"
-printf "  %s\n" "-------------------------------------------------------------------------------------"
-BASEB=""; BASEJ=""
+# **손잡이가 둘이고 서로 독립이다.**
+#   A. 계획을 되돌린다        — 인덱스가 고른 Merge/Index 경로를 막는다
+#   B. 병렬을 얻는다          — q13 은 인덱스가 있든 없든 **직렬**이다(§T-6 확장 ①).
+#                               고카디널리티 GROUP BY 라 Gather 통과 행이 많아 비용이 거절한다.
+# A 는 접근량(buffers)을 줄이고 B 는 같은 일을 나눠 든다 — 그래서 **같이 걸면 더 내려간다.**
+printf "  %s%10s %14s %7s   %s\n" "$(padr 조건 34)" "$(padl 시간ms 10)" "$(padl buffers 14)" "$(padl 워커 7)" "계획 맨 위 조인"
+printf "  %s\n" "--------------------------------------------------------------------------------------------"
+BASEB=""; BASEJ=""; BASET=""
+declare -A T13
 for c in "기본 (그대로)|" \
-         "enable_mergejoin=off|SET enable_mergejoin=off;" \
-         "enable_indexscan=off|SET enable_indexscan=off;"; do
+         "A  enable_indexscan=off|SET enable_indexscan=off;" \
+         "A' enable_mergejoin=off|SET enable_mergejoin=off;" \
+         "B  parallel_tuple_cost=0.01|SET parallel_tuple_cost=0.01;" \
+         "A+B 둘 다|SET enable_indexscan=off; SET parallel_tuple_cost=0.01;"; do
   LBL="${c%%|*}"; S="${c#*|}"
-  P=$(plan "$S" "$Q13"); B=$(bufs "$P")
+  P=$(plan "$S" "$Q13"); B=$(bufs "$P"); T=$(best "$S" "$Q13")
   J=$(echo "$P" | grep -oE "(Merge|Hash|Nested)[A-Za-z ]*Join" | head -1)
-  [ -z "$BASEB" ] && { BASEB="$B"; BASEJ="$J"; }
-  printf "  %s%10s %14s   %s\n" "$(padr "$LBL" 30)" "$(best "$S" "$Q13")" "$B" "${J:-?}"
+  [ -z "$BASEB" ] && { BASEB="$B"; BASEJ="$J"; BASET="$T"; }
+  T13["$LBL"]="$T"
+  printf "  %s%10s %14s %7s   %s\n" "$(padr "$LBL" 34)" "$T" "$B" "$(wrk "$P")" "${J:-?}"
 done
+echo
+# 두 손잡이가 곱해지는지(=독립인지) 숫자로 확인한다. 합쳐서 더 안 내려가면 독립이 아니다.
+awk -v base="${BASET:-0}" -v a="${T13[A  enable_indexscan=off]:-0}" \
+    -v b="${T13[B  parallel_tuple_cost=0.01]:-0}" -v ab="${T13[A+B 둘 다]:-0}" 'BEGIN{
+  if (base>0 && a>0 && b>0 && ab>0) {
+    printf "  배수:  A 단독 %.2fx / B 단독 %.2fx / 곱하면 %.2fx 예상  →  실제 A+B %.2fx\n",
+           base/a, base/b, (base/a)*(base/b), base/ab
+    if (base/ab > (base/a)*1.05 && base/ab > (base/b)*1.05)
+      printf "  → **둘 다 걸면 각각보다 더 내려간다. 두 손잡이는 독립이다.**\n"
+    else
+      printf "  → 합쳐도 한쪽만큼밖에 안 내려간다 — 이 환경에서는 한 손잡이가 할 일이 없었다는 뜻이다.\n  바로 아래 판정을 함께 읽을 것.\n"
+  }}'
 echo
 # **재현 여부를 먼저 판정한다.** 기본 계획이 Merge Join 이 아니면 이 절의 함정이 안 걸린 것이고,
 # 그 상태에서 아래 해설을 결과처럼 읽으면 안 된다.
 case "$BASEJ" in
   Merge*) echo "  → **함정이 재현됐다.** 기본 계획이 ${BASEJ} 다. 위 표에서 enable_* 를 끈 쪽이"
           echo "    더 빠르고 buffers 도 적다면, 인덱스가 고른 경로가 손해라는 뜻이다." ;;
-  *)      echo "  ⚠️ **이 규모에서는 재현되지 않았다.** 기본 계획이 이미 ${BASEJ:-?} 이고 세 조건의"
-          echo "    buffers 가 같다 — 플래너가 Merge Join 경로를 아예 고르지 않았다."
-          echo "    아래 설명은 SF=10(lineitem 6,000만) 실측에 대한 것이고, 여기서는 배경 지식으로만 읽는다."
-          echo "    **작은 규모에서 '문제 없네'로 결론내면 안 되는 이유가 이것이다** —"
-          echo "    이 함정은 행수에 비례해 깊어지므로 규모를 키워야 비로소 나타난다." ;;
+  *)      echo "  ⚠️ **A 쪽 함정은 이 규모에서 재현되지 않았다.** 기본 계획이 이미 ${BASEJ:-?} 다 —"
+          echo "    플래너가 Merge/Index 경로를 아예 고르지 않았으므로 **A 가 되돌릴 것이 없다.**"
+          echo "    A 의 배수가 1 근처이거나 오히려 손해라면 그 뜻이고, 그건 정상이다"
+          echo "    (인덱스 스캔을 막으면 customer_pkey 의 Index Only Scan 까지 막혀 buffers 가 는다)."
+          echo "    **B 는 규모와 무관하게 값을 낸다** — 직렬 판정은 선택도가 아니라 그룹 수가 정하므로."
+          echo "    A 쪽 수치는 SF=10(lineitem 6,000만) 실측을 참고한다. 이 함정은 행수에 비례해"
+          echo "    깊어지므로 규모를 키워야 비로소 나타난다 — **작은 규모의 '문제 없네'는 결론이 아니다.**" ;;
 esac
 echo
 if [ "${DROP:-0}" = "1" ]; then
@@ -185,6 +209,12 @@ echo "    Merge Join 경로를 볼 수 있게 되고, 비용 모델이 그쪽을
 echo "    대가는 **테이블의 99% 를 인덱스 순서로 읽는 것**이다 — 힙 접근이 랜덤이 되어"
 echo "    같은 블록을 여러 번 만진다. buffers 열의 배수가 그 값이다."
 echo "    SF=10 실측: 30만 → **1,500만 buffers(48배)**, I/O 만 14.4초."
+echo
+echo "  그리고 **q13 은 인덱스가 있든 없든 직렬이다**(위 표의 워커 열, 기본 행). §T-6 확장 ①의"
+echo "  그 문제다 — 고카디널리티 GROUP BY 라 Gather 를 통과할 행이 많아 비용 모델이 병렬을 거절한다."
+echo "  그래서 손잡이가 둘이고 **서로 독립**이다: A 는 접근량을 줄이고, B 는 같은 일을 나눠 든다."
+echo "  (B 의 값은 환경마다 다르다. 여기서는 0.05 로는 안 켜지고 0.01 에서 켜졌다 —"
+echo "   워커 열이 '직렬'로 남아 있으면 더 낮춰야 한다. 전역이 아니라 **세션 단위로** 쓸 것.)"
 echo
 echo "  → 규칙: **전체를 읽는 쿼리에 인덱스 순서 접근을 붙이면 진다.**"
 echo "    정렬을 공짜로 얻는 이득보다 랜덤 힙 접근의 손해가 크고, 그 손해는 **행수에 비례**한다."
