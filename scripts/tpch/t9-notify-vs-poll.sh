@@ -550,6 +550,10 @@ echo "  워커를 못 이긴다(⑤에서 -R 3200 을 줘도 잔량 0 이었다)
 echo "  주문을 한 고객에게 몰아 두면, 그 고객 등급 변경 1건이 denorm 수만 행 갱신이 된다."
 echo
 BIG="${BIG:-5000}"
+# 앞선 절이 넣어 둔 실험용 lineitem 을 먼저 지운다. 안 그러면 반복 실행마다 고객1 의
+# 파생 행수(=항목당 비용)가 불어나 **절대 수치가 회차마다 달라진다.**
+sql "DELETE FROM lineitem WHERE l_linenumber >= 90;
+     DELETE FROM lineitem_denorm WHERE l_linenumber >= 90;" >/dev/null 2>&1
 sql "VACUUM (ANALYZE) lineitem_denorm" >/dev/null 2>&1
 sql "UPDATE orders SET o_custkey=1 WHERE o_orderkey<=$BIG;" >/dev/null 2>&1
 full_refill; trg notify
@@ -557,38 +561,58 @@ FAN=$(sql "SELECT count(*) FROM lineitem_denorm d JOIN orders o ON d.l_orderkey=
             WHERE o.o_custkey=1")
 echo "  고객1 에 주문 ${BIG}건 → 등급 변경 1건당 파생 ${FAN}행 갱신"
 echo
-printf "  %s\n" "  깨우는 방식      달성tps  지연중앙  최대지연      왕복  배치당항목      잔량"
-printf "  %s\n" "  ------------------------------------------------------------------------------"
-for m in notify poll:20 adaptive:5; do
-  R=$(run_case "$m" 400 /tmp/t9n_skew.sql)
-  printf "  %s%9s %9s %9s %9s %11s %9s\n" "$(printf '%-16s' "$(lbl $m)")" \
-    "$(echo "$R"|awk '{print $1}')" "$(echo "$R"|awk '{print $2}')" "$(echo "$R"|awk '{print $3}')" \
-    "$(echo "$R"|awk '{print $8}')" "$(echo "$R"|awk '{print $9}')" "$(echo "$R"|awk '{print $7}')"
+# **교차 측정한다.** ⑥을 처음 만들었을 때는 세 방식을 고정 순서로 1회씩 쟀고,
+# 항상 맨 앞에 있던 NOTIFY 가 지연 123~135ms 로 혼자 나빠 보였다. 3라운드 교차로 다시 재니
+# 45~57ms 로 **구분되지 않는다** — 순서가 만든 값이었다(§T-0 원칙 6, 이 랩이 이미 한 번 겪은 실수).
+printf "  %s\n" "  깨우는 방식      달성tps  지연중앙  최대지연      왕복      잔량 | cust배치  cust합ms"
+printf "  %s\n" "  -------------------------------------------------------------------------------------"
+declare -A B_T B_L B_M B_R B_Q B_CB B_CM
+MODES6=("notify" "poll:20" "adaptive:5")
+for m in "${MODES6[@]}"; do B_L[$m]=""; done
+for r in $(seq 1 "$ROUNDS"); do
+  for m in "${MODES6[@]}"; do
+    R=$(run_case "$m" 400 /tmp/t9n_skew.sql)
+    # denorm_stat 은 run_case 가 시작할 때만 비우므로, 끝난 직후 그대로 읽을 수 있다.
+    # **워커를 건드리지 않고** "비싼 배치가 몇 번이었나 / 거기에 몇 ms 를 썼나"를 얻는다.
+    G=$(sql "WITH g AS (SELECT cust_items, EXTRACT(epoch FROM t - lag(t) OVER (ORDER BY t))*1000 AS gap
+                          FROM denorm_stat)
+             SELECT count(*) FILTER (WHERE cust_items>0) || '|' ||
+                    coalesce(round(sum(gap) FILTER (WHERE cust_items>0))::text,'-') FROM g")
+    B_L[$m]="${B_L[$m]} $(echo "$R"|awk '{print $2}')"
+    B_T[$m]="$(echo "$R"|awk '{print $1}')"; B_M[$m]="$(echo "$R"|awk '{print $3}')"
+    B_R[$m]="$(echo "$R"|awk '{print $8}')"; B_Q[$m]="$(echo "$R"|awk '{print $7}')"
+    B_CB[$m]="${G%%|*}"; B_CM[$m]="${G##*|}"
+  done
+done
+for m in "${MODES6[@]}"; do
+  printf "  %s%9s %9s %9s %9s %9s | %8s %9s\n" "$(printf '%-16s' "$(lbl $m)")" \
+    "${B_T[$m]}" "$(med "${B_L[$m]}")" "${B_M[$m]}" "${B_R[$m]}" "${B_Q[$m]}" "${B_CB[$m]}" "${B_CM[$m]}"
 done
 echo
-echo "  **잔량 열이 먼저다.** 전부 0 이면 적체를 못 만든 것이고, 그 표로는 아무 말도 할 수 없다"
-echo "  (BIG 을 키워 다시 돌린다). 0 이 아닌 줄이 있으면 적체가 걸린 것이다."
+echo "  (지연중앙은 ${ROUNDS}라운드 중앙값, 나머지는 마지막 라운드 값이다.)"
 echo
-echo "  해석 — **예상과 반대가 나왔다. 이 절은 그 기록이다.**"
-echo "   처음 쓴 예상: \"적체되면 큐가 늘 차 있으니 무엇으로 깨우든 똑같아져 방식이 의미를 잃는다.\""
-echo "   실측은 정반대였다 — **적체 구간에서 방식 차이가 가장 크게 벌어진다.**"
-echo "   그리고 **즉시 깨우는 쪽(NOTIFY)이 가장 나쁘다.** ①②의 건강한 구간에서 가장 좋던 방식이다."
-echo "   (두 번 돌려 지연 중앙값 124/126ms 대 적응형 31/46ms 로 방향이 같았다.)"
+echo "  **기전 — 오른쪽 두 열이 답이다.**"
+PERC=$(awk -v a="${B_CM[adaptive:5]:-0}" -v b="${B_CB[adaptive:5]:-0}" 'BEGIN{ if(b>0) printf "%.0f", a/b; else printf "?" }')
+echo "   이 워크로드에서 비싼 일은 단 하나, '고객1 등급 전파' UPDATE 다 —"
+echo "   파생 ${FAN}행을 갱신하고, 위 표에서 계산하면 **회당 약 ${PERC}ms** 다(cust합ms ÷ cust배치)."
+echo "   drain 은 한 배치 안의 같은 고객을 **DISTINCT 로 접어** UPDATE 를 한 번만 한다."
+echo "   그래서 총 비용 = **(cust 항목이 들어 있던 배치 수) × 회당 비용** 이고, 배치 안에 그 고객이"
+echo "   1건 있든 10건 있든 값이 같다. 문장 단위로 계측해 보면 **drain 시간의 약 97% 가 이 한 문장**이다."
+echo "   (claim / ord / line / depth 를 다 합쳐도 나머지 3% 다.)"
 echo
-echo "   **기전은 확정하지 못했다. 짐작으로 적지 않는다.**"
-echo "   처음엔 \"NOTIFY 가 트랜잭션마다 깨워 배치를 잘게 쪼개고, drain 이 같은 고객을 DISTINCT 로"
-echo "   접을 기회를 없앤다\" 로 썼는데 — **배치당 항목 열이 그걸 반증할 때가 있었다**(NOTIFY 쪽이"
-echo "   오히려 컸다). 별도 하네스로 다시 재면 반대로 나와, 두 측정이 서로 안 맞는다."
-echo "   대기 이벤트를 0.15초 간격으로 표본 추출해도 세 방식 모두 (running) 이 대부분이라"
-echo "   락 대기로는 설명되지 않는다 — 어딘가에서 **CPU 를 더 쓰고 있다**는 것까지가 확인된 전부다."
-echo "   남은 과제: drain 안에서 어느 UPDATE 가 시간을 먹는지 문장 단위로 쪼개 재는 것"
-echo "   (auto_explain 이나 drain 을 단계별로 계측한 판이 필요하다)."
+echo "   그리고 세 방식의 'cust배치'와 'cust합ms' 가 거의 같다 — 즉 **세 방식이 같은 일을 한다.**"
+echo "   합계가 측정 시간(10초)에 육박하면 워커는 100% 포화 상태이고, 그때 잔량은 깨우는 방식이"
+echo "   아니라 **비싼 항목의 도착률 × 항목당 비용**이 정한다. 깨우기로는 손댈 수 없는 값이다."
 echo
-echo "   확정된 것만 쓰면 이렇다 — **깨우는 방식의 우열이 부하 구간에 따라 뒤집힌다.**"
-echo "   ①②(따라잡는 구간)에서 최선이던 NOTIFY 가 ⑥(밀리는 구간)에서 최악이 된다."
-echo "   **그래서 한 구간에서만 재고 방식을 고르면 안 된다.** 이 스크립트가 구간을 나눠 재는 이유다."
-echo "   → 실무 규칙 하나: **NOTIFY 는 응답성 대책이지 처리량 대책이 아니다.** 밀리기 시작하면"
-echo "     알림을 끄고 페이싱으로 가는 것이 맞다(③의 '쓰기 경로 1.6배'까지 더하면 더 그렇다)."
+echo "  → **처음 가설이 맞았다: 적체 구간에서는 깨우는 방식이 의미를 잃는다.**"
+echo "    중간에 \"아니다, NOTIFY 가 최악이다\" 로 한 번 뒤집어 적었는데, 그게 틀렸다."
+echo "    고정 순서 1회 측정이 만든 값이었고 교차 측정에서 사라졌다."
+echo "    **이 랩이 §T-0 에 적어 둔 원칙을 스스로 어겨서 생긴 오답이다.**"
+echo
+echo "  → 실무 규칙: 밀리기 시작하면 **깨우는 방식을 바꾸는 것은 답이 아니다.**"
+echo "    손댈 곳은 항목당 비용(팬아웃이 큰 전파를 쪼개거나 증분화)이거나 도착률이다."
+echo "    ①②(따라잡는 구간)에서 깨우는 방식이 지연을 지배하던 것과 정반대다 —"
+echo "    **같은 손잡이가 구간에 따라 전부이기도 하고 아무것도 아니기도 하다.**"
 echo
 # 원복 — 주문 소유자를 되돌리고 **파생 테이블도 다시 만든다.**
 # 소유자만 되돌리면 lineitem_denorm 이 편중 상태 그대로 남아, 이후 모든 drain 이
