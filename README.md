@@ -167,6 +167,7 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpch/t9-trigger-sync.sh               # 트리거 동기화의 쓰기 오버헤드
 ./scripts/tpch/t9-concurrency.sh                # 동시성에서 드리프트가 생기는 지점
 ./scripts/tpch/t9-lock-range.sh                 # FOR SHARE 의 락 범위 비용
+./scripts/tpch/t9-isolation-levels.sh           # 격리수준을 올리면 — 실패율과 재시도 비용
 ./scripts/tpch/t9-change-queue.sh               # 변경 큐 + 비동기 전파 (5방식 비교)
 ./scripts/tpch/t9-queue-tuning.sh               # 워커 수 × 배치 크기 → 지연창
 ./scripts/tpch/t9-notify-vs-poll.sh             # 폴링/NOTIFY/고정창/적응형/큐깊이 5파 비교
