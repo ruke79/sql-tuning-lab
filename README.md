@@ -145,6 +145,7 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./scripts/tpch/t2-selectivity-sweep.sh          # 옵티마이저가 선택한 스캔 방식의 변화
 ./scripts/tpch/t2-selectivity-sweep.sh 4.0      # random_page_cost=4.0 (HDD 가정) 비교
 ./scripts/tpch/t2-crossover-verify.sh           # 두 방식을 강제 실행해 '진짜 교차점' 측정
+./scripts/tpch/t2-index-regression.sh           # 인덱스를 만들었더니 느려진 두 쿼리 (§T-2/T-4)
 ./scripts/tpch/join-method-compare.sh q03       # 조인 방식(NL/Hash/Merge) 강제 비교 (§T-3)
 ./scripts/tpch/t6-parallel-decision.sh          # 옵티마이저가 병렬을 고르는/못 고르는 지점 (§T-6)
 ./scripts/tpch/t8-combined-index.sh             # 조인키+필터 결합 인덱스 (§T-8)
