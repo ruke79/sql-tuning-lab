@@ -47,6 +47,9 @@ set -uo pipefail
 CLIENTS="${1:-8}"
 SECS="${2:-12}"
 ROUNDS="${3:-3}"
+# 어느 절을 돌릴지. ⑤(경계 찾기)는 rate 를 훑느라 오래 걸려 기본에 넣되 마지막에 둔다.
+ONLY="${ONLY:-123456}"
+want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 PGHOST_="${PGHOST:-localhost}"
 PGPORT_="${PGPORT:-5432}"
 # work_mem — 큰 해시·정렬이 디스크로 넘치지 않게 **이 스크립트가 여는 세션에만** 건다.
@@ -254,6 +257,10 @@ ON CONFLICT DO NOTHING;
 END;
 EOF
 
+# **END; 를 빼먹지 말 것.** BEGIN 만 있고 커밋이 없으면 매 반복의 쓰기가 연결 종료 시
+# 통째로 롤백된다 — 그런데 pgbench 는 "failed 0" 으로 보고하고 tps 도 정상으로 찍는다.
+# 그러면 큐가 비고 워커가 아무 일도 안 하는데, 출력은 '지연 0 / 왕복 2' 라 고장이 아니라
+# 결과처럼 보인다. 이 한 줄이 없어서 적체 구간 절을 원인도 모른 채 통째로 지웠던 적이 있다.
 cat > /tmp/t9n_skew.sql <<'EOF'
 \set r    random(1, 100)
 \set ord  random(1, 5000)
@@ -270,6 +277,7 @@ INSERT INTO lineitem (l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_e
 SELECT :ord,1,1,:lnum,1,100.00,0.05,0.05,'N','O',
        DATE '1995-01-01',DATE '1995-01-01',DATE '1995-01-01','DELIVER','AIR','q'
 ON CONFLICT DO NOTHING;
+END;
 EOF
 
 # 한 조건 1회 → "tps 평균지연 최대지연 배치수 빈폴링 처리항목 잔량"
@@ -322,8 +330,10 @@ lbl(){ case $1 in poll:200) echo "폴링 200ms";; poll:20) echo "폴링 20ms";;
                   debounce:5) echo "고정창 5ms";; debounce:20) echo "고정창 20ms";;
                   debounce:50) echo "고정창 50ms";;
                   adaptive:5) echo "적응형 5ms";; adaptive:20) echo "적응형 20ms";;
-                  qdepth:5) echo "큐깊이 5ms";; qdepth:20) echo "큐깊이 20ms";; esac; }
+                  qdepth:5) echo "큐깊이 5ms";; qdepth:20) echo "큐깊이 20ms";;
+                  poll:20) echo "폴링 20ms";; adaptive:5) echo "적응형 5ms";; esac; }
 
+if want 1; then
 # ── ① 아주 낮은 부하 ──────────────────────────────────────────────────
 echo "── ① 저부하(-R 50) · 자연 분포 · 배치 2000 (${ROUNDS}라운드 중앙값) ──"
 sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
@@ -340,6 +350,9 @@ echo "     5ms: 지연 6→3ms, 왕복 920→871 / 20ms: 지연 15→12ms, 왕�
 echo "     기다릴 시간을 계산하므로, 직전 drain 이후 이미 지난 만큼은 안 기다리기 때문이다."
 echo
 
+fi
+
+if want 2; then
 # ── ② 중간 부하 ───────────────────────────────────────────────────────
 echo "── ② 중부하(-R 800) · 자연 분포 · 배치 2000 (${ROUNDS}라운드 중앙값) ──"
 sweep 800 "$ROUNDS" /tmp/t9n_nat.sql "${MODES[@]}"
@@ -358,6 +371,9 @@ echo "     두 축 모두에서 이긴다.** 같은 파라미터끼리 비교하
 echo "     (5ms 기준 지연 3→6ms, 왕복 4,213→1,380)."
 echo
 
+fi
+
+if want 4; then
 # ── ④ 버스트 소진: 큐 깊이 신호가 발화하는 유일한 구간 ─────────────────
 echo "── ④ 버스트 소진 · 워커 정지 중 2만 건 적체 → 기동 후 소진 시간 (3회) ──"
 trg notify
@@ -380,6 +396,9 @@ echo "  → 이론상 큐깊이가 페이싱(20ms × 배치 9회 ≈ 180ms)을 �
 echo "     실측에서는 그 절약이 배치 작업 시간(1.5~1.9초)에 묻혀 구분되지 않았다."
 echo
 
+fi
+
+if want 3; then
 # ── ③ NOTIFY 자체의 쓰기 비용 ─────────────────────────────────────────
 echo "── ③ NOTIFY 는 공짜인가 · 포화 부하 · 워커 없음(쓰기 경로만) (${ROUNDS}라운드 중앙값) ──"
 NOTPS=""; PLTPS=""
@@ -433,6 +452,165 @@ echo "     NOTIFY 는 저장되지 않는다 — 워커가 죽어 있는 동안 
 echo "     알림만 믿으면 재시작 직후 남은 큐를 영영 못 집는다. 큐 테이블이 진실이고"
 echo "     알림은 힌트일 뿐이라는 원칙(이 스크립트의 워커도 그렇게 짜여 있다)을 지켜야 한다."
 echo
+fi
+
+# ── ⑤ NOTIFY 가 폴링보다 나빠지는 경계 쓰기율 ─────────────────────────
+if want 5; then
+echo "── ⑤ NOTIFY 퇴화의 경계는 어디인가 · 쓰기율을 훑는다 (1라운드) ──"
+echo
+echo "  ①은 -R 50 에서 NOTIFY 가 최선이라 했고, ②는 -R 800 에서 NOTIFY 의 왕복이"
+echo "  제일 많다고 했다. **그 사이 어디서 뒤집히는가**를 찾는다."
+echo "  비교 상대는 폴링 1ms 다 — 지연 바닥이 가장 낮은, 즉 가장 공격적인 폴링이다."
+echo "  적응형 5ms 도 같이 둔다(②에서 그 퇴화를 고친 방식)."
+echo
+# **이 절만 따로 돌릴 수 있어야 하므로 준비를 스스로 한다.**
+# ①이 해 주던 trg/full_refill 에 기대면, ONLY=5 로 돌렸을 때 enqueue 트리거가 아예 없어
+# 큐가 안 채워지고 워커가 아무것도 못 한다 — 그런데 출력은 '왕복 21, 지연 0' 이라
+# **고장이 아니라 결과처럼 보인다.** 실제로 처음 그렇게 나왔다.
+trg notify; full_refill
+# **반복 실행이 쌓은 부풀음을 걷어낸다.** 이 실습은 lineitem 에 행을 넣었다 지우기를
+# 수만 번 반복하므로, 여러 번 돌리면 drain 이 점점 느려져 낮은 쓰기율에서도 잔량이 붙는다.
+# 그러면 ⑤의 절대값이 회차마다 달라진다 — 측정이 아니라 누적 상태를 재게 된다.
+sql "VACUUM (ANALYZE) lineitem_denorm" >/dev/null 2>&1
+sql "VACUUM (ANALYZE) denorm_queue" >/dev/null 2>&1
+sql "VACUUM (ANALYZE) lineitem" >/dev/null 2>&1
+NTRG=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't_enq%'")
+if [ "${NTRG:-0}" -lt 3 ]; then
+  echo "  [중단] enqueue 트리거가 ${NTRG}개뿐이다(3개여야 한다). 큐가 안 채워진다."
+  exit 1
+fi
+# 목표 rate 를 실제로 달성했는지 같이 찍는다 — 장비가 못 따라가면 '-R 3200' 이 사실은
+# -R 900 이고, 그러면 거기서 찾은 경계는 그 rate 의 경계가 아니다.
+printf "  %-8s %8s | %-22s | %-22s | %-22s %s\n" "목표" "달성tps" "NOTIFY (지연ms/왕복)" "폴링1ms (지연ms/왕복)" "적응형5ms (지연ms/왕복)" "잔량"
+printf "  %s\n" "------------------------------------------------------------------------------------------------------------"
+CROSS=""
+for R in 50 100 200 400 800 1600 3200; do
+  N=$(run_case notify   "$R" /tmp/t9n_nat.sql)
+  P=$(run_case poll:1   "$R" /tmp/t9n_nat.sql)
+  A=$(run_case adaptive:5 "$R" /tmp/t9n_nat.sql)
+  NL=$(echo "$N"|awk '{print $2}'); NT=$(echo "$N"|awk '{print $8}')
+  PL=$(echo "$P"|awk '{print $2}'); PT=$(echo "$P"|awk '{print $8}')
+  AL=$(echo "$A"|awk '{print $2}'); AT=$(echo "$A"|awk '{print $8}')
+  # 처리한 항목이 0 이면 큐가 안 채워진 것이다 — 그 줄은 결과가 아니라 고장이다.
+  NAPP=$(echo "$N"|awk '{print $6}')
+  if [ "${NAPP:-0}" -lt 1 ]; then
+    printf "  %-8s | %s\n" "-R $R" "[측정 실패] 워커가 처리한 항목이 0 이다 — 큐가 안 채워졌다."
+    continue
+  fi
+  # 두 값이 5% 안이면 '대등'으로 본다. 회차마다 순서가 바뀌는 지점을 '뒤집혔다'고 쓰면
+  # 노이즈를 발견으로 읽는 것이다 — 실제로 두 번 돌려 한 번은 뒤집히고 한 번은 안 뒤집혔다.
+  MARK=""
+  if [ -z "$CROSS" ] && awk -v a="${NT:-0}" -v b="${PT:-0}" 'BEGIN{exit !(a > b*0.95)}'; then
+    CROSS="$R"
+    awk -v a="${NT:-0}" -v b="${PT:-0}" 'BEGIN{exit !(a > b*1.05)}' \
+      && MARK="  ← NOTIFY 가 더 많아진다" || MARK="  ← 대등해지는 지점"
+  fi
+  # 잔량(부하 종료 직후 큐에 남은 항목) = 워커가 따라잡고 있었는가. 0 이 아니면 적체 구간이다.
+  printf "  %-8s %8s | %9s / %-10s | %9s / %-10s | %9s / %-10s %6s%s\n" \
+    "-R $R" "$(echo "$N"|awk '{print $1}')" "$NL" "$NT" "$PL" "$PT" "$AL" "$AT" \
+    "$(echo "$N"|awk '{print $7}')" "$MARK"
+done
+echo
+if [ -n "$CROSS" ]; then
+  echo "  → **경계는 -R ${CROSS} 부근이다.** 그 아래에서는 NOTIFY 가 왕복도 적고 지연도 낮다."
+  echo "    그 위로는 트랜잭션마다 알림이 나가 **NOTIFY 가 1ms 폴링보다 더 자주 깨어난다** —"
+  echo "    알림 기반이 '가장 공격적인 폴링보다도 바쁜 폴링'으로 퇴화한 지점이다."
+else
+  echo "  → 이 구간에서는 뒤집히지 않았다. **달성tps 열을 보라** — 목표 rate 를 못 따라가고 있다면"
+  echo "    더 올려도 소용없다. 그 장비에서는 NOTIFY 가 1ms 폴링을 넘어설 만큼 커밋을 못 하는 것이고,"
+  echo "    그것 자체가 답이다: **이 장비의 워크로드 범위 안에서는 NOTIFY 가 항상 왕복이 적다.**"
+fi
+echo
+echo "  경계의 정체는 간단하다. 폴링의 왕복은 **시간**이 정하고(초당 1000회, 부하와 무관),"
+echo "  NOTIFY 의 왕복은 **트랜잭션 수**가 정한다. 그래서 커밋 속도가 폴링 주기를 넘어서는"
+echo "  순간 역전된다. 즉 **경계는 설정이 아니라 워크로드가 정하고, 장비가 빨라지면 앞당겨진다.**"
+echo "  적응형 열이 거의 평평하다면, 그 방식이 이 경계 자체를 없앤다는 뜻이다(②의 결론)."
+echo
+echo "  **예측과 맞는지 확인하라.** 이론상 경계는 '초당 커밋 수 = 폴링의 초당 왕복 수' 다."
+echo "  폴링 1ms 의 왕복 열을 측정 시간으로 나누면 그 값이 나온다(간격이 1ms 라고 초당 1000회가"
+echo "  되는 건 아니다 — 왕복 자체에 시간이 걸린다). 달성tps 가 그 값을 넘어서는 줄에서"
+echo "  뒤집히면 예측이 맞은 것이다. 즉 **경계는 폴링 간격이 아니라 폴링의 실제 왕복률이 정한다.**"
+echo
+echo "  높은 쓰기율에서 NOTIFY 의 왕복이 다시 **줄어드는** 것도 보라. 역설이 아니다 —"
+echo "  커밋이 빨라지면 한 번 깨어나는 사이에 알림이 여러 개 쌓여 자연스럽게 합쳐진다."
+echo "  **잔량 열이 0 이면 워커는 아직 따라잡고 있는 것이다** — 적체가 아니라 합쳐짐이다."
+echo "  잔량이 붙는 구간(적체)은 성격이 다르고, ⑥에서 따로 만든다."
+echo
+fi
+
+# ── ⑥ 적체 구간 — 깨우는 방식이 의미를 잃는가 ────────────────────────
+if want 6; then
+echo "── ⑥ 적체 구간 · 대형 고객 편중으로 워커를 못 따라잡게 만든다 (1라운드) ──"
+echo
+echo "  ⑤까지는 잔량이 0 이었다. 워커가 계속 따라잡았다는 뜻이고, 그 구간에서는"
+echo "  '언제 깨느냐'가 지연을 지배한다. **워커가 못 따라잡으면 그 결론이 뒤집히는가**를 본다."
+echo
+echo "  적체는 쓰기율만 올려서는 안 만들어진다 — 이 장비의 pgbench 가 낼 수 있는 속도로는"
+echo "  워커를 못 이긴다(⑤에서 -R 3200 을 줘도 잔량 0 이었다). **항목 하나를 비싸게** 만든다:"
+echo "  주문을 한 고객에게 몰아 두면, 그 고객 등급 변경 1건이 denorm 수만 행 갱신이 된다."
+echo
+BIG="${BIG:-5000}"
+sql "VACUUM (ANALYZE) lineitem_denorm" >/dev/null 2>&1
+sql "UPDATE orders SET o_custkey=1 WHERE o_orderkey<=$BIG;" >/dev/null 2>&1
+full_refill; trg notify
+FAN=$(sql "SELECT count(*) FROM lineitem_denorm d JOIN orders o ON d.l_orderkey=o.o_orderkey
+            WHERE o.o_custkey=1")
+echo "  고객1 에 주문 ${BIG}건 → 등급 변경 1건당 파생 ${FAN}행 갱신"
+echo
+printf "  %s\n" "  깨우는 방식      달성tps  지연중앙  최대지연      왕복  배치당항목      잔량"
+printf "  %s\n" "  ------------------------------------------------------------------------------"
+for m in notify poll:20 adaptive:5; do
+  R=$(run_case "$m" 400 /tmp/t9n_skew.sql)
+  printf "  %s%9s %9s %9s %9s %11s %9s\n" "$(printf '%-16s' "$(lbl $m)")" \
+    "$(echo "$R"|awk '{print $1}')" "$(echo "$R"|awk '{print $2}')" "$(echo "$R"|awk '{print $3}')" \
+    "$(echo "$R"|awk '{print $8}')" "$(echo "$R"|awk '{print $9}')" "$(echo "$R"|awk '{print $7}')"
+done
+echo
+echo "  **잔량 열이 먼저다.** 전부 0 이면 적체를 못 만든 것이고, 그 표로는 아무 말도 할 수 없다"
+echo "  (BIG 을 키워 다시 돌린다). 0 이 아닌 줄이 있으면 적체가 걸린 것이다."
+echo
+echo "  해석 — **예상과 반대가 나왔다. 이 절은 그 기록이다.**"
+echo "   처음 쓴 예상: \"적체되면 큐가 늘 차 있으니 무엇으로 깨우든 똑같아져 방식이 의미를 잃는다.\""
+echo "   실측은 정반대였다 — **적체 구간에서 방식 차이가 가장 크게 벌어진다.**"
+echo "   그리고 **즉시 깨우는 쪽(NOTIFY)이 가장 나쁘다.** ①②의 건강한 구간에서 가장 좋던 방식이다."
+echo "   (두 번 돌려 지연 중앙값 124/126ms 대 적응형 31/46ms 로 방향이 같았다.)"
+echo
+echo "   **기전은 확정하지 못했다. 짐작으로 적지 않는다.**"
+echo "   처음엔 \"NOTIFY 가 트랜잭션마다 깨워 배치를 잘게 쪼개고, drain 이 같은 고객을 DISTINCT 로"
+echo "   접을 기회를 없앤다\" 로 썼는데 — **배치당 항목 열이 그걸 반증할 때가 있었다**(NOTIFY 쪽이"
+echo "   오히려 컸다). 별도 하네스로 다시 재면 반대로 나와, 두 측정이 서로 안 맞는다."
+echo "   대기 이벤트를 0.15초 간격으로 표본 추출해도 세 방식 모두 (running) 이 대부분이라"
+echo "   락 대기로는 설명되지 않는다 — 어딘가에서 **CPU 를 더 쓰고 있다**는 것까지가 확인된 전부다."
+echo "   남은 과제: drain 안에서 어느 UPDATE 가 시간을 먹는지 문장 단위로 쪼개 재는 것"
+echo "   (auto_explain 이나 drain 을 단계별로 계측한 판이 필요하다)."
+echo
+echo "   확정된 것만 쓰면 이렇다 — **깨우는 방식의 우열이 부하 구간에 따라 뒤집힌다.**"
+echo "   ①②(따라잡는 구간)에서 최선이던 NOTIFY 가 ⑥(밀리는 구간)에서 최악이 된다."
+echo "   **그래서 한 구간에서만 재고 방식을 고르면 안 된다.** 이 스크립트가 구간을 나눠 재는 이유다."
+echo "   → 실무 규칙 하나: **NOTIFY 는 응답성 대책이지 처리량 대책이 아니다.** 밀리기 시작하면"
+echo "     알림을 끄고 페이싱으로 가는 것이 맞다(③의 '쓰기 경로 1.6배'까지 더하면 더 그렇다)."
+echo
+# 원복 — 주문 소유자를 되돌리고 **파생 테이블도 다시 만든다.**
+# 소유자만 되돌리면 lineitem_denorm 이 편중 상태 그대로 남아, 이후 모든 drain 이
+# "다른 값을 찾아 고치는" 교정 작업을 떠안는다. 그러면 ⑤를 다시 돌렸을 때 낮은 쓰기율에서도
+# 잔량이 붙어 **⑤의 결과가 통째로 달라진다** — 실제로 그래서 ⑤가 한 번 엉망으로 나왔다.
+# 절 사이에 상태를 흘리지 않는 것이 여기서는 데이터 원복만으로 부족하다.
+sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
+      WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1
+full_refill
+LEFT=$(sql "SELECT count(*) FROM orders o JOIN orders_cust_bak b USING (o_orderkey)
+             WHERE o.o_custkey IS DISTINCT FROM b.o_custkey")
+DRIFT=$(sql "WITH truth AS (SELECT l.l_orderkey,l.l_linenumber,c.c_mktsegment,o.o_orderdate,o.o_shippriority
+             FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey
+                             JOIN customer c ON o.o_custkey=c.c_custkey)
+             SELECT count(*) FROM truth t JOIN lineitem_denorm d
+               ON d.l_orderkey=t.l_orderkey AND d.l_linenumber=t.l_linenumber
+              WHERE (d.c_mktsegment,d.o_orderdate,d.o_shippriority)
+                    IS DISTINCT FROM (t.c_mktsegment,t.o_orderdate,t.o_shippriority)")
+echo "  원복했다 — 안 돌아온 주문 ${LEFT:-?} / 파생 불일치 ${DRIFT:-?}  (둘 다 0 이어야 한다)"
+echo
+fi
+
 echo "정리 (이 스크립트는 customer/lineitem 을 변형한다 — 재적재 권장):"
 echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"load   --db=postgres\""
