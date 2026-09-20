@@ -312,6 +312,21 @@ ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
 ./gradlew :sysbench-lab:bootRun --args="monitor"   # buffer pool hit / row lock waits / redo 설정
 ```
 
+§M-4/M-6/M-7(무릎·커밋 비용·redo 압력)의 MySQL 판은 스크립트로 자동화되어 있다.
+`sysbench` 가 없으면 `apt-get install -y sysbench`, 데이터가 없으면 스크립트가 만든다:
+
+```bash
+./scripts/sysbench/m4-m7-mysql.sh               # 전부 (약 8분)
+ONLY=1 ./scripts/sysbench/m4-m7-mysql.sh        # 무릎 sweep 만
+```
+
+> **무릎은 pgbench 와 같은 자리(코어 수 4)에 있었지만 증상이 다르다** — pgbench 는 4→8 에서
+> TPS 가 줄고, 여기서는 줄지 않고 포화한다(읽기가 많아 CPU 가 비는 틈을 메운다).
+> 커밋 내구성은 MySQL 이 redo·binlog **둘**을 내린다. 둘 다 꺼도 1.12배뿐인데, 쓰기 전용
+> 워크로드로 바꾸면 1.84배가 된다 — **배수를 정하는 건 엔진이 아니라 커밋 비중이다**
+> (그룹 커밋 가설은 스레드 1과 8이 같은 배수라 기각됐다).
+> redo 를 1GB→8MB 로 좁히면 TPS −22% 인데 **max 는 14.5배** 뛴다. 내구성 설정은 끝에 원복한다.
+
 **1억 건**: `--tables=10 --table-size=10000000` (공식: `scripts/sysbench/run-official-sysbench.sh prepare 10 10000000`)
 
 실험 아이디어:
