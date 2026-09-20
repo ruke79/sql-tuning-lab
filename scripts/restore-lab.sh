@@ -110,6 +110,10 @@ chk() {  # $1 = 파라미터, $2 = 원하는 값
 chk shared_buffers "$WANT_SHARED_BUFFERS"
 chk work_mem "$WANT_WORK_MEM"
 chk max_parallel_workers_per_gather "$WANT_PARALLEL"
+# wal_level 은 성능 설정처럼 안 보이지만 **측정 기준**이다 — logical 로 올라가 있으면
+# UPDATE 당 WAL 이 약 80바이트 늘어 §T-8 의 쓰기 비용 수치가 통째로 달라진다.
+# verify-lab 의 DB-10(CDC)을 돌리려고 올렸다가 안 되돌린 경우가 실제로 있었다.
+chk wal_level "${WANT_WAL_LEVEL:-replica}"
 if [ "$NEED_RESTART" = "1" ]; then
   act "설정 반영을 위해 재기동"
   pg_ctlcluster 16 main restart 2>&1 | sed 's/^/     /'; sleep 2

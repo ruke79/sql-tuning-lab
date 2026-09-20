@@ -16,7 +16,11 @@ import java.util.List;
  *   <li>소비되지 않은 슬롯은 <b>WAL 을 계속 붙잡는다</b> — 컨슈머가 죽으면 디스크가 찬다</li>
  * </ul>
  *
- * <p>서버가 {@code wal_level=logical} 이어야 한다(compose.yaml 에 설정돼 있다).
+ * <p>서버가 {@code wal_level=logical} 이어야 한다. <b>이 저장소의 기본 설정은 아니다</b> —
+ * {@code docker/postgres/postgresql.conf} 는 {@code wal_level = replica} 이고, 그것이 이 랩의
+ * 측정 기준이다(logical 로 바꾸면 UPDATE 당 WAL 이 약 80바이트 늘어 §T-8 의 수치가 달라진다).
+ * 이 케이스를 돌릴 때만 일시적으로 올린다:
+ * {@code ALTER SYSTEM SET wal_level='logical';} 후 재기동, 끝나면 {@code 'replica'} 로 되돌린다.
  * 그렇지 않은 서버에서는 판정을 내리지 않고 INCONCLUSIVE 로 남긴다.
  */
 @Component
@@ -62,7 +66,7 @@ public class ChangeDataCaptureCase extends VerificationCase {
 
         if (!"logical".equals(walLevel)) {
             evidence.expectFlaky("논리 디코딩에는 wal_level=logical 이 필요하다 — 이 서버는 " + walLevel, false);
-            evidence.note("compose.yaml 은 -c wal_level=logical 로 띄운다. 직접 띄운 PostgreSQL 이라면 같은 설정이 필요하고 재기동해야 적용된다.");
+            evidence.note("이 저장소의 기본값은 wal_level=replica 다(docker/postgres/postgresql.conf). 이 케이스만 ALTER SYSTEM SET wal_level='logical' 후 재기동해서 돌리고, 끝나면 replica 로 되돌린다 — logical 은 UPDATE 당 WAL 을 약 80바이트 늘려 §T-8 의 측정 기준을 바꾼다.");
             return;
         }
 
