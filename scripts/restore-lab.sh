@@ -205,7 +205,13 @@ else
   fi
 fi
 
-LEFT=$(t_sql tpch "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't_sync%'")
+# t_sync%(동기화 트리거)만 보면 큐 실습의 t_enq%(enqueue 트리거)를 놓친다 — 둘 다 lineitem 의
+# 모든 쓰기에 붙는다. 실제로 t9-notify-vs-poll 을 돌린 뒤 3개가 남아 있는데 "잔여물 없음" 이
+# 나왔다. 둘 다 본다.
+LEFT=$(t_sql tpch "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\_sync%' OR tgname LIKE 't\_enq%'")
+# 큐/동시성 실습은 lineitem 에 l_linenumber>=90 인 행을 넣었다 지운다. 중간에 끊기면 남는데,
+# **행수가 늘어난 것은 에러가 아니라 숫자만 달라지는 오염**이다(SF=0.5 는 3,000,491 행이다).
+LEFT5=$(t_sql tpch "SELECT count(*) FROM lineitem WHERE l_linenumber >= 90")
 LEFT2=$(t_sql tpcds "SELECT count(*) FROM pg_class WHERE relname LIKE 'mt\_%' OR relname IN ('ss_probe','ss_denorm')")
 # 실험이 만든 인덱스도 잔여물이다. §T-8 은 정리 명령을 **출력만** 하므로 손으로 안 지우면 남고,
 # 남은 idx_li_orderkey_shipdate 는 §T-3·§T-5 의 조인 측정을 조용히 바꿔 놓는다
@@ -214,10 +220,11 @@ LEFT3=$(t_sql tpch "SELECT count(*) FROM pg_indexes WHERE indexname IN
           ('idx_li_orderkey_shipdate','idx_li_cover','idx_ord_custkey_orderdate')")
 LEFT4=$(t_sql tpcds "SELECT count(*) FROM pg_indexes WHERE indexname IN
           ('idx_ss_item_solddate','idx_ss_cover','mt_shared_date')")
-if [ "${LEFT:-0}" = "0" ] && [ "${LEFT2:-0}" = "0" ] && [ "${LEFT3:-0}" = "0" ] && [ "${LEFT4:-0}" = "0" ]; then
+if [ "${LEFT:-0}" = "0" ] && [ "${LEFT2:-0}" = "0" ] && [ "${LEFT3:-0}" = "0" ] && [ "${LEFT4:-0}" = "0" ] \
+   && [ "${LEFT5:-0}" = "0" ]; then
   ok "실습 잔여물 없음"
 else
-  warn "실습 잔여물 — tpch 트리거 ${LEFT:-0} / tpcds 임시테이블 ${LEFT2:-0} / 실험 인덱스 tpch ${LEFT3:-0}·tpcds ${LEFT4:-0}"
+  warn "실습 잔여물 — tpch 트리거 ${LEFT:-0} / tpcds 임시테이블 ${LEFT2:-0} / 실험 인덱스 tpch ${LEFT3:-0}·tpcds ${LEFT4:-0} / 실험 lineitem 행 ${LEFT5:-0}"
   say  "     남으면 다음 측정이 **에러 없이** 달라진다. 지우려면:"
   say  "       psql -d tpch  -c \"DROP TRIGGER IF EXISTS t_sync_li ON lineitem;\" \\"
   say  "                     -c \"DROP TRIGGER IF EXISTS t_sync_ord ON orders;\" \\"

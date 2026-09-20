@@ -611,7 +611,26 @@ echo "  원복했다 — 안 돌아온 주문 ${LEFT:-?} / 파생 불일치 ${DR
 echo
 fi
 
-echo "정리 (이 스크립트는 customer/lineitem 을 변형한다 — 재적재 권장):"
+# 스스로 치운다. **enqueue 트리거를 남기면 lineitem 의 모든 쓰기에 붙어 다음 실습을
+# 조용히 오염시킨다**(에러가 없으니 다음 사람은 자기가 다른 것을 재는 줄 모른다).
+# 실험이 넣은 lineitem 행(l_linenumber>=90)도 같이 지운다 — 남으면 행수가 달라진다.
+if [ "${KEEP:-0}" != "1" ]; then
+  sql "DROP TRIGGER IF EXISTS t_enq_cust ON customer; DROP TRIGGER IF EXISTS t_enq_ord ON orders;
+       DROP TRIGGER IF EXISTS t_enq_line ON lineitem;" >/dev/null 2>&1
+  sql "DELETE FROM lineitem WHERE l_linenumber >= 90;
+       DELETE FROM lineitem_denorm WHERE l_linenumber >= 90;" >/dev/null 2>&1
+  sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
+        WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1
+  echo "정리했다 — 남은 enqueue 트리거 $(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\_enq%'") /"
+  echo "  실험 lineitem 행 $(sql "SELECT count(*) FROM lineitem WHERE l_linenumber>=90") /"
+  echo "  주문 소유자 불일치 $(sql "SELECT count(*) FROM orders o JOIN orders_cust_bak b USING (o_orderkey)
+                                    WHERE o.o_custkey IS DISTINCT FROM b.o_custkey")   (전부 0 이어야 한다)"
+else
+  echo "KEEP=1 — 트리거와 파생 테이블을 남긴다."
+fi
+echo
+echo "※ customer 의 c_mktsegment 는 워크로드가 바꾼다(복구 대상이 아니다)."
+echo "   원래 값이 필요하면 재적재한다:"
 echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"load   --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"index  --db=postgres\""
