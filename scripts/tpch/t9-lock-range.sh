@@ -41,7 +41,52 @@ export PGOPTIONS="-c work_mem=$WORK_MEM"
 # PGPASSWORD 은 export 한다. pgbench 도 이 환경변수를 쓰고, timeout 으로 감쌀 psql 도
 # 셸 함수가 아니라 실제 명령이어야 하기 때문이다(아래 tsql 주석 참고).
 export PGPASSWORD=tuner
-PSQL(){ psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
+# 클라이언트가 호스트에 있을 수도, 컨테이너 안에만 있을 수도 있다. 없다고 그냥 두면
+# psql 호출이 전부 빈 값을 돌려주고, 그 빈 값이 **다른 진단으로 둔갑한다** —
+# 실제로 "psql: command not found" 뒤에 "lineitem 에 인덱스가 없습니다"가 찍혀,
+# 사용자가 멀쩡한 DB 에 index 를 다시 돌렸다. 그래서 여기서 갈라 두고,
+# 아래 pg_precheck 이 '클라이언트 없음'과 '접속 불가'와 '인덱스 없음'을 구분해 말한다.
+CONTAINER="${CONTAINER:-tuninglab-postgres}"
+if command -v psql >/dev/null 2>&1; then
+  PG_VIA=host
+else
+  PG_VIA=docker
+fi
+if [ "$PG_VIA" = host ]; then
+  PSQL(){ psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
+  PGBENCH(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner "$@"; }
+else
+  PSQL(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" psql -U tuner -d tpch -X -q "$@"; }
+  PGBENCH(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" pgbench -U tuner "$@"; }
+fi
+# 진단을 섞지 않는다 — 원인마다 다른 문장을 준다.
+pg_precheck() {
+  if [ "$PG_VIA" = docker ] && ! command -v docker >/dev/null 2>&1; then
+    echo "  [중단] psql 도 docker 도 없습니다. 둘 중 하나:"
+    echo "         sudo apt install postgresql-client"
+    echo "         docker compose -f docker/docker-compose.yml up -d postgres"
+    exit 1
+  fi
+  # 이 시점에 sql() 은 아직 정의 전일 수 있다(스크립트마다 순서가 다르다).
+  # 정의돼 있는 쪽을 골라 직접 찔러 본다.
+  local ok=""
+  if declare -f PSQL >/dev/null 2>&1; then ok=$(PSQL -tAc "SELECT 1" 2>/dev/null)
+  elif declare -f q >/dev/null 2>&1;    then ok=$(q "SELECT 1" 2>/dev/null); fi
+  if ! printf %s "$ok" | grep -q 1; then
+    echo "  [중단] PostgreSQL 에 접속할 수 없습니다 (경로: $PG_VIA)."
+    [ "$PG_VIA" = docker ] && echo "         docker start $CONTAINER   # 컨테이너 이름이 다르면 CONTAINER=... 로 준다"
+    echo "         ./scripts/restore-lab.sh --check"
+    exit 1
+  fi
+}
+# 컨테이너 경로에서는 -f 로 줄 파일이 **컨테이너 안에** 있어야 한다. 경로를 바꿔 준다.
+pg_stage() {
+  if [ "$PG_VIA" = host ]; then printf %s "$1"; return; fi
+  docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
+  printf %s "/tmp/$(basename "$1")"
+}
+pg_precheck
+
 sql(){ PSQL -tAc "$1"; }
 # timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
 #   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
@@ -151,7 +196,7 @@ BEGIN;
 UPDATE orders SET o_shippriority = :r % 7 WHERE o_orderkey = :ord;
 END;
 EOF
-run(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner -f /tmp/t9_skew.sql \
+run(){ PGBENCH -f "$(pg_stage /tmp/t9_skew.sql)" \
         -c 8 -j 4 -T 12 -n tpch 2>&1 | grep -oP 'tps = \K[0-9.]+' | head -1; }
 printf "  %-10s %-9s %13s %13s %8s\n" "주문수" "적중률" "naive tps" "FOR SHARE" "손해"
 for N in 50 500 5000; do

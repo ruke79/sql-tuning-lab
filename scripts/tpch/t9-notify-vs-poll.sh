@@ -71,7 +71,52 @@ export PGOPTIONS="-c work_mem=$WORK_MEM"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 export PGPASSWORD=tuner
-PSQL(){ psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
+# 클라이언트가 호스트에 있을 수도, 컨테이너 안에만 있을 수도 있다. 없다고 그냥 두면
+# psql 호출이 전부 빈 값을 돌려주고, 그 빈 값이 **다른 진단으로 둔갑한다** —
+# 실제로 "psql: command not found" 뒤에 "lineitem 에 인덱스가 없습니다"가 찍혀,
+# 사용자가 멀쩡한 DB 에 index 를 다시 돌렸다. 그래서 여기서 갈라 두고,
+# 아래 pg_precheck 이 '클라이언트 없음'과 '접속 불가'와 '인덱스 없음'을 구분해 말한다.
+CONTAINER="${CONTAINER:-tuninglab-postgres}"
+if command -v psql >/dev/null 2>&1; then
+  PG_VIA=host
+else
+  PG_VIA=docker
+fi
+if [ "$PG_VIA" = host ]; then
+  PSQL(){ psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q "$@"; }
+  PGBENCH(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner "$@"; }
+else
+  PSQL(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" psql -U tuner -d tpch -X -q "$@"; }
+  PGBENCH(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" pgbench -U tuner "$@"; }
+fi
+# 진단을 섞지 않는다 — 원인마다 다른 문장을 준다.
+pg_precheck() {
+  if [ "$PG_VIA" = docker ] && ! command -v docker >/dev/null 2>&1; then
+    echo "  [중단] psql 도 docker 도 없습니다. 둘 중 하나:"
+    echo "         sudo apt install postgresql-client"
+    echo "         docker compose -f docker/docker-compose.yml up -d postgres"
+    exit 1
+  fi
+  # 이 시점에 sql() 은 아직 정의 전일 수 있다(스크립트마다 순서가 다르다).
+  # 정의돼 있는 쪽을 골라 직접 찔러 본다.
+  local ok=""
+  if declare -f PSQL >/dev/null 2>&1; then ok=$(PSQL -tAc "SELECT 1" 2>/dev/null)
+  elif declare -f q >/dev/null 2>&1;    then ok=$(q "SELECT 1" 2>/dev/null); fi
+  if ! printf %s "$ok" | grep -q 1; then
+    echo "  [중단] PostgreSQL 에 접속할 수 없습니다 (경로: $PG_VIA)."
+    [ "$PG_VIA" = docker ] && echo "         docker start $CONTAINER   # 컨테이너 이름이 다르면 CONTAINER=... 로 준다"
+    echo "         ./scripts/restore-lab.sh --check"
+    exit 1
+  fi
+}
+# 컨테이너 경로에서는 -f 로 줄 파일이 **컨테이너 안에** 있어야 한다. 경로를 바꿔 준다.
+pg_stage() {
+  if [ "$PG_VIA" = host ]; then printf %s "$1"; return; fi
+  docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
+  printf %s "/tmp/$(basename "$1")"
+}
+pg_precheck
+
 sql(){ PSQL -tAc "$1"; }
 
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
@@ -291,7 +336,7 @@ run_case(){   # $1=모드지정("poll:20"|"notify") $2=목표rate("" 면 무제�
       >/dev/null 2>&1 & local WP=$!
   sleep 0.4
   local extra=""; [ -n "${2:-}" ] && extra="-R $2"
-  local T; T=$(pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner -f "${3:-/tmp/t9n_nat.sql}" \
+  local T; T=$(PGBENCH -f "$(pg_stage "${3:-/tmp/t9n_nat.sql}")" \
                  -c "$CLIENTS" -j 4 -T "$SECS" -n $extra tpch 2>&1 \
                | grep -oP 'tps = \K[0-9.]+' | head -1)
   # 부하 종료 직후의 잔량이 곧 "따라잡고 있었는가"의 지표다. 여기서 0 이 되기를
@@ -405,7 +450,7 @@ NOTPS=""; PLTPS=""
 for r in $(seq 1 "$ROUNDS"); do
   for t in plain notify; do
     light_reset; trg $t
-    v=$(pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner -f /tmp/t9n_nat.sql \
+    v=$(PGBENCH -f "$(pg_stage /tmp/t9n_nat.sql)" \
           -c "$CLIENTS" -j 4 -T "$SECS" -n tpch 2>&1 | grep -oP 'tps = \K[0-9.]+' | head -1)
     [ "$t" = plain ] && PLTPS="$PLTPS ${v%%.*}" || NOTPS="$NOTPS ${v%%.*}"
   done

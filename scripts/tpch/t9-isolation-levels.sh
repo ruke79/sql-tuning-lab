@@ -40,7 +40,52 @@ DB=tpch
 TMPD="${TMPDIR:-/tmp}/t9iso.$$"
 
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
-q()  { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -tAc "$1" 2>&1; }
+# 클라이언트가 호스트에 있을 수도, 컨테이너 안에만 있을 수도 있다. 없다고 그냥 두면
+# psql 호출이 전부 빈 값을 돌려주고, 그 빈 값이 **다른 진단으로 둔갑한다** —
+# 실제로 "psql: command not found" 뒤에 "lineitem 에 인덱스가 없습니다"가 찍혀,
+# 사용자가 멀쩡한 DB 에 index 를 다시 돌렸다. 그래서 여기서 갈라 두고,
+# 아래 pg_precheck 이 '클라이언트 없음'과 '접속 불가'와 '인덱스 없음'을 구분해 말한다.
+CONTAINER="${CONTAINER:-tuninglab-postgres}"
+if command -v psql >/dev/null 2>&1; then
+  PG_VIA=host
+else
+  PG_VIA=docker
+fi
+if [ "$PG_VIA" = host ]; then
+  q()  { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -tAc "$1" 2>&1; }
+  PGBENCH(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" "$@"; }
+else
+  q()  { docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" psql -U "$PGUSER_" -d "$DB" -X -q -tAc "$1" 2>&1; }
+  PGBENCH(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" pgbench -U "$PGUSER_" "$@"; }
+fi
+# 진단을 섞지 않는다 — 원인마다 다른 문장을 준다.
+pg_precheck() {
+  if [ "$PG_VIA" = docker ] && ! command -v docker >/dev/null 2>&1; then
+    echo "  [중단] psql 도 docker 도 없습니다. 둘 중 하나:"
+    echo "         sudo apt install postgresql-client"
+    echo "         docker compose -f docker/docker-compose.yml up -d postgres"
+    exit 1
+  fi
+  # 이 시점에 sql() 은 아직 정의 전일 수 있다(스크립트마다 순서가 다르다).
+  # 정의돼 있는 쪽을 골라 직접 찔러 본다.
+  local ok=""
+  if declare -f PSQL >/dev/null 2>&1; then ok=$(PSQL -tAc "SELECT 1" 2>/dev/null)
+  elif declare -f q >/dev/null 2>&1;    then ok=$(q "SELECT 1" 2>/dev/null); fi
+  if ! printf %s "$ok" | grep -q 1; then
+    echo "  [중단] PostgreSQL 에 접속할 수 없습니다 (경로: $PG_VIA)."
+    [ "$PG_VIA" = docker ] && echo "         docker start $CONTAINER   # 컨테이너 이름이 다르면 CONTAINER=... 로 준다"
+    echo "         ./scripts/restore-lab.sh --check"
+    exit 1
+  fi
+}
+# 컨테이너 경로에서는 -f 로 줄 파일이 **컨테이너 안에** 있어야 한다. 경로를 바꿔 준다.
+pg_stage() {
+  if [ "$PG_VIA" = host ]; then printf %s "$1"; return; fi
+  docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
+  printf %s "/tmp/$(basename "$1")"
+}
+pg_precheck
+
 qf() { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -f "$1" 2>&1; }
 qx() { local o; o=$(q "$1"); case "$o" in *ERROR*) echo "  [중단] 준비 실패: $1"; echo "  $o"; exit 1;; esac; }
 
@@ -49,8 +94,8 @@ dispw() { local b k; b=$(printf %s "$1" | wc -c); k=$(printf %s "$1" | LC_ALL=C 
 padr()  { local n; n=$(dispw "$1"); printf "%s" "$1"; while [ "$n" -lt "$2" ]; do printf " "; n=$((n+1)); done; }
 padl()  { local n; n=$(dispw "$1"); while [ "$n" -lt "$2" ]; do printf " "; n=$((n+1)); done; printf "%s" "$1"; }
 
-command -v pgbench >/dev/null 2>&1 || { echo "pgbench 가 없습니다."; exit 1; }
-PGBV=$(pgbench --version | grep -oE "[0-9]+" | head -1)
+PGBV=$(PGBENCH --version 2>/dev/null | grep -oE "[0-9]+" | head -1)
+[ -n "$PGBV" ] || { echo "  [중단] pgbench 를 찾을 수 없습니다 (경로: $PG_VIA)."; exit 1; }
 if [ "${PGBV:-0}" -lt 14 ]; then
   echo "  [중단] pgbench $PGBV 입니다. --max-tries 는 14 이상에서만 됩니다 — ②를 잴 수 없습니다."
   exit 1
@@ -235,7 +280,7 @@ for e in "${LEVELS[@]}"; do
   LVL="${e%%:*}"; LBL="${e#*:}"
   for MT in 1 10; do
     R=$(PGOPTIONS="-c default_transaction_isolation=$LVL" \
-        pgbench -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -n \
+        PGBENCH -d "$DB" -n \
           -f "$TMPD/wa.sql" -f "$TMPD/wb.sql" -c "$CLIENTS" -j "$JOBS" -T "$SECS" \
           --max-tries=$MT --failures-detailed 2>&1)
     TPS=$(echo "$R" | grep -oE "^tps = [0-9.]+" | grep -oE "[0-9.]+" | head -1)

@@ -46,8 +46,53 @@ DB=pgbench_lab
 
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 
-command -v pgbench >/dev/null 2>&1 || { echo "pgbench 가 없습니다."; exit 1; }
-q()  { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -tAc "$1" 2>&1; }
+# pgbench 는 컨테이너 경로에서도 쓸 수 있다(postgres 이미지에 들어 있다) — 아래 pg_precheck 이 본다.
+# 클라이언트가 호스트에 있을 수도, 컨테이너 안에만 있을 수도 있다. 없다고 그냥 두면
+# psql 호출이 전부 빈 값을 돌려주고, 그 빈 값이 **다른 진단으로 둔갑한다** —
+# 실제로 "psql: command not found" 뒤에 "lineitem 에 인덱스가 없습니다"가 찍혀,
+# 사용자가 멀쩡한 DB 에 index 를 다시 돌렸다. 그래서 여기서 갈라 두고,
+# 아래 pg_precheck 이 '클라이언트 없음'과 '접속 불가'와 '인덱스 없음'을 구분해 말한다.
+CONTAINER="${CONTAINER:-tuninglab-postgres}"
+if command -v psql >/dev/null 2>&1; then
+  PG_VIA=host
+else
+  PG_VIA=docker
+fi
+if [ "$PG_VIA" = host ]; then
+  q()  { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -tAc "$1" 2>&1; }
+  PGBENCH(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" "$@"; }
+else
+  q()  { docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" psql -U "$PGUSER_" -d "$DB" -X -q -tAc "$1" 2>&1; }
+  PGBENCH(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="${PGOPTIONS:-}" "$CONTAINER" pgbench -U "$PGUSER_" "$@"; }
+fi
+# 진단을 섞지 않는다 — 원인마다 다른 문장을 준다.
+pg_precheck() {
+  if [ "$PG_VIA" = docker ] && ! command -v docker >/dev/null 2>&1; then
+    echo "  [중단] psql 도 docker 도 없습니다. 둘 중 하나:"
+    echo "         sudo apt install postgresql-client"
+    echo "         docker compose -f docker/docker-compose.yml up -d postgres"
+    exit 1
+  fi
+  # 이 시점에 sql() 은 아직 정의 전일 수 있다(스크립트마다 순서가 다르다).
+  # 정의돼 있는 쪽을 골라 직접 찔러 본다.
+  local ok=""
+  if declare -f PSQL >/dev/null 2>&1; then ok=$(PSQL -tAc "SELECT 1" 2>/dev/null)
+  elif declare -f q >/dev/null 2>&1;    then ok=$(q "SELECT 1" 2>/dev/null); fi
+  if ! printf %s "$ok" | grep -q 1; then
+    echo "  [중단] PostgreSQL 에 접속할 수 없습니다 (경로: $PG_VIA)."
+    [ "$PG_VIA" = docker ] && echo "         docker start $CONTAINER   # 컨테이너 이름이 다르면 CONTAINER=... 로 준다"
+    echo "         ./scripts/restore-lab.sh --check"
+    exit 1
+  fi
+}
+# 컨테이너 경로에서는 -f 로 줄 파일이 **컨테이너 안에** 있어야 한다. 경로를 바꿔 준다.
+pg_stage() {
+  if [ "$PG_VIA" = host ]; then printf %s "$1"; return; fi
+  docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
+  printf %s "/tmp/$(basename "$1")"
+}
+pg_precheck
+
 # 준비 단계용 — 실패를 삼키지 않는다. 조용히 안 돈 준비 단계는 측정을 통째로 무의미하게 만든다.
 qx() { local o; o=$(q "$1"); case "$o" in *ERROR*) echo "  [중단] 준비 단계 실패: $1"; echo "         $o"; exit 1;; esac; }
 qp() { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d postgres -X -q -tAc "$1" 2>&1; }
@@ -61,7 +106,7 @@ NACC=$(q "SELECT count(*) FROM pgbench_accounts" 2>/dev/null)
 case "$NACC" in ''|*[!0-9]*) NACC=0;; esac
 if [ "$NACC" -lt 1000 ]; then
   echo "pgbench_accounts 를 적재한다 (-s $SCALE, 약 3초)"
-  pgbench -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -i -s "$SCALE" -q "$DB" 2>&1 | tail -1
+  PGBENCH -i -s "$SCALE" -q "$DB" 2>&1 | tail -1
   NACC=$(q "SELECT count(*) FROM pgbench_accounts")
 fi
 
@@ -105,7 +150,7 @@ measure() {
   q "SELECT pg_stat_reset_single_table_counters('pgbench_accounts'::regclass)" >/dev/null
   q "SELECT pg_stat_reset_shared('wal')" >/dev/null
   local tps
-  tps=$(pgbench -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -c "$CLIENTS" -j "$JOBS" -T "$SECS" "$DB" 2>&1 \
+  tps=$(PGBENCH -c "$CLIENTS" -j "$JOBS" -T "$SECS" "$DB" 2>&1 \
         | grep -oE "tps = [0-9.]+" | head -1 | grep -oE "[0-9.]+")
   # tps|HOT비율|UPDATE당 WAL 전체|그중 FPI 를 뺀 레코드 몫
   #
