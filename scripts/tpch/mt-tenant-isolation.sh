@@ -85,6 +85,52 @@ bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" >/dev/null 2>&1
             sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
 joins_of() { sql "EXPLAIN (COSTS OFF) $1" | grep -cE 'Nested Loop|Hash Join|Merge Join'; }
 
+# ── 교차 측정 ────────────────────────────────────────────────────────
+# 세 가지를 한꺼번에 고친다:
+#  (1) **시간과 buffers 를 같은 실행에서** 뽑는다. 따로 돌리면 캐시 상태가 달라져,
+#      SF=10 에서 시간은 웜인데 buffers 는 콜드(hit=0)로 찍히는 일이 생긴다.
+#  (2) **라운드마다 전략을 교차**한다. 고정 순서로 한 번씩 돌면 앞 전략이 캐시를 밀어내
+#      뒤 전략이 불리해지고, 그 차이를 전략 탓으로 읽게 된다(§T-0 원칙 6).
+#      실제로 이 표에서 RLS 가 A 보다 *빨라* 보인 적이 있다 — 순서가 만든 값이었다.
+#  (3) **편차를 같이 찍는다.** 최소값만 주면 "이 차이가 노이즈 안인가"를 읽는 사람이
+#      판단할 수 없다. (최대−최소)/최소 를 ±% 로 붙여, 그 폭보다 작은 차이는
+#      주장하지 않도록 한다.
+# 입력은 "라벨|사전SET|쿼리" 들. 결과는 M_MS/M_BUF/M_DEV 에 라벨로 담긴다.
+declare -A M_MS M_BUF M_DEV
+one_run() {   # "$1 pre" "$2 query" → "ms|hit|read"
+  sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | awk '
+    /Buffers: shared/ && !seen { h=0; r=0;
+      if (match($0,/hit=[0-9]+/))  h=substr($0,RSTART+4,RLENGTH-4);
+      if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); seen=1 }
+    /Execution Time:/ { t=$3 }
+    END { printf "%s|%d|%d", t, h, r }'
+}
+measure_set() {
+  local specs=("$@") sp lbl rest pre Q r out ms h rd
+  local -A MAXV
+  for sp in "${specs[@]}"; do lbl="${sp%%|*}"; M_MS[$lbl]=""; MAXV[$lbl]=""; done
+  # 워밍업 1회 — 첫 실행의 계획 캐시·힌트비트 비용을 모든 전략에서 똑같이 털어낸다.
+  for sp in "${specs[@]}"; do rest="${sp#*|}"; pre="${rest%%|*}"; Q="${rest#*|}"
+    sql "$pre EXPLAIN (ANALYZE, BUFFERS) $Q" >/dev/null 2>&1; done
+  for r in $(seq "$REPEAT"); do
+    for sp in "${specs[@]}"; do
+      lbl="${sp%%|*}"; rest="${sp#*|}"; pre="${rest%%|*}"; Q="${rest#*|}"
+      IFS='|' read -r ms h rd <<<"$(one_run "$pre" "$Q")"
+      case "$ms" in ''|*[!0-9.]*) continue;; esac
+      if [ -z "${M_MS[$lbl]}" ] || awk -v a="$ms" -v b="${M_MS[$lbl]}" 'BEGIN{exit !(a<b)}'; then
+        M_MS[$lbl]="$ms"; M_BUF[$lbl]="hit=$h read=$rd"
+      fi
+      if [ -z "${MAXV[$lbl]}" ] || awk -v a="$ms" -v b="${MAXV[$lbl]}" 'BEGIN{exit !(a>b)}'; then
+        MAXV[$lbl]="$ms"
+      fi
+    done
+  done
+  for sp in "${specs[@]}"; do lbl="${sp%%|*}"
+    M_DEV[$lbl]=$(awk -v hi="${MAXV[$lbl]:-0}" -v lo="${M_MS[$lbl]:-0}" \
+                  'BEGIN{ if(lo>0) printf "±%.0f%%", 100*(hi-lo)/lo; else printf "-" }')
+  done
+}
+
 # tpcds 판의 teardown 버그를 그대로 답습하지 않는다 — 문장을 따로 보낸다.
 # 한 -c 에 몰면 뒤의 실패가 앞의 DROP 까지 롤백시켜 정리가 조용히 안 된다.
 teardown() {
@@ -181,13 +227,27 @@ PRE_RLS="SET ROLE mt_app_tpch; SET app.nation = '$T_ME';"
 # ══════════════════════════════════════════════════════════════════════
 if want 1; then
 echo "── ① 테넌트 범위 조회 — 2조인을 지불하는가, 비정규화로 없애는가 ──"
-printf "  %-24s %6s %-40s %-16s %s\n" "전략" "조인" "스캔" "buffers" "min(ms)"
-printf "  %s\n" "--------------------------------------------------------------------------------------------------------"
-printf "  %-24s %6s %-40s %-16s %s\n" "N 정규화 (2조인)"  "$(joins_of "$QN")" "$(scan_of '' "$QN")" "$(bufs_of '' "$QN")" "$(best_ms '' "$QN")"
-printf "  %-24s %6s %-40s %-16s %s\n" "A 비정규화"        "$(joins_of "$QA")" "$(scan_of '' "$QA")" "$(bufs_of '' "$QA")" "$(best_ms '' "$QA")"
-printf "  %-24s %6s %-40s %-16s %s\n" "A + RLS"           "$(joins_of "$QA")" "$(scan_of "$PRE_RLS" "$QA")" "$(bufs_of "$PRE_RLS" "$QA")" "$(best_ms "$PRE_RLS" "$QA")"
-printf "  %-24s %6s %-40s %-16s %s\n" "B 파티션"          "$(joins_of "$QB")" "$(scan_of '' "$QB")" "$(bufs_of '' "$QB")" "$(best_ms '' "$QB")"
-printf "  %-24s %6s %-40s %-16s %s\n" "C 스키마"          "$(joins_of "$QC")" "$(scan_of "$PRE_C" "$QC")" "$(bufs_of "$PRE_C" "$QC")" "$(best_ms "$PRE_C" "$QC")"
+C1=("N 정규화 (2조인)||$QN" "A 비정규화||$QA" "A + RLS|$PRE_RLS|$QA" "B 파티션||$QB" "C 스키마|$PRE_C|$QC")
+measure_set "${C1[@]}"
+printf "  %-24s %6s %-38s %-18s %9s %8s\n" "전략" "조인" "스캔" "buffers" "min(ms)" "편차"
+printf "  %s\n" "------------------------------------------------------------------------------------------------------------"
+for sp in "${C1[@]}"; do
+  lbl="${sp%%|*}"; rest="${sp#*|}"; pre="${rest%%|*}"; Q="${rest#*|}"
+  printf "  %-24s %6s %-38s %-18s %9s %8s\n" "$lbl" "$(joins_of "$Q")" "$(scan_of "$pre" "$Q")" \
+    "${M_BUF[$lbl]}" "${M_MS[$lbl]}" "${M_DEV[$lbl]}"
+done
+echo
+echo "  ※ ${REPEAT}라운드 **교차** 측정이다(전략을 번갈아 돈다). buffers 는 최소 시간이 나온"
+echo "     바로 그 실행의 값이라 두 열의 조건이 같다. **편차보다 작은 차이는 주장하지 말 것** —"
+echo "     예컨대 A 와 A+RLS 의 시간 차가 편차 안이면, RLS 오버헤드는 buffers 열로 말해야 한다"
+echo "     (접근량이 같으면 정책이 추가 접근을 안 만든 것이다)."
+echo
+echo "  ※ **교차는 공짜가 아니다.** 순서 편향은 없앴지만, 대신 전략들이 서로 캐시를 밀어내"
+echo "     같은 조건도 회차마다 흔들린다 — 특히 N 은 원본 14GB 를 훑어 다른 전략의 캐시를"
+echo "     통째로 날린다. 편차가 크게 찍히면 그건 고장이 아니라 **그 수치가 원래 그만큼"
+echo "     불안정하다는 보고**다. 고정 순서로 재면 편차는 작아 보이지만 그건 순서가 만든"
+echo "     안정성이라 더 나쁘다 — **안 보이는 편향보다 보이는 편차가 낫다.**"
+echo "     편차가 크면 REPEAT 를 늘린다: ./mt-tenant-isolation.sh 8"
 echo
 echo "  해석: N 의 조인 2개가 테넌트 조회 **한 번마다** 붙는다. 이게 tpcds 판에는 없던 비용이다."
 echo "        tpcds 에서는 ①이 안 갈렸지만(전략 무관 2~3ms) 여기서는 N 만 확실히 다르다 —"
@@ -385,12 +445,18 @@ if [ -n "$XN_ERR" ]; then
   fi
   echo
 fi
-printf "  %-22s %9s %-16s %s\n" "전략" "min(ms)" "buffers" "쿼리 길이"
-printf "  %s\n" "-----------------------------------------------------------------"
-printf "  %-22s %9s %-16s %s자%s\n" "N 정규화 (2조인)" "$(best_ms "$XN_PRE" "$XN")" "$(bufs_of "$XN_PRE" "$XN")" "${#XN}" "$XN_TAG"
-printf "  %-22s %9s %-16s %s자\n" "A 비정규화"       "$(best_ms '' "$XA")" "$(bufs_of '' "$XA")" "${#XA}"
-printf "  %-22s %9s %-16s %s자\n" "B 파티션"         "$(best_ms '' "$XB")" "$(bufs_of '' "$XB")" "${#XB}"
-printf "  %-22s %9s %-16s %s자 (UNION ALL ×%s)\n" "C 스키마" "$(best_ms '' "$XC")" "$(bufs_of '' "$XC")" "${#XC}" "$NT"
+C6=("N 정규화 (2조인)|$XN_PRE|$XN" "A 비정규화||$XA" "B 파티션||$XB" "C 스키마||$XC")
+measure_set "${C6[@]}"
+printf "  %-22s %10s %8s %-20s %s\n" "전략" "min(ms)" "편차" "buffers" "쿼리 길이"
+printf "  %s\n" "---------------------------------------------------------------------------------"
+printf "  %-22s %10s %8s %-20s %s자%s\n" "N 정규화 (2조인)" "${M_MS[N 정규화 (2조인)]}" "${M_DEV[N 정규화 (2조인)]}" "${M_BUF[N 정규화 (2조인)]}" "${#XN}" "$XN_TAG"
+printf "  %-22s %10s %8s %-20s %s자\n" "A 비정규화" "${M_MS[A 비정규화]}" "${M_DEV[A 비정규화]}" "${M_BUF[A 비정규화]}" "${#XA}"
+printf "  %-22s %10s %8s %-20s %s자\n" "B 파티션"   "${M_MS[B 파티션]}"   "${M_DEV[B 파티션]}"   "${M_BUF[B 파티션]}"   "${#XB}"
+printf "  %-22s %10s %8s %-20s %s자 (UNION ALL ×%s)\n" "C 스키마" "${M_MS[C 스키마]}" "${M_DEV[C 스키마]}" "${M_BUF[C 스키마]}" "${#XC}" "$NT"
+echo
+echo "  ※ 여기도 ${REPEAT}라운드 교차 측정이다. **A 와 B 는 buffers 가 거의 같은데 시간이 갈린다면**"
+echo "     그건 I/O 가 아니라 파티션을 25개 열고 Append 로 합치는 오버헤드다 — 접근량을 통제한"
+echo "     상태의 비교이므로 그렇게 읽을 수 있다."
 echo
 echo "  해석: 교차 집계는 tpcds 와 같은 방향이다 — C 의 쿼리가 테넌트 수만큼 자란다."
 echo "        다만 tpch 에서는 테넌트가 ${NT}개라 그 부담이 더 크고(문자 ${#XC}), 국가가 하나"
