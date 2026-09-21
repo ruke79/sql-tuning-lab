@@ -56,6 +56,15 @@ restore_mysql() {
   # mysqladmin 도 호스트에 없을 수 있으므로 핑을 쿼리로 대신한다.
   m_up() { [ "$(m "SELECT 1")" = "1" ]; }
 
+  # root 비밀번호는 **컨테이너가 만들어질 때 박힌 값**이라 지금의 compose 파일과 다를 수 있다.
+  # 사용자가 안 줬으면 컨테이너 환경에서 읽어 온다 — 추측하는 것보다 낫다.
+  if [ "$VIA" = docker ] && [ -z "${MYSQL_ROOT_PASS:-}" ]; then
+    local ENVROOT
+    ENVROOT=$(docker inspect "$MYCON" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+              | sed -n 's/^MYSQL_ROOT_PASSWORD=//p' | head -1)
+    [ -n "$ENVROOT" ] && MYROOT="$ENVROOT"
+  fi
+
   # ── 2) 서버 ─────────────────────────────────────────────────────────
   if m_up; then
     ok "MySQL 서버 online ($(m "SELECT VERSION()"))"
@@ -89,26 +98,31 @@ restore_mysql() {
   # 여기까지 왔다는 건 tuner 로 이미 붙었다는 뜻이다(m_up 이 tuner 로 핑한다).
   # 권한은 따로 본다 — mt-*-mysql.sh 가 DB 25개와 계정 하나를 만들고 지운다.
   #
-  # `ALL PRIVILEGES ON *.*` 문자열만 찾으면 안 된다. MySQL 은 GRANT 를 개별 권한 목록으로
-  # 펼쳐 보여 주는 경우가 많아서(특히 동적 권한이 붙으면), 충분한 계정도 '좁다'고 잡힌다.
-  # **필요한 권한을 하나씩 본다** — 그래야 부족할 때 무엇이 없는지도 같이 말할 수 있다.
-  local GRANTS MISSING=""
-  GRANTS=$(m "SHOW GRANTS FOR CURRENT_USER()" | tr '\n' ' ')
-  case "$GRANTS" in *"ALL PRIVILEGES ON *.*"*|*"GRANT ALL ON *.*"*) GRANTS="$GRANTS CREATE DROP CREATE USER CREATE ROUTINE" ;; esac
-  for p in "CREATE" "DROP" "CREATE USER" "CREATE ROUTINE"; do
-    case "$GRANTS" in *"$p"*) ;; *) MISSING="$MISSING $p," ;; esac
-  done
-  if [ -z "$MISSING" ]; then
-    ok "계정 tuner — DB·계정·함수를 만들 권한 있음"
+  # **SHOW GRANTS 를 문자열로 파싱하지 않는다.** 한 번 그렇게 했다가 틀렸다:
+  # `GRANT ALL PRIVILEGES ON \`tpch\`.* TO ...` 에는 "CREATE" 라는 글자가 아예 없어서
+  # 'CREATE 권한 없음'으로 잡혔는데, 실제로는 그 권한으로 CREATE DATABASE tpch 가 된다
+  # (DB 단위 CREATE 는 그 이름의 DB 를 만들 수 있다). 반대로 ALL 인데 못 하는 것도 있다.
+  # 그래서 **실제로 해 본다** — 스크립트가 할 일을 그대로 시험하는 것이 유일하게 정확하다.
+  can_do() {  # 실험 객체를 만들었다 바로 지운다. 성공하면 0.
+    local probe="mt_probe_$$"
+    m "CREATE DATABASE $probe" >/dev/null 2>&1 || return 1
+    m "DROP DATABASE $probe"   >/dev/null 2>&1
+    m "CREATE USER '$probe'@'%' IDENTIFIED BY 'x'" >/dev/null 2>&1 || return 1
+    m "DROP USER '$probe'@'%'" >/dev/null 2>&1
+    return 0
+  }
+  if can_do; then
+    ok "계정 $MYUSER — DB·계정을 만들 권한 있음 (실제로 만들었다 지워서 확인)"
   elif [ "$MODE" = "--check" ]; then
-    warn "계정 tuner 에 없는 권한:${MISSING%,} — mt-*-mysql.sh 가 중간에 죽는다"
+    warn "계정 $MYUSER 가 **새 DB 나 계정을 못 만든다** — mt-*-mysql.sh 가 준비 단계에서 죽는다"
+    say  "       (mt_n0..24 / mt_s1..N 과 계정 mt_app 을 만들었다 지우는 실습이다)"
     say  "       GRANT ALL ON *.* TO '$MYUSER'@'%' WITH GRANT OPTION;"
   else
     # compose 의 init(docker/mysql/init/01-create-databases.sql)은 **tpch.\*·tpcds.\*·
     # sysbench_lab.\* 에만** ALL 을 준다. 그런데 mt-*-mysql.sh 는 mt_n0..24 라는 **새 DB** 25개와
     # 계정 mt_app 을 만든다 — 그 권한은 init 에 없다. 그래서 스크립트가 준비 단계에서 죽는다.
     # 실습용 로컬 컨테이너이므로 root 로 넓혀 준다. 무엇을 실행했는지 그대로 찍는다.
-    warn "계정 $MYUSER 에 없는 권한:${MISSING%,} — mt-*-mysql.sh 가 중간에 죽는다"
+    warn "계정 $MYUSER 가 **새 DB 나 계정을 못 만든다** — mt-*-mysql.sh 가 준비 단계에서 죽는다"
     act "root 로 권한을 넓힌다"
     for h in '%' 'localhost'; do
       mr "GRANT ALL ON *.* TO '$MYUSER'@'$h' WITH GRANT OPTION" >/dev/null 2>&1
@@ -118,12 +132,19 @@ restore_mysql() {
     mr "FLUSH PRIVILEGES" >/dev/null 2>&1
     say  "       GRANT ALL ON *.* TO '$MYUSER'@'%' WITH GRANT OPTION;"
     say  "       GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '$MYUSER'@'%';"
-    GRANTS=$(m "SHOW GRANTS FOR CURRENT_USER()" | tr '\n' ' ')
-    case "$GRANTS" in
-      *"ALL PRIVILEGES ON *.*"*|*"GRANT ALL ON *.*"*) ok "넓혔다"; CHANGED=1 ;;
-      *) warn "권한이 그대로다 — root 비밀번호가 다를 수 있다. MYSQL_ROOT_PASS=... 로 다시:"
-         say  "       MYSQL_ROOT_PASS=<비번> ./scripts/restore-lab.sh --mysql" ;;
-    esac
+    if can_do; then
+      ok "넓혔다 (다시 만들었다 지워서 확인)"; CHANGED=1
+    else
+      warn "권한이 그대로다 — root 로 못 붙었다."
+      if [ "$VIA" = docker ]; then
+        say "     이 컨테이너가 **만들어질 때** 박힌 root 비밀번호는 지금의 compose 파일과"
+        say "     다를 수 있다. 컨테이너 환경에서 직접 읽어 본다:"
+        say "       docker inspect $MYCON --format '{{range .Config.Env}}{{println .}}{{end}}' | grep MYSQL_ROOT"
+      fi
+      say "     찾았으면: MYSQL_ROOT_PASS=<비번> ./scripts/restore-lab.sh --mysql"
+      say "     **적재는 계속 진행한다** — tpch/tpcds 채우기에는 이 권한이 필요 없다."
+      say "     막히는 것은 mt-*-mysql.sh 뿐이다(새 DB 25개 + 계정 mt_app)."
+    fi
   fi
 
   # ── 4) 데이터 ───────────────────────────────────────────────────────

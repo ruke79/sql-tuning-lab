@@ -36,6 +36,13 @@
 #   ONLY=125 ./mt-tenant-isolation-mysql.sh
 #   KEEP=1 ./mt-tenant-isolation-mysql.sh   # 실험 객체를 남겨 둔다
 #
+#   SAMPLE=3000000 ./mt-tenant-isolation-mysql.sh   # 큰 적재에서 표본만 (문서와 같은 크기)
+#   FORCE=1        ./mt-tenant-isolation-mysql.sh   # 규모 가드를 무시하고 전부
+#
+# **규모 주의.** lineitem 의 복사본을 3개 만들고 테넌트별 DB 25개에 또 한 벌을 흩뿌린다.
+# SF=0.5(300만 행)에서 준비 215초 / 약 1.9GB. SF=10(6,000만)이면 1시간대 / 40GB 규모다.
+# 1,000만 행이 넘으면 스크립트가 추정치를 찍고 멈춘다 — SAMPLE 이나 FORCE 로 고른다.
+#
 # 선행 조건: MySQL 에 tpch 가 적재돼 있어야 한다. 없으면 ./scripts/restore-lab.sh --mysql
 set -uo pipefail
 
@@ -101,6 +108,41 @@ TEN=$(q "SELECT count(*) FROM nation")
 T_ME=3; T_OTHER=7
 NLI=$(q "SELECT count(*) FROM lineitem")
 
+# ── 규모 가드 ─────────────────────────────────────────────────────────
+# 이 스크립트는 lineitem 의 **복사본을 3개** 만들고 테넌트별 DB 25개에 또 한 벌을 흩뿌린다.
+# SF=0.5(300만 행)에서 준비가 215초 / 약 1.9GB 였다. 규모는 거의 선형으로 늘고,
+# 복사본이 버퍼 풀을 넘어서면 그보다 나빠진다. SF=10(6,000만)이면 준비만 1시간대,
+# 디스크 40GB 규모다 — **그걸 모르고 시작하면 한참 뒤에 디스크가 차서 죽는다.**
+# 그래서 재료 크기로 추정치를 찍고, 큰 경우에는 명시적으로 고르게 한다.
+# 표본은 **LIMIT 으로 뜨면 안 된다.** 실제로 그렇게 짰다가 걸렸다 — MySQL 이 고른 조인
+# 순서에 따라 LIMIT 300000 이 customer 를 앞에서부터 자르는 바람에 표본에
+# **nation 0,1,2 세 개만** 들어왔다. 측정 대상인 테넌트 3 은 0행이었고, 그런데도
+# ②가 "3.6배"라는 숫자를 태연히 찍었다. 아무것도 안 재고 나온 배수다.
+# 그래서 테넌트 분포를 보존하는 방식으로 뜬다 — 주문키 나머지로 고르게 솎는다.
+SAMPLE="${SAMPLE:-0}"
+if [ "$SAMPLE" -gt 0 ] && [ "$SAMPLE" -lt "$NLI" ]; then
+  SDIV=$(( (NLI + SAMPLE - 1) / SAMPLE ))
+  NROW=$(( NLI / SDIV ))
+  SWHERE=" WHERE l.l_orderkey % $SDIV = 0"
+else
+  SDIV=1; NROW="$NLI"; SWHERE=""
+fi
+if [ "$NROW" -gt 10000000 ] && [ "${FORCE:-0}" != "1" ]; then
+  echo "  lineitem 이 ${NROW} 행이다 (SF=0.5 기준의 $((NROW/3000491))배)."
+  echo "  준비(복사본 3개 + DB 25개)만 대략 $((NROW*215/3000491/60))분, 디스크 약 $((NROW*19/3000491/10))GB 를 쓴다."
+  echo
+  echo "  셋 중 하나를 고른다:"
+  echo "    SAMPLE=3000000 $0    # 문서의 실측 조건(SF=0.5)과 같은 크기로 표본을 떠서 본다"
+  echo "    FORCE=1        $0    # 그대로 전부 — 시간과 디스크를 확인하고 시작할 것"
+  echo "    df -h 로 여유를 먼저 보고 결정한다"
+  echo
+  echo "  ※ 표본은 주문키 나머지로 고르게 솎는다(테넌트 분포가 보존된다)."
+  echo "     다만 **너무 작게 뜨면 ①이 판정 불가로 나온다** — 서버 시간이 클라이언트"
+  echo "     왕복보다 작아져 전략 차이가 묻힌다. 300만(문서 실측 조건) 아래로는 권하지 않고,"
+  echo "     그보다 작게 뜰 거면 ②의 서버 시간만 신뢰할 것."
+  exit 1
+fi
+
 # **벽시계 측정에는 클라이언트 왕복이 통째로 들어간다.** 호스트 클라이언트면 보통
 # 수십 ms 지만 docker exec 는 프로세스를 하나 더 띄우므로 그보다 크다. 크기는 환경마다
 # 다르니 짐작하지 말고 **여기서 재서 찍는다** — 표의 작은 차이는 이 값과 비교해 읽어야
@@ -111,7 +153,7 @@ RT=$( b=""; for _ in 1 2 3; do
       done; echo "$b" )
 
 echo "멀티테넌시 분리 훈련 (MySQL $(q "SELECT VERSION()") / InnoDB)"
-echo "테넌트 ${TEN}개(국가), lineitem ${NLI} 행, 각 측정 ${REPEAT}회 최소값"
+echo "테넌트 ${TEN}개(국가), lineitem 약 ${NROW} 행${SWHERE:+ (원본 ${NLI} 행에서 1/${SDIV} 표본)}, 각 측정 ${REPEAT}회 최소값"
 echo "buffer pool $(q "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024)")MB  (PostgreSQL 판의 shared_buffers 1GB 와 맞춘 값)"
 echo "클라이언트 ${MYVIA} — 빈 쿼리 왕복 ${RT}ms. **아래 벽시계 값 전부에 이만큼이 들어 있다**"
 echo
@@ -132,7 +174,7 @@ teardown
 SRC="SELECT c.c_nationkey AS l_nationkey, l.l_orderkey, l.l_linenumber, o.o_custkey,
             l.l_extendedprice, l.l_shipdate
      FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey
-                     JOIN customer c ON o.o_custkey=c.c_custkey"
+                     JOIN customer c ON o.o_custkey=c.c_custkey$SWHERE"
 COLS="l_nationkey INT NOT NULL, l_orderkey BIGINT NOT NULL, l_linenumber INT NOT NULL,
       o_custkey INT NOT NULL, l_extendedprice DECIMAL(15,2), l_shipdate DATE"
 
@@ -168,7 +210,18 @@ for n in $(seq 0 $((TEN-1))); do
 done
 TD=$(date +%s)
 
-[ "$(q "SELECT count(*) FROM li_a")" = "$NLI" ] || { echo "  [중단] li_a 적재 실패"; exit 1; }
+# 표본을 뜨면 행수가 정확히 NROW 가 아니므로 '같은가'로 못 잡는다. 대신 **실제로 쓸 수 있는
+# 상태인가**를 본다 — 비어 있지 않고, 측정 대상 테넌트에 행이 있는가. LIMIT 표본 사고가
+# 여기서 안 걸렸던 이유가 이 검사가 없어서였다.
+NROW=$(q "SELECT count(*) FROM li_a")
+[ "${NROW:-0}" -gt 0 ] || { echo "  [중단] li_a 적재 실패 (0행)"; exit 1; }
+NTEN=$(q "SELECT count(DISTINCT l_nationkey) FROM li_a")
+MINE0=$(q "SELECT count(*) FROM li_a WHERE l_nationkey=$T_ME")
+if [ "${MINE0:-0}" -eq 0 ] || [ "${NTEN:-0}" -lt "$TEN" ]; then
+  echo "  [중단] 표본이 테넌트를 고르게 담지 못했다 — 테넌트 ${NTEN}/${TEN}개, 대상 테넌트 ${MINE0}행."
+  echo "         SAMPLE 을 키우거나(현재 ${SAMPLE}) 빼고 다시 돌린다."
+  exit 1
+fi
 sz() { q "SELECT CONCAT(ROUND(SUM(data_length)/1048576),'MB 데이터 / ',ROUND(SUM(index_length)/1048576),'MB 인덱스')
           FROM information_schema.tables WHERE table_schema='tpch' AND table_name='$1'"; }
 printf "  A  비정규화, PK=(orderkey,linenumber)      %3ds   %s\n" $((TA-T0)) "$(sz li_a)"
@@ -191,31 +244,60 @@ if want 1; then
 echo "── ① 테넌트 범위 조회 ──"
 printf "  %-34s %-42s %s\n" "전략" "계획" "min(ms)"
 printf "  %s\n" "-------------------------------------------------------------------------------------------"
-printf "  %-34s %-42s %s\n" "N  정규화 (2조인)"          "$(plan_of "$QN")"  "$(best "$QN")"
-printf "  %-34s %-42s %s\n" "A  비정규화 (보조 인덱스)"  "$(plan_of "$QA")"  "$(best "$QA")"
-printf "  %-34s %-42s %s\n" "A′ 테넌트가 PK 선두"        "$(plan_of "$QAC")" "$(best "$QAC")"
-printf "  %-34s %-42s %s\n" "B  파티션"                  "$(plan_of "$QB")"  "$(best "$QB")"
-printf "  %-34s %-42s %s\n" "C  테넌트별 DB"             "$(plan_of "$QC")"  "$(best "$QC")"
+M_N=$(best "$QN"); M_A=$(best "$QA"); M_AC=$(best "$QAC"); M_B=$(best "$QB"); M_C=$(best "$QC")
+printf "  %-34s %-42s %s\n" "N  정규화 (2조인)"          "$(plan_of "$QN")"  "$M_N"
+printf "  %-34s %-42s %s\n" "A  비정규화 (보조 인덱스)"  "$(plan_of "$QA")"  "$M_A"
+printf "  %-34s %-42s %s\n" "A′ 테넌트가 PK 선두"        "$(plan_of "$QAC")" "$M_AC"
+printf "  %-34s %-42s %s\n" "B  파티션"                  "$(plan_of "$QB")"  "$M_B"
+printf "  %-34s %-42s %s\n" "C  테넌트별 DB"             "$(plan_of "$QC")"  "$M_C"
 echo
 echo "  B 가 파티션 하나만 열었는지:"
 q "EXPLAIN FORMAT=TRADITIONAL $QB" | awk '{print "    partitions = "$4}' | head -1
 echo
-echo "  해석 — **PostgreSQL 판과 순서가 다르다.** 거기서는 N(2조인)이 제일 느렸는데"
-echo "  여기서는 N 이 A 를 이긴다. 비정규화를 하고도 더 느려진 것이다."
-echo "  이유는 ②에 있다 — A 의 보조 인덱스 조회는 테넌트 행 12만 개를 찾은 뒤 **PK 로"
-echo "  클러스터드 인덱스를 12만 번 되찾아간다.** 그 랜덤 접근이 조인 두 번보다 비싸다."
-echo "  A′ 처럼 테넌트를 PK 선두에 두면 그제야 비정규화가 값을 한다."
-echo "  → '비정규화하면 빨라진다'가 InnoDB 에서는 **PK 를 어떻게 잡느냐에 달려 있다.**"
-echo "     PostgreSQL 힙 테이블에서는 나올 수 없는 역전이다."
+
+# **해석을 박아 두지 않는다.** 예전에는 이 자리에 "N 이 A 를 이긴다"가 결론으로 적혀
+# 있었는데, SAMPLE 로 작게 돌리면 값이 전부 왕복비 바닥(RT)에 깔려 A 와 A′ 가 뒤집히는데도
+# 같은 문장이 나왔다. **측정과 어긋나는 해설은 없는 것만 못하다.** 재서 쓴다.
+GAP=$(( M_A > M_AC ? M_A - M_AC : M_AC - M_A ))
+echo "  해석 —"
+if [ "$M_A" -le $((RT * 2)) ] || [ "$GAP" -le $((RT / 4)) ]; then
+  echo "  **이 규모에서는 벽시계로 판정할 수 없다.** A ${M_A}ms · A′ ${M_AC}ms (차이 ${GAP}ms)인데"
+  echo "  클라이언트 왕복만 ${RT}ms 다 — 값의 대부분이 서버가 아니라 **왕복비**이고, 남은 몫에서"
+  echo "  전략 차이를 읽어내는 건 신뢰할 수 없다. 전략의 우열이 아니라 **측정 한계**다."
+  echo "  → ②의 값을 본다(EXPLAIN ANALYZE 의 서버 시간이라 왕복비가 안 들어간다),"
+  echo "     또는 SAMPLE 을 키워서(문서 실측은 300만 행) 다시 잰다."
+elif [ "$M_A" -gt "$M_AC" ] && [ "$M_A" -gt "$M_N" ]; then
+  echo "  **PostgreSQL 판과 순서가 다르다.** 거기서는 N(2조인)이 제일 느렸는데"
+  echo "  여기서는 N(${M_N}ms)이 A(${M_A}ms)를 이긴다. 비정규화를 하고도 더 느려진 것이다."
+  echo "  이유는 ②에 있다 — A 의 보조 인덱스 조회는 테넌트 행을 찾은 뒤 **PK 로"
+  echo "  클러스터드 인덱스를 그만큼 되찾아간다.** 그 랜덤 접근이 조인 두 번보다 비싸다."
+  echo "  A′(${M_AC}ms)처럼 테넌트를 PK 선두에 두면 그제야 비정규화가 값을 한다."
+  echo "  → '비정규화하면 빨라진다'가 InnoDB 에서는 **PK 를 어떻게 잡느냐에 달려 있다.**"
+  echo "     PostgreSQL 힙 테이블에서는 나올 수 없는 역전이다."
+elif [ "$M_A" -gt "$M_AC" ]; then
+  echo "  A(${M_A}ms) > A′(${M_AC}ms) — **PK 배치의 효과는 나왔다.** 보조 인덱스로 찾은 뒤"
+  echo "  PK 로 클러스터드 인덱스를 되찾아가는 비용이다(②에서 따로 본다)."
+  echo "  다만 N(${M_N}ms)까지 A 를 이기지는 않았다. 문서의 실측(SF=0.5)에서는 그것도 뒤집혔다 —"
+  echo "  조인 두 번의 비용은 규모와 캐시 상태에 따라 달라지므로 여기서 단정하지 않는다."
+else
+  echo "  A(${M_A}ms) ≤ A′(${M_AC}ms) — **문서의 실측과 방향이 다르다.** 그대로 적어 둔다."
+  echo "  A 의 되찾기 비용이 드러나려면 테넌트 행이 클러스터드 인덱스에 충분히 흩어져 있고"
+  echo "  그 양이 버퍼 풀을 압박해야 한다. 규모나 캐시 상태가 다르면 안 나올 수 있다."
+  echo "  → ②의 서버 시간과 함께 읽고, SAMPLE 없이(또는 더 크게) 다시 재 볼 것."
+fi
 echo
 fi
 
 # ══════════════════════════════════════════════════════════════════════
 if want 2; then
 echo "── ② InnoDB 의 PK 는 클러스터드 인덱스다 — A vs A′ 가 전부다 ──"
-echo "  같은 데이터·같은 질문인데 PK 배치만 다르다:"
-printf "    A  PK=(l_orderkey,l_linenumber) + KEY(l_nationkey,...)   %6s ms\n" "$(best "$QA")"
-printf "    A′ PK=(l_nationkey,l_orderkey,l_linenumber)              %6s ms\n" "$(best "$QAC")"
+echo "  같은 데이터·같은 질문인데 PK 배치만 다르다."
+echo "  **여기는 벽시계가 아니라 서버 시간(EXPLAIN ANALYZE)으로 잰다** — 이 절이 이 스크립트의"
+echo "  핵심 주장이고, 벽시계로 재면 클라이언트 왕복 ${RT}ms 가 그대로 섞여 들어오기 때문이다."
+S_A=$(srv_ms "$QA"); S_AC=$(srv_ms "$QAC")
+printf "    A  PK=(l_orderkey,l_linenumber) + KEY(l_nationkey,...)   %8s ms (서버)\n" "$S_A"
+printf "    A′ PK=(l_nationkey,l_orderkey,l_linenumber)              %8s ms (서버)\n" "$S_AC"
+printf "    배수: %s\n" "$(awk -v a="$S_A" -v b="$S_AC" 'BEGIN{ if (b+0>0) printf "%.1fx", a/b; else print "(계산 불가)" }')"
 echo
 echo "  A 는 보조 인덱스에서 테넌트 행을 찾은 뒤 **PK 로 클러스터드 인덱스를 다시 찾아간다**"
 echo "  (InnoDB 의 보조 인덱스는 행 위치가 아니라 PK 값을 담는다). 테넌트 행이 클러스터드"
@@ -267,7 +349,7 @@ fi
 if want 4; then
 echo "── ④ WHERE 누락 유출 ──"
 MINE=$(q "SELECT count(*) FROM li_a WHERE l_nationkey=$T_ME")
-printf "  내 테넌트 %s 행 / 전체 %s 행\n\n" "$MINE" "$NLI"
+printf "  내 테넌트 %s 행 / 전체 %s 행\n\n" "$MINE" "$NROW"
 printf "  %-30s %12s   %s\n" "전략" "돌아온 행수" "판정"
 printf "  %s\n" "---------------------------------------------------------------"
 jd() { [ "$1" = "$MINE" ] && echo "격리됨" || echo "**유출**"; }
