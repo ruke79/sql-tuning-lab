@@ -22,6 +22,15 @@ docker exec -it tuninglab-clickhouse clickhouse-client \
   --user tuner --password tuner --database gharchive
 ```
 
+> `Unknown database 'tpch'` 가 나오면 **DB 가 아직 없는 것**이다.
+> `docker/mysql/init/01-create-databases.sql` 이 만들어 주지만 그건 **볼륨이 비어 있는
+> 첫 기동에만** 돈다 — 이미 만들어진 `mysqldata` 볼륨에는 소급되지 않는다.
+> `./scripts/restore-lab.sh --mysql` 이 DB 생성부터 적재·인덱스까지 채운다.
+>
+> `scripts/**/*-mysql.sh` 와 `--mysql` 은 호스트에 `mysql` 클라이언트가 없으면
+> `docker exec` 로 넘어간다(psql 쪽과 같다). 컨테이너 이름이 다르면
+> `MYSQL_CONTAINER=... ` 로 준다.
+
 한 줄만 실행할 때:
 
 ```bash

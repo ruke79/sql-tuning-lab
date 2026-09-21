@@ -46,10 +46,28 @@ MYPORT="${MYSQL_PORT:-3306}"
 MYUSER="${MYSQL_USER:-tuner}"
 MYPASS="${MYSQL_PASS:-tuner}"
 
-my()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" -N -B "$@" 2>/dev/null; }
+MYCON="${MYSQL_CONTAINER:-tuninglab-mysql}"
+
+# 호스트에 클라이언트가 없으면 컨테이너 안의 것을 쓴다(psql 쪽과 같은 구조).
+# docker 경로에 -t 를 주면 출력에 CR 이 섞여 숫자 비교가 에러 없이 어긋난다 — -i 만.
+if command -v mysql >/dev/null 2>&1; then
+  MYVIA=host
+  mycli_as() { local u="$1" p="$2"; shift 2; mysql -h "$MYHOST" -P "$MYPORT" -u "$u" -p"$p" "$@"; }
+elif command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$MYCON"; then
+  MYVIA=docker
+  mycli_as() { local u="$1" p="$2"; shift 2; docker exec -i "$MYCON" mysql -u "$u" -p"$p" "$@"; }
+else
+  echo "  mysql 클라이언트도 $MYCON 컨테이너도 없습니다. 둘 중 하나:"
+  echo "    sudo apt install mysql-client"
+  echo "    docker compose -f docker/docker-compose.yml up -d mysql"
+  exit 1
+fi
+# ④ 는 앱 계정(mt_app)으로도 붙어야 하므로 계정을 인자로 받는 형태가 바탕이다.
+mycli() { mycli_as "$MYUSER" "$MYPASS" "$@"; }
+my()  { mycli -N -B "$@" 2>/dev/null; }
 q()   { my tpcds -e "$1"; }
-qe()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
-qv()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+qe()  { mycli tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+qv()  { mycli tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 
 if ! q "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
   echo "  MySQL 의 tpcds.store_sales 가 없습니다. 둘 중 하나:"
@@ -60,7 +78,7 @@ if ! q "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
   exit 1
 fi
 
-best() {  # 벽시계 최소값. 수십 ms 이상짜리만 이걸로 본다(연결비 25~30ms).
+best() {  # 벽시계 최소값. 수십 ms 이상짜리만 이걸로 본다(왕복비는 아래 RT 로 찍는다).
   local Q="$1" b="" v s e
   q "$Q" >/dev/null 2>&1
   for _ in $(seq "$REPEAT"); do
@@ -78,9 +96,17 @@ NSS=$(q "SELECT count(*) FROM store_sales WHERE ss_store_sk IS NOT NULL")
 D1=$(q "SELECT min(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_moy=6")
 D2=$(q "SELECT max(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_moy=6")
 
+# 벽시계 값에는 클라이언트 왕복이 통째로 들어간다. 크기가 환경마다 다르니(특히
+# docker exec 는 프로세스를 하나 더 띄운다) 짐작하지 말고 재서 찍는다.
+RT=$( b=""; for _ in 1 2 3; do
+        s=$(date +%s%N); q "SELECT 1" >/dev/null 2>&1; e=$(date +%s%N)
+        v=$(( (e-s)/1000000 )); [ -z "$b" ] && b=$v || { [ "$v" -lt "$b" ] && b=$v; }
+      done; echo "$b" )
+
 echo "멀티테넌시 분리 훈련 (TPC-DS × MySQL $(q "SELECT VERSION()") / InnoDB)"
 echo "테넌트 ${TEN}개(매장), store_sales ${NSS} 행, 각 측정 ${REPEAT}회 최소값"
 echo "buffer pool $(q "SELECT ROUND(@@innodb_buffer_pool_size/1048576)")MB"
+echo "클라이언트 ${MYVIA} — 빈 쿼리 왕복 ${RT}ms. **아래 벽시계 값 전부에 이만큼이 들어 있다**"
 echo
 echo "  ※ 이 판의 전제: 테넌트(매장)가 **이미 팩트 컬럼**이고, 매장은 다른 매장이 되지 않는다."
 echo "     tpch × MySQL 판에서 'PK 선두' 선택의 청구서였던 테넌트 이동이 여기엔 없다."
@@ -239,7 +265,7 @@ q "CREATE FUNCTION app_store() RETURNS INT DETERMINISTIC NO SQL RETURN CAST(@app
 my -e "CREATE USER IF NOT EXISTS 'mt_app'@'%' IDENTIFIED BY 'x';
        GRANT SELECT ON tpcds.v_ss TO 'mt_app'@'%';
        GRANT EXECUTE ON FUNCTION tpcds.app_store TO 'mt_app'@'%';" >/dev/null 2>&1
-APP() { mysql -h "$MYHOST" -P "$MYPORT" -u mt_app -px -N -B tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+APP() { mycli_as mt_app x -N -B tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 printf "  내 테넌트 %s 행 / 전체 %s 행\n\n" "$MINE" "$NSS"
 printf "  %-30s %12s   %s\n" "전략" "돌아온 행수" "판정"
 printf "  %s\n" "---------------------------------------------------------------"

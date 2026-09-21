@@ -39,7 +39,22 @@ MYPASS="${MYSQL_PASS:-tuner}"
 DB="${MYSQL_DB:-sysbench_lab}"
 
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
-my() { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" -N -B "$@" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+MYCON="${MYSQL_CONTAINER:-tuninglab-mysql}"
+
+# 호스트에 클라이언트가 없으면 컨테이너 안의 것을 쓴다. (sysbench 자체는 호스트 바이너리이고
+# TCP 로 붙으므로 이 분기와 무관하다 — 여기서 갈리는 건 설정을 읽고 쓰는 SQL 호출뿐이다.)
+# docker 경로에 -t 를 주면 출력에 CR 이 섞여 숫자 비교가 에러 없이 어긋난다 — -i 만.
+if command -v mysql >/dev/null 2>&1; then
+  mycli() { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" "$@"; }
+elif command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$MYCON"; then
+  mycli() { docker exec -i "$MYCON" mysql -u "$MYUSER" -p"$MYPASS" "$@"; }
+else
+  echo "  mysql 클라이언트도 $MYCON 컨테이너도 없습니다. 둘 중 하나:"
+  echo "    sudo apt install mysql-client"
+  echo "    docker compose -f docker/docker-compose.yml up -d mysql"
+  exit 1
+fi
+my() { mycli -N -B "$@" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 q()  { my -e "$1"; }
 qx() { local o; o=$(q "$1"); case "$o" in *ERROR*) echo "  [중단] 준비 실패: $1"; echo "  $o"; exit 1;; esac; }
 

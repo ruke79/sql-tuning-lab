@@ -47,10 +47,31 @@ MYPORT="${MYSQL_PORT:-3306}"
 MYUSER="${MYSQL_USER:-tuner}"
 MYPASS="${MYSQL_PASS:-tuner}"
 
-my()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" -N -B "$@" 2>/dev/null; }
-myv() { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" "$@" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+MYCON="${MYSQL_CONTAINER:-tuninglab-mysql}"
+
+# 클라이언트가 호스트에 있을 수도, 컨테이너 안에만 있을 수도 있다 — PostgreSQL 쪽
+# 스크립트들이 psql 없으면 docker exec 로 넘어가는 것과 같은 구조다. Docker 로 돌리는
+# 환경에는 호스트 클라이언트가 없는 게 보통이라, 없다고 멈추면 서버는 멀쩡한데 못 돈다.
+# docker 경로에 -t 를 주면 안 된다 — TTY 를 붙이면 출력에 CR 이 섞여 숫자 비교가
+# **에러 없이** 어긋난다. -i 만 준다.
+if command -v mysql >/dev/null 2>&1; then
+  MYVIA=host
+  mycli_as() { local u="$1" p="$2"; shift 2; mysql -h "$MYHOST" -P "$MYPORT" -u "$u" -p"$p" "$@"; }
+elif command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$MYCON"; then
+  MYVIA=docker
+  mycli_as() { local u="$1" p="$2"; shift 2; docker exec -i "$MYCON" mysql -u "$u" -p"$p" "$@"; }
+else
+  echo "  mysql 클라이언트도 $MYCON 컨테이너도 없습니다. 둘 중 하나:"
+  echo "    sudo apt install mysql-client"
+  echo "    docker compose -f docker/docker-compose.yml up -d mysql"
+  exit 1
+fi
+# ③ 은 앱 계정(mt_app)으로도 붙어야 하므로 계정을 인자로 받는 형태가 바탕이다.
+mycli() { mycli_as "$MYUSER" "$MYPASS" "$@"; }
+my()  { mycli -N -B "$@" 2>/dev/null; }
+myv() { mycli "$@" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 q()   { my tpch -e "$1"; }
-qe()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" tpch -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+qe()  { mycli tpch -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 
 if ! q "SELECT 1 FROM lineitem LIMIT 1" >/dev/null 2>&1; then
   echo "  MySQL 의 tpch.lineitem 이 없습니다. 둘 중 하나:"
@@ -80,9 +101,19 @@ TEN=$(q "SELECT count(*) FROM nation")
 T_ME=3; T_OTHER=7
 NLI=$(q "SELECT count(*) FROM lineitem")
 
+# **벽시계 측정에는 클라이언트 왕복이 통째로 들어간다.** 호스트 클라이언트면 보통
+# 수십 ms 지만 docker exec 는 프로세스를 하나 더 띄우므로 그보다 크다. 크기는 환경마다
+# 다르니 짐작하지 말고 **여기서 재서 찍는다** — 표의 작은 차이는 이 값과 비교해 읽어야
+# 하고, 이 값에 묻히는 차이는 srv_ms(EXPLAIN ANALYZE) 로 봐야 한다.
+RT=$( b=""; for _ in 1 2 3; do
+        s=$(date +%s%N); q "SELECT 1" >/dev/null 2>&1; e=$(date +%s%N)
+        v=$(( (e-s)/1000000 )); [ -z "$b" ] && b=$v || { [ "$v" -lt "$b" ] && b=$v; }
+      done; echo "$b" )
+
 echo "멀티테넌시 분리 훈련 (MySQL $(q "SELECT VERSION()") / InnoDB)"
 echo "테넌트 ${TEN}개(국가), lineitem ${NLI} 행, 각 측정 ${REPEAT}회 최소값"
 echo "buffer pool $(q "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024)")MB  (PostgreSQL 판의 shared_buffers 1GB 와 맞춘 값)"
+echo "클라이언트 ${MYVIA} — 빈 쿼리 왕복 ${RT}ms. **아래 벽시계 값 전부에 이만큼이 들어 있다**"
 echo
 
 teardown() {
@@ -218,7 +249,7 @@ q "CREATE FUNCTION app_tenant() RETURNS INT DETERMINISTIC NO SQL RETURN CAST(@ap
 my -e "CREATE USER IF NOT EXISTS 'mt_app'@'%' IDENTIFIED BY 'x';
        GRANT SELECT ON tpch.v_li TO 'mt_app'@'%';
        GRANT EXECUTE ON FUNCTION tpch.app_tenant TO 'mt_app'@'%';" >/dev/null 2>&1
-APPQ() { mysql -h "$MYHOST" -P "$MYPORT" -u mt_app -px -N -B tpch -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
+APPQ() { mycli_as mt_app x -N -B tpch -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 printf "    앱 계정이 뷰로 본 행수 (tenant=%s): %s\n" "$T_ME" "$(APPQ "SET @app_tenant=$T_ME; SELECT count(*) FROM v_li")"
 printf "    앱 계정이 뷰로 본 행수 (tenant=%s): %s\n" "$T_OTHER" "$(APPQ "SET @app_tenant=$T_OTHER; SELECT count(*) FROM v_li")"
 printf "    앱 계정이 **원본 테이블** 직접: %s\n" "$(APPQ "SELECT count(*) FROM li_a" | head -1)"
@@ -248,7 +279,7 @@ for pair in "N  정규화|SELECT count(*) FROM lineitem" \
   L="${pair%%|*}"; Q="${pair#*|}"; R=$(q "$Q")
   printf "  %-30s %12s   %s\n" "$L" "$R" "$(jd "$R")"
 done
-V=$(APPQ2() { mysql -h "$MYHOST" -P "$MYPORT" -u mt_app -px -N -B tpch -e "$1" 2>/dev/null; }; APPQ2 "SET @app_tenant=$T_ME; SELECT count(*) FROM v_li")
+V=$(APPQ2() { mycli_as mt_app x -N -B tpch -e "$1" 2>/dev/null; }; APPQ2 "SET @app_tenant=$T_ME; SELECT count(*) FROM v_li")
 printf "  %-30s %12s   %s\n" "뷰+권한 (앱 계정)" "${V:-?}" "$(jd "${V:-0}")"
 echo
 echo "  PostgreSQL 판과 같은 결론이다 — 파티션은 격리가 아니다. 다만 MySQL 에서 격리를 주는"

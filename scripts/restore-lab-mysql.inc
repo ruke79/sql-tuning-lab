@@ -20,28 +20,41 @@ restore_mysql() {
   local MYUSER="${MYSQL_USER:-tuner}"
   local MYPASS="${MYSQL_PASS:-tuner}"
   local MYROOT="${MYSQL_ROOT_PASS:-root}"
-
-  # -N -B 로 헤더·격자를 빼서 값만 받는다. 경고 한 줄("Using a password on the command line")은
-  # 항상 붙으므로 걸러낸다 — 안 걸러내면 숫자 비교가 전부 어긋난다.
-  m()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" -N -B -e "$1" 2>/dev/null; }
-  mr() { mysql -h "$MYHOST" -P "$MYPORT" -u root -p"$MYROOT" -N -B -e "$1" 2>/dev/null; }
-  m_up() { mysqladmin -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" ping >/dev/null 2>&1; }
+  local MYCON="${MYSQL_CONTAINER:-tuninglab-mysql}"
 
   say "MySQL 랩 점검 — $HERE"
   say
 
   # ── 1) 클라이언트 ───────────────────────────────────────────────────
+  # PostgreSQL 쪽 스크립트들이 psql 없으면 docker exec 로 넘어가는 것과 같은 구조다.
+  # Docker 로 돌리는 환경에는 호스트에 클라이언트가 없는 게 보통이라, 없다고 멈추면
+  # **서버는 멀쩡한데 점검을 못 한다.** 실제로 그렇게 막혔다.
+  local VIA
   if have mysql; then
-    ok "mysql 클라이언트 있음"
-  elif dk_exists tuninglab-mysql; then
-    warn "호스트에 mysql 클라이언트가 없다 — 컨테이너 안에서 쓰려면:"
-    say  "       docker exec -it tuninglab-mysql mysql -u tuner -ptuner tpch"
-    say  "     스크립트들은 호스트 클라이언트를 쓴다. 설치: sudo apt install mysql-client"
-    return 1
+    VIA=host; ok "mysql 클라이언트 있음 (호스트)"
+  elif have docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$MYCON"; then
+    VIA=docker; ok "호스트에 클라이언트가 없다 — 컨테이너($MYCON) 안의 것을 쓴다"
   else
-    warn "mysql 클라이언트가 없다 — sudo apt install mysql-client"
+    warn "mysql 클라이언트도 $MYCON 컨테이너도 없다"
+    say  "       sudo apt install mysql-client        # 호스트에 설치하거나"
+    say  "       docker compose -f docker/docker-compose.yml up -d mysql   # 컨테이너를 올린다"
     return 1
   fi
+
+  # -N -B 로 헤더·격자를 빼서 값만 받는다. 경고 한 줄("Using a password on the command line")은
+  # 항상 붙으므로 걸러낸다 — 안 걸러내면 숫자 비교가 전부 어긋난다.
+  # docker 경로는 -i(표준입력 유지)만 주고 -t 는 주지 않는다 — TTY 를 붙이면 출력에 CR 이
+  # 섞여 숫자 비교가 조용히 어긋난다.
+  m() {
+    if [ "$VIA" = host ]; then mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" -N -B -e "$1" 2>/dev/null
+    else docker exec -i "$MYCON" mysql -u "$MYUSER" -p"$MYPASS" -N -B -e "$1" 2>/dev/null; fi
+  }
+  mr() {
+    if [ "$VIA" = host ]; then mysql -h "$MYHOST" -P "$MYPORT" -u root -p"$MYROOT" -N -B -e "$1" 2>/dev/null
+    else docker exec -i "$MYCON" mysql -u root -p"$MYROOT" -N -B -e "$1" 2>/dev/null; fi
+  }
+  # mysqladmin 도 호스트에 없을 수 있으므로 핑을 쿼리로 대신한다.
+  m_up() { [ "$(m "SELECT 1")" = "1" ]; }
 
   # ── 2) 서버 ─────────────────────────────────────────────────────────
   if m_up; then
@@ -51,9 +64,9 @@ restore_mysql() {
     return 1
   else
     act "MySQL 을 기동한다"
-    if dk_exists tuninglab-mysql; then
-      say "     (Docker — tuninglab-mysql)"
-      docker start tuninglab-mysql 2>&1 | sed 's/^/     /'
+    if dk_exists "$MYCON"; then
+      say "     (Docker — $MYCON)"
+      docker start "$MYCON" 2>&1 | sed 's/^/     /'
     elif have docker && [ -f docker/docker-compose.yml ] && ! have mysqld; then
       say "     (컨테이너가 아직 없다 — docker compose up -d mysql)"
       ( cd docker && docker compose up -d mysql ) 2>&1 | tail -3 | sed 's/^/     /'
@@ -87,9 +100,30 @@ restore_mysql() {
   done
   if [ -z "$MISSING" ]; then
     ok "계정 tuner — DB·계정·함수를 만들 권한 있음"
-  else
+  elif [ "$MODE" = "--check" ]; then
     warn "계정 tuner 에 없는 권한:${MISSING%,} — mt-*-mysql.sh 가 중간에 죽는다"
-    say  "       GRANT ALL ON *.* TO 'tuner'@'%' WITH GRANT OPTION;"
+    say  "       GRANT ALL ON *.* TO '$MYUSER'@'%' WITH GRANT OPTION;"
+  else
+    # compose 의 init(docker/mysql/init/01-create-databases.sql)은 **tpch.\*·tpcds.\*·
+    # sysbench_lab.\* 에만** ALL 을 준다. 그런데 mt-*-mysql.sh 는 mt_n0..24 라는 **새 DB** 25개와
+    # 계정 mt_app 을 만든다 — 그 권한은 init 에 없다. 그래서 스크립트가 준비 단계에서 죽는다.
+    # 실습용 로컬 컨테이너이므로 root 로 넓혀 준다. 무엇을 실행했는지 그대로 찍는다.
+    warn "계정 $MYUSER 에 없는 권한:${MISSING%,} — mt-*-mysql.sh 가 중간에 죽는다"
+    act "root 로 권한을 넓힌다"
+    for h in '%' 'localhost'; do
+      mr "GRANT ALL ON *.* TO '$MYUSER'@'$h' WITH GRANT OPTION" >/dev/null 2>&1
+      # SET GLOBAL(§M-7 의 redo·내구성 조절)은 ALL 에 안 들어간다 — 동적 권한은 따로 준다.
+      mr "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '$MYUSER'@'$h'" >/dev/null 2>&1
+    done
+    mr "FLUSH PRIVILEGES" >/dev/null 2>&1
+    say  "       GRANT ALL ON *.* TO '$MYUSER'@'%' WITH GRANT OPTION;"
+    say  "       GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '$MYUSER'@'%';"
+    GRANTS=$(m "SHOW GRANTS FOR CURRENT_USER()" | tr '\n' ' ')
+    case "$GRANTS" in
+      *"ALL PRIVILEGES ON *.*"*|*"GRANT ALL ON *.*"*) ok "넓혔다"; CHANGED=1 ;;
+      *) warn "권한이 그대로다 — root 비밀번호가 다를 수 있다. MYSQL_ROOT_PASS=... 로 다시:"
+         say  "       MYSQL_ROOT_PASS=<비번> ./scripts/restore-lab.sh --mysql" ;;
+    esac
   fi
 
   # ── 4) 데이터 ───────────────────────────────────────────────────────
@@ -111,8 +145,24 @@ restore_mysql() {
   chk_data() {  # $1 = DB, $2 = 테이블, $3 = 모듈, $4 = generate 인자(없으면 빈 문자열)
     local db="$1" tbl="$2" mod="$3" genarg="$4" n idx
     if [ "$(m "SELECT count(*) FROM information_schema.schemata WHERE schema_name='$db'")" != "1" ]; then
-      if [ "$MODE" = "--check" ]; then warn "DB $db 없음"; return; fi
-      act "DB $db 를 만든다"; m "CREATE DATABASE $db"; CHANGED=1
+      if [ "$MODE" = "--check" ]; then
+        # 여기서 멈춰서 gradlew 를 먼저 돌리면 이렇게 죽는다 — 원인이 안 보이는 에러라 적어 둔다:
+        #   HikariPool$PoolInitializationException: Failed to initialize pool: Unknown database 'tpch'
+        # JDBC URL 이 .../tpch 라서 **DB 가 먼저 있어야** schema 가 돈다.
+        warn "DB $db 없음 — 이 상태로 gradlew 를 돌리면 Unknown database '$db' 로 죽는다"
+        return
+      fi
+      # compose 의 init 은 **볼륨이 비어 있는 첫 기동에만** 돈다. 볼륨을 먼저 만들어 둔
+      # 환경에서는 tpch/tpcds/sysbench_lab 이 영영 안 생긴다 — 실제로 그 상태였다.
+      act "DB $db 를 만든다"
+      m "CREATE DATABASE $db CHARACTER SET utf8mb4" >/dev/null 2>&1 \
+        || mr "CREATE DATABASE $db CHARACTER SET utf8mb4" >/dev/null 2>&1
+      if [ "$(m "SELECT count(*) FROM information_schema.schemata WHERE schema_name='$db'")" != "1" ]; then
+        warn "DB $db 를 못 만들었다 — $MYUSER 에게 CREATE 권한이 없고 root 접속도 안 된다"
+        say  "       MYSQL_ROOT_PASS=<비번> ./scripts/restore-lab.sh --mysql"
+        return
+      fi
+      CHANGED=1
     fi
     n=$(m "SELECT count(*) FROM $db.$tbl" 2>/dev/null)
     if [ -n "$n" ] && [ "$n" -gt 0 ]; then
@@ -142,7 +192,8 @@ restore_mysql() {
         tpch)  mgen tpch  "schema --db=mysql" "load --db=mysql --dir=./data/tpch" "index --db=mysql" ;;
         tpcds) mgen tpcds "schema --db=mysql" "load --db=mysql"                   "index --db=mysql" ;;
       esac
-      ok "$db.$tbl $(m "SELECT count(*) FROM $db.$tbl") 행"; CHANGED=1
+      # 행수만 찍으면 안 된다 — 이 절이 존재하는 이유가 '인덱스가 빠진 채 적재된 상태'다.
+      ok "$db.$tbl $(m "SELECT count(*) FROM $db.$tbl") 행 (인덱스 $(nidx "$db" "$tbl")개)"; CHANGED=1
     fi
   }
   chk_data tpch  lineitem    tpch  "generate --sf=$SF --dir=./data/tpch"
