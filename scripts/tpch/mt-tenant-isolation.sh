@@ -29,6 +29,7 @@
 #
 # 사용법:
 #   ./mt-tenant-isolation.sh            # 전부, 각 측정 4회 최소값
+#   WORK_MEM=512MB ./mt-tenant-isolation.sh   # SF=10 이상에서 ⑥의 N 이 공유메모리로 죽으면
 #   ./mt-tenant-isolation.sh 6
 #   ONLY=125 ./mt-tenant-isolation.sh   # ①②⑤만
 #   KEEP=1 ./mt-tenant-isolation.sh     # 실험 객체를 남겨 둔다
@@ -71,7 +72,11 @@ best_ms() {
   echo "${b:-?}"
 }
 scan_of() { sql "$1 EXPLAIN (COSTS OFF) $2" | grep -oE '(Parallel )?(Seq Scan|Index Scan|Index Only Scan|Bitmap Heap Scan) (using [a-z0-9_]+ )?on [a-z0-9_.]+' | head -1; }
-bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | grep -m1 -oE 'shared hit=[0-9]+( read=[0-9]+)?' | sed 's/shared //'; }
+# **hit=0 이면 PostgreSQL 이 그 항목을 아예 생략한다.** 그래서 'shared hit=' 로 긁으면
+# top 노드 줄을 건너뛰고 더 깊은 노드 값을 집는다 — 테이블이 shared_buffers 보다 크면
+# (SF=10 등) 늘 그렇게 되고, buffers 열이 시간과 전혀 안 맞는 작은 값으로 찍힌다.
+# 첫 'Buffers: shared' 줄을 잡고 두 항목을 각각 0 기본값으로 읽는다.
+bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
 joins_of() { sql "EXPLAIN (COSTS OFF) $1" | grep -cE 'Nested Loop|Hash Join|Merge Join'; }
 
 # tpcds 판의 teardown 버그를 그대로 답습하지 않는다 — 문장을 따로 보낸다.
@@ -337,6 +342,25 @@ XC=""; for n in $(seq 0 $((NT-1))); do
   XC="$XC SELECT $n AS l_nationkey, sum(l_extendedprice) FROM mt_n$n.lineitem"
 done
 XC="SELECT * FROM ($XC) u ORDER BY 2 DESC"
+# N 은 이 스크립트에서 가장 무거운 쿼리다(6천만 행 × 2조인). 큰 규모에서는 여기서
+# 서버가 죽는 일이 있어, 재기 전에 **한 번 돌려 에러를 먼저 확인한다** —
+# 실패를 삼키면 표에 '?' 만 남아 원인을 알 수 없다.
+XN_ERR=$(sql "EXPLAIN (ANALYZE) $XN" 2>&1 | grep -m1 "ERROR" || true)
+if [ -n "$XN_ERR" ]; then
+  echo "  [N 측정 실패] $XN_ERR"
+  case "$XN_ERR" in
+    *"shared memory segment"*|*"No space left on device"*)
+      echo "    원인: 병렬 해시가 쓰는 **동적 공유메모리(/dev/shm)** 가 모자란다."
+      echo "          이 스크립트는 WORK_MEM=${WORK_MEM} 로 도는데, 규모가 크면 워커마다"
+      echo "          큰 세그먼트를 잡아 /dev/shm 을 넘긴다. 셋 중 하나로 푼다:"
+      echo "            WORK_MEM=512MB $0          # 가장 간단하다"
+      echo "            mount -o remount,size=8G /dev/shm"
+      echo "            (컨테이너면) docker run --shm-size=8g ..."
+      echo "    ※ 이건 데이터나 계획의 문제가 아니라 **환경 한계**다 — A·B·C 는 같은 규모에서"
+      echo "       멀쩡히 돌았다(단일 테이블이라 병렬 해시를 안 쓴다). N 만 못 잰 것이다." ;;
+  esac
+  echo
+fi
 printf "  %-22s %9s %-16s %s\n" "전략" "min(ms)" "buffers" "쿼리 길이"
 printf "  %s\n" "-----------------------------------------------------------------"
 printf "  %-22s %9s %-16s %s자\n" "N 정규화 (2조인)" "$(best_ms '' "$XN")" "$(bufs_of '' "$XN")" "${#XN}"

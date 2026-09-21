@@ -57,7 +57,11 @@ if ! sql "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
 fi
 
 ms()  { sql "EXPLAIN (ANALYZE) $1" | grep -oE 'Execution Time: [0-9.]+' | grep -oE '[0-9.]+'; }
-buf() { sql "EXPLAIN (ANALYZE, BUFFERS) $1" | grep -m1 -oE 'shared hit=[0-9]+( read=[0-9]+)?' | sed 's/shared //'; }
+# **hit=0 이면 PostgreSQL 이 그 항목을 아예 생략한다.** 그래서 'shared hit=' 로 긁으면
+# top 노드 줄을 건너뛰고 더 깊은 노드 값을 집는다 — 테이블이 shared_buffers 보다 크면
+# (SF=10 등) 늘 그렇게 되고, buffers 열이 시간과 전혀 안 맞는 작은 값으로 찍힌다.
+# 첫 'Buffers: shared' 줄을 잡고 두 항목을 각각 0 기본값으로 읽는다.
+buf() { sql "EXPLAIN (ANALYZE, BUFFERS) $1" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
 
 # 원본: 3개 차원에 필터가 흩어진 스타 조인
 Q="select i_brand_id, i_brand, d_year, sum(ss_ext_sales_price) as ext_price

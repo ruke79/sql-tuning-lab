@@ -57,7 +57,11 @@ echo "store_sales 총 행수: $TOTAL   (기준 d_date_sk=$BASE = 1998-01-01)"
 echo
 
 scan_of() { echo "$1" | grep -oE '(Parallel Seq Scan|Seq Scan|Parallel Index Scan|Index Scan|Bitmap Heap Scan|Index Only Scan)' | head -1; }
-buf_of()  { echo "$1" | grep -m1 -oE 'shared hit=[0-9]+( read=[0-9]+)?' | sed 's/shared //'; }
+# **hit=0 이면 PostgreSQL 이 그 항목을 아예 생략한다.** 그래서 'shared hit=' 로 긁으면
+# top 노드 줄을 건너뛰고 더 깊은 노드 값을 집는다 — 테이블이 shared_buffers 보다 크면
+# (SF=10 등) 늘 그렇게 되고, buffers 열이 시간과 전혀 안 맞는 작은 값으로 찍힌다.
+# 첫 'Buffers: shared' 줄을 잡고 두 항목을 각각 0 기본값으로 읽는다.
+buf_of()  { echo "$1" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
 ms_of()   { echo "$1" | grep -oE 'Execution Time: [0-9.]+' | grep -oE '[0-9.]+'; }
 
 echo "── ① 팩트 직접: WHERE ss_sold_date_sk BETWEEN ... ──"

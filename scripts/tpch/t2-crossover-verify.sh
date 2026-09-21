@@ -80,7 +80,7 @@ for IV in "1 month" "3 month" "6 month" "1 year" "18 month" "20 month" "2 year" 
 
   # 비트맵이 실제로 읽은 페이지 수
   RP=$(run_sql "SET enable_seqscan=off; EXPLAIN (ANALYZE,BUFFERS) $Q" \
-        | grep -m1 -oE 'shared hit=[0-9]+' | grep -oE '[0-9]+')
+        | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); print h+r; exit}')
   RPPCT=$(run_sql "SELECT round(100.0 * ${RP:-0} / $PAGES, 1)")
 
   CHOSEN=$(run_sql "EXPLAIN $Q" \

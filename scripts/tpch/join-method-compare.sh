@@ -108,7 +108,7 @@ compare() {  # $1 = 라벨, $2 = SET 구문
         | tail -n $((REPEAT - 1)) | sort -n | head -1)
 
   PLAN=$(run_sql "$2 SET statement_timeout='${TIMEOUT}'; EXPLAIN (ANALYZE, BUFFERS) $QUERY" 2>&1 || true)
-  BUF=$(echo "$PLAN" | grep -m1 -oE 'shared hit=[0-9]+( read=[0-9]+)?' | sed 's/shared //')
+  BUF=$(echo "$PLAN" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}')
   printf "%-26s %-42s %12s %10s\n" "$1" "${JOINS:-?}" "${BUF:-?}" "${MS:-?}"
 }
 

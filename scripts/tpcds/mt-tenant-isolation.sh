@@ -69,7 +69,11 @@ best_ms() {
   echo "${b:-?}"
 }
 scan_of() { sql "$1 EXPLAIN (COSTS OFF) $2" | grep -oE '(Parallel )?(Seq Scan|Index Scan|Index Only Scan|Bitmap Heap Scan) (using [a-z0-9_]+ )?on [a-z0-9_.]+' | head -1; }
-bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | grep -m1 -oE 'shared hit=[0-9]+( read=[0-9]+)?' | sed 's/shared //'; }
+# **hit=0 이면 PostgreSQL 이 그 항목을 아예 생략한다.** 그래서 'shared hit=' 로 긁으면
+# top 노드 줄을 건너뛰고 더 깊은 노드 값을 집는다 — 테이블이 shared_buffers 보다 크면
+# (SF=10 등) 늘 그렇게 되고, buffers 열이 시간과 전혀 안 맞는 작은 값으로 찍힌다.
+# 첫 'Buffers: shared' 줄을 잡고 두 항목을 각각 0 기본값으로 읽는다.
+bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
 
 TENANTS=$(sql "SELECT string_agg(s_store_sk::text, ' ' ORDER BY s_store_sk) FROM store")
 NT=$(echo "$TENANTS" | wc -w)
@@ -324,7 +328,7 @@ echo "  ⑥-1 이웃이 **자기 테넌트 전체를 집계**할 때 (논리적�
 echo "      먼저 그 이웃 조회 자체가 전략마다 얼마나 무거운지 — 페이지 수와 **프로세스 수**:"
 nb() {  # $1 = 쿼리 → "buffers / 워커 수 / 스캔"
   local o; o=$(sql "EXPLAIN (ANALYZE, BUFFERS) $1")
-  printf "%-22s 워커 %s개   %s" "$(echo "$o" | grep -m1 -oE 'shared hit=[0-9]+( read=[0-9]+)?' | sed 's/shared //')" \
+  printf "%-22s 워커 %s개   %s" "$(echo "$o" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}')" \
     "$(w=$(echo "$o" | grep -oE 'Workers Launched: [0-9]+' | grep -oE '[0-9]+' | head -1); echo "${w:-0}")" \
     "$(echo "$o" | grep -oE '(Parallel )?(Seq Scan|Bitmap Heap Scan|Index Scan) on [a-z_0-9.]+' | head -1)"
 }
