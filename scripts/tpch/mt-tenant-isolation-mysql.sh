@@ -36,6 +36,12 @@
 #   ONLY=125 ./mt-tenant-isolation-mysql.sh
 #   KEEP=1 ./mt-tenant-isolation-mysql.sh   # 실험 객체를 남겨 둔다
 #
+# **ONLY 는 준비도 줄인다.** 고를 절이 안 쓰는 복사본은 만들지 않는다 —
+#   ① 전부 · ② A·A′ · ③ A · ④ 전부 · ⑤ (없음) · ⑥ A·A′·B
+# SF=0.5 에서 전부가 215초인데 ONLY=2 는 91초, ONLY=5 는 0초다. 규모가 커지면
+# 이 차이가 시간의 전부가 된다 — 특히 C(테넌트별 DB 25개)는 li_a 를 보조 인덱스로 훑어
+# PK 로 되찾아가는(=②에서 재는 그 느린 패턴) 일을 25번 반복하므로 제일 비싸다.
+#
 #   SAMPLE=3000000 ./mt-tenant-isolation-mysql.sh   # 큰 적재에서 표본만 (문서와 같은 크기)
 #   FORCE=1        ./mt-tenant-isolation-mysql.sh   # 규모 가드를 무시하고 전부
 #
@@ -198,6 +204,15 @@ teardown() {
   my -e "DROP USER IF EXISTS 'mt_app'@'%'" >/dev/null 2>&1
 }
 
+# ONLY 로 일부 절만 돌 때 **쓰지도 않을 복사본을 만들지 않는다.** 규모가 커지면 이 차이가
+# 시간의 전부다 — 예컨대 ②만 보려면 A 와 A′ 면 되는데, 예전에는 파티션 25개와 DB 25개까지
+# 다 만들었다. SF=10 에서 그 둘이 준비 시간의 절반 이상이다.
+#   ① 전부   ② A·A′   ③ A   ④ 전부   ⑤ (없음)   ⑥ A·A′·B
+need_a()    { want 1 || want 2 || want 3 || want 4 || want 6; }
+need_ac()   { want 1 || want 2 || want 4 || want 6; }
+need_part() { want 1 || want 4 || want 6; }
+need_c()    { want 1 || want 4; }
+
 # ══════════════════════════════════════════════════════════════════════
 echo "── 준비 ──"
 teardown
@@ -210,14 +225,19 @@ COLS="l_nationkey INT NOT NULL, l_orderkey BIGINT NOT NULL, l_linenumber INT NOT
 
 T0=$(date +%s)
 # A — PK 는 원본대로. 테넌트는 보조 인덱스로 찾는다.
+# ⑤(ERROR 1503 확인)는 복사본이 하나도 필요 없다 — CREATE TABLE 이 거절당하는 걸 보는 절이라서.
+if need_a; then
 q "CREATE TABLE li_a ($COLS, PRIMARY KEY (l_orderkey, l_linenumber),
      KEY k_ten (l_nationkey, l_shipdate), KEY k_cust (o_custkey)) ENGINE=InnoDB;
    INSERT INTO li_a $SRC; ANALYZE TABLE li_a;" >/dev/null 2>&1
+fi
 TA=$(date +%s)
 # A′ — 테넌트를 PK 선두로. InnoDB 에서 이것은 물리 배치를 바꾸는 일이다.
+if need_ac; then
 q "CREATE TABLE li_ac ($COLS, PRIMARY KEY (l_nationkey, l_orderkey, l_linenumber),
      KEY k_cust (o_custkey)) ENGINE=InnoDB;
    INSERT INTO li_ac $SRC; ANALYZE TABLE li_ac;" >/dev/null 2>&1
+fi
 TB=$(date +%s)
 # B — LIST 파티션. PK 에 테넌트가 들어가 있어야만 가능하다(⑤에서 확인).
 PARTS=""
@@ -225,12 +245,17 @@ for n in $(seq 0 $((TEN-1))); do
   [ -n "$PARTS" ] && PARTS="$PARTS,"
   PARTS="$PARTS PARTITION p$n VALUES IN ($n)"
 done
+if need_part; then
 q "CREATE TABLE li_part ($COLS, PRIMARY KEY (l_nationkey, l_orderkey, l_linenumber),
      KEY k_cust (o_custkey)) ENGINE=InnoDB
    PARTITION BY LIST (l_nationkey) ($PARTS);
    INSERT INTO li_part $SRC; ANALYZE TABLE li_part;" >/dev/null 2>&1
+fi
 TC=$(date +%s)
-# C — 테넌트별 데이터베이스
+# C — 테넌트별 데이터베이스. **네 단계 중 제일 위험한 것이 이것이다.** li_a 를 보조 인덱스로
+# 훑어 PK 로 되찾아가는(=②에서 7.8배로 측정한 그 패턴) 일을 테넌트 수만큼 반복한다.
+# 버퍼 풀을 넘는 규모에서는 앞의 셋을 합친 것보다 오래 걸릴 수 있다.
+if need_c; then
 for n in $(seq 0 $((TEN-1))); do
   my -e "CREATE DATABASE mt_n$n;
          CREATE TABLE mt_n$n.lineitem ($COLS, PRIMARY KEY (l_orderkey, l_linenumber),
@@ -238,27 +263,31 @@ for n in $(seq 0 $((TEN-1))); do
          INSERT INTO mt_n$n.lineitem SELECT * FROM tpch.li_a WHERE l_nationkey=$n;
          ANALYZE TABLE mt_n$n.lineitem;" >/dev/null 2>&1
 done
+fi
 TD=$(date +%s)
 
 # 표본을 뜨면 행수가 정확히 NROW 가 아니므로 '같은가'로 못 잡는다. 대신 **실제로 쓸 수 있는
 # 상태인가**를 본다 — 비어 있지 않고, 측정 대상 테넌트에 행이 있는가. LIMIT 표본 사고가
 # 여기서 안 걸렸던 이유가 이 검사가 없어서였다.
-NROW=$(q "SELECT count(*) FROM li_a")
-[ "${NROW:-0}" -gt 0 ] || { echo "  [중단] li_a 적재 실패 (0행)"; exit 1; }
-NTEN=$(q "SELECT count(DISTINCT l_nationkey) FROM li_a")
-MINE0=$(q "SELECT count(*) FROM li_a WHERE l_nationkey=$T_ME")
-if [ "${MINE0:-0}" -eq 0 ] || [ "${NTEN:-0}" -lt "$TEN" ]; then
-  echo "  [중단] 표본이 테넌트를 고르게 담지 못했다 — 테넌트 ${NTEN}/${TEN}개, 대상 테넌트 ${MINE0}행."
-  echo "         SAMPLE 을 키우거나(현재 ${SAMPLE}) 빼고 다시 돌린다."
-  exit 1
+if need_a; then
+  NROW=$(q "SELECT count(*) FROM li_a")
+  [ "${NROW:-0}" -gt 0 ] || { echo "  [중단] li_a 적재 실패 (0행)"; exit 1; }
+  NTEN=$(q "SELECT count(DISTINCT l_nationkey) FROM li_a")
+  MINE0=$(q "SELECT count(*) FROM li_a WHERE l_nationkey=$T_ME")
+  if [ "${MINE0:-0}" -eq 0 ] || [ "${NTEN:-0}" -lt "$TEN" ]; then
+    echo "  [중단] 표본이 테넌트를 고르게 담지 못했다 — 테넌트 ${NTEN}/${TEN}개, 대상 테넌트 ${MINE0}행."
+    echo "         SAMPLE 을 키우거나(현재 ${SAMPLE}) 빼고 다시 돌린다."
+    exit 1
+  fi
 fi
 sz() { q "SELECT CONCAT(ROUND(SUM(data_length)/1048576),'MB 데이터 / ',ROUND(SUM(index_length)/1048576),'MB 인덱스')
           FROM information_schema.tables WHERE table_schema='tpch' AND table_name='$1'"; }
-printf "  A  비정규화, PK=(orderkey,linenumber)      %3ds   %s\n" $((TA-T0)) "$(sz li_a)"
-printf "  A′ 비정규화, PK=(nationkey,...)            %3ds   %s\n" $((TB-TA)) "$(sz li_ac)"
-printf "  B  A′ + LIST 파티션 %2d개                   %3ds   %s\n" "$TEN" $((TC-TB)) "$(sz li_part)"
-printf "  C  테넌트별 DB %2d개                        %3ds   %s\n" "$TEN" $((TD-TC)) \
+need_a    && printf "  A  비정규화, PK=(orderkey,linenumber)      %3ds   %s\n" $((TA-T0)) "$(sz li_a)"
+need_ac   && printf "  A′ 비정규화, PK=(nationkey,...)            %3ds   %s\n" $((TB-TA)) "$(sz li_ac)"
+need_part && printf "  B  A′ + LIST 파티션 %2d개                   %3ds   %s\n" "$TEN" $((TC-TB)) "$(sz li_part)"
+need_c    && printf "  C  테넌트별 DB %2d개                        %3ds   %s\n" "$TEN" $((TD-TC)) \
   "$(q "SELECT CONCAT(ROUND(SUM(data_length)/1048576),'MB 데이터 / ',ROUND(SUM(index_length)/1048576),'MB 인덱스') FROM information_schema.tables WHERE table_schema LIKE 'mt\\_n%'")"
+need_c || echo "  (ONLY=$ONLY 이라 안 쓰는 복사본은 만들지 않았다 — 규모가 크면 이게 시간의 전부다)"
 echo
 
 QN="SELECT count(*), sum(l.l_extendedprice) FROM lineitem l
