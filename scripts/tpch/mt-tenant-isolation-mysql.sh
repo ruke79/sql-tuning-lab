@@ -374,7 +374,16 @@ echo "  핵심 주장이고, 벽시계로 재면 클라이언트 왕복 ${RT}ms 
 S_A=$(srv_ms "$QA"); S_AC=$(srv_ms "$QAC")
 printf "    A  PK=(l_orderkey,l_linenumber) + KEY(l_nationkey,...)   %8s ms (서버)\n" "$S_A"
 printf "    A′ PK=(l_nationkey,l_orderkey,l_linenumber)              %8s ms (서버)\n" "$S_AC"
-printf "    배수: %s\n" "$(awk -v a="$S_A" -v b="$S_AC" 'BEGIN{ if (b+0>0) printf "%.1fx", a/b; else print "(계산 불가)" }')"
+S_RATIO=$(awk -v a="$S_A" -v b="$S_AC" 'BEGIN{ if (b+0>0) printf "%.1f", a/b; else print "" }')
+printf "    배수: %s\n" "${S_RATIO:-(계산 불가)}${S_RATIO:+x}"
+# **이 배수는 버퍼 풀 상태에 크게 의존한다.** A 의 비용은 흩어진 행을 되찾는 랜덤 접근인데,
+# 그 페이지가 캐시에 있으면 싸고 없으면 디스크로 나간다. 실측: ①을 먼저 돌려 데워 둔
+# 실행에서 7.8배가 두 번 나왔고, ONLY=26 으로 ①을 건너뛴(차가운) 실행에서는 26~28배였다.
+# **방향은 규모·버전·경로를 바꿔도 같지만 배수 자체를 고정값으로 외우면 안 된다.**
+if ! want 1; then
+  echo "    ※ ①을 건너뛴 실행이라 버퍼 풀이 차갑다 — 이 배수는 부풀어 있다."
+  echo "      ①을 같이 돌린 실행에서는 같은 장비에서도 훨씬 작게 나온다."
+fi
 echo
 echo "  A 는 보조 인덱스에서 테넌트 행을 찾은 뒤 **PK 로 클러스터드 인덱스를 다시 찾아간다**"
 echo "  (InnoDB 의 보조 인덱스는 행 위치가 아니라 PK 값을 담는다). 테넌트 행이 클러스터드"
@@ -484,18 +493,22 @@ amort_ms() {  # $1 = UPDATE 문, $2 = 반복 횟수 → 회당 ms
   my tpch < "$f" 2>/dev/null | tail -1; rm -f "$f"
 }
 echo "  (가) 점 이동 — 고객 한 명 (${CROWS}행). 한 연결에서 30회 반복해 회당 시간을 낸다:"
-printf "    %-44s %8s ms\n" "N  정규화 — customer 1행만"          "$(amort_ms "UPDATE customer SET c_nationkey=$T_OTHER WHERE c_custkey=$CUST" 30)"
-printf "    %-44s %8s ms\n" "A  비정규화 — 보조 인덱스만 갱신"    "$(amort_ms "UPDATE li_a    SET l_nationkey=$T_OTHER WHERE o_custkey=$CUST" 30)"
-printf "    %-44s %8s ms\n" "A′ PK 선두 — PK 를 바꾼다"           "$(amort_ms "UPDATE li_ac   SET l_nationkey=$T_OTHER WHERE o_custkey=$CUST" 30)"
-printf "    %-44s %8s ms\n" "B  파티션 — 파티션을 넘는다"         "$(amort_ms "UPDATE li_part SET l_nationkey=$T_OTHER WHERE o_custkey=$CUST" 30)"
+P_N=$(amort_ms  "UPDATE customer SET c_nationkey=$T_OTHER WHERE c_custkey=$CUST" 30)
+P_A=$(amort_ms  "UPDATE li_a    SET l_nationkey=$T_OTHER WHERE o_custkey=$CUST" 30)
+P_AC=$(amort_ms "UPDATE li_ac   SET l_nationkey=$T_OTHER WHERE o_custkey=$CUST" 30)
+P_B=$(amort_ms  "UPDATE li_part SET l_nationkey=$T_OTHER WHERE o_custkey=$CUST" 30)
+printf "    %-44s %8s ms\n" "N  정규화 — customer 1행만"          "$P_N"
+printf "    %-44s %8s ms\n" "A  비정규화 — 보조 인덱스만 갱신"    "$P_A"
+printf "    %-44s %8s ms\n" "A′ PK 선두 — PK 를 바꾼다"           "$P_AC"
+printf "    %-44s %8s ms\n" "B  파티션 — 파티션을 넘는다"         "$P_B"
 echo
 BULKN=$(q "SELECT count(*) FROM li_a WHERE l_nationkey=$CN")
 echo "  (나) 대량 이관 — 국가 $CN 전체(${BULKN}행)를 $T_OTHER 로. 테넌트 통합·이관 시나리오:"
-printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A  비정규화" \
-  "$(amort_ms "UPDATE li_a SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)" \
+M_BA=$(amort_ms "UPDATE li_a SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)
+printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A  비정규화" "$M_BA" \
   "$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_a'")"
-printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A′ PK 선두" \
-  "$(amort_ms "UPDATE li_ac SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)" \
+M_BAC=$(amort_ms "UPDATE li_ac SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)
+printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A′ PK 선두" "$M_BAC" \
   "$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_ac'")"
 printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "B  파티션" \
   "$(amort_ms "UPDATE li_part SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)" \
@@ -507,16 +520,44 @@ q "START TRANSACTION;
    SELECT CONCAT('    p$T_OTHER 에 도착한 행: ', count(*)) FROM li_part PARTITION (p$T_OTHER) WHERE o_custkey=$CUST;
    ROLLBACK;"
 echo
+BULK_RATIO=$(awk -v a="$M_BA" -v c="$M_BAC" 'BEGIN{ if(a+0>0) printf "%.2f", c/a; else print "?" }')
 echo "  해석 — ②에서 A′ 가 이긴 그 결정의 청구서가 여기 있다. 단 **규모에 따라 다르다.**"
-echo "   · (가) 점 이동에서는 네 전략이 사실상 같다. 100여 행짜리 작업에서는 PK 를 바꾸든"
-echo "     보조 인덱스를 바꾸든 눈에 띄는 차이가 안 난다 — 여기서 과장하면 안 된다."
+# (가)의 문장도 재서 쓴다. 예전에는 "네 전략이 사실상 같다"가 박혀 있었다.
+# 고치면서 한 번 더 틀렸다 — "B 가 가장 비싸다"로 바꿨더니 A′ 5.32 / B 5.31 인 실행에서
+# 그대로 찍혔다. **최댓값이 누구인지도 재야 한다.** 가정하면 같은 실수가 반복된다.
+#
+# 그리고 N 은 여기서도 성질이 다르다 — customer 1행만 건드리므로 구조적으로 제일 싸다.
+# 그 N 까지 넣고 '최대/최소 배수'를 말하면 A·A′·B 사이의 차이가 N 에 가려진다.
+# 비교는 **A·A′·B 셋 사이에서** 한다.
+read -r P_TOP P_SPREAD <<EOF
+$(awk -v a="$P_A" -v c="$P_AC" -v b="$P_B" 'BEGIN{
+  n=split("A A′ B", nm, " "); split(a" "c" "b, s, " ")
+  mx=1; mn=1
+  for (i=2;i<=3;i++){ if(s[i]+0>s[mx]+0) mx=i; if(s[i]+0<s[mn]+0) mn=i }
+  printf "%s %.2f", nm[mx], (s[mn]+0>0 ? s[mx]/s[mn] : 0) }')
+EOF
+echo "   · (가) 점 이동 — N ${P_N} / A ${P_A} / A′ ${P_AC} / B ${P_B} ms."
+echo "     N 은 customer 1행만 건드리므로 구조적으로 제일 싸다 — 비교는 A·A′·B 사이에서 한다."
+if awk -v s="$P_SPREAD" 'BEGIN{exit !(s<1.3)}'; then
+  echo "     셋의 최대/최소가 ${P_SPREAD}배로 **사실상 같다.** 100여 행짜리 작업에서는"
+  echo "     PK 를 바꾸든 보조 인덱스를 바꾸든 차이가 안 난다 — 여기서 과장하면 안 된다."
+else
+  echo "     셋의 최대/최소가 ${P_SPREAD}배이고 가장 비싼 쪽은 **${P_TOP}** 다."
+  echo "     다만 절대값이 한 자릿수 ms 라 이 차이로 전략을 고를 일은 드물다 — (나)를 볼 것."
+fi
 echo "   · (나) 대량 이관에서 갈린다. A′ 가 A 보다 느린데, **보조 인덱스가 하나 더 적은데도**"
 echo "     그렇다는 것이 핵심이다. InnoDB 에서 PK 를 바꾸는 UPDATE 는 제자리 수정이 아니라"
 echo "     클러스터드 인덱스에서 지우고 다시 넣는 일이고, 그 행을 가리키던 보조 인덱스"
 echo "     엔트리도 새 PK 값으로 고쳐야 한다. 인덱스 수로 설명되지 않는 몫이 그것이다."
 echo "   → 조회를 위해 테넌트를 PK 선두에 놓는 결정은 **테넌트가 잘 안 바뀔 때** 옳다."
 echo "     tpcds 의 매장이라면 좋은 선택이고, 고객의 국가처럼 움직이는 축이라면"
-echo "     ②의 이득(6배)과 (나)의 비용을 워크로드 비율로 저울질해야 한다."
+if [ -n "${S_RATIO:-}" ]; then
+  echo "     ②의 이득(이번 실행 ${S_RATIO}배)과 (나)의 비용(A′/A ${BULK_RATIO}배)을"
+  echo "     워크로드 비율로 저울질해야 한다."
+else
+  echo "     ②의 이득과 (나)의 비용(이번 실행 A′/A ${BULK_RATIO}배)을 워크로드 비율로"
+  echo "     저울질해야 한다. ②를 같이 돌리면(ONLY 에 2 를 넣는다) 그 이득도 같이 찍힌다."
+fi
 echo
 fi
 
