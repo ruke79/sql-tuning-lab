@@ -27,7 +27,17 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
-    shm_size: 1g          # parallel hash join 등에서 공유메모리 부족 방지
+    # 병렬 해시가 쓰는 동적 공유메모리(DSA)는 **컨테이너 안의 /dev/shm** 에서 나온다.
+    # 호스트에 여유가 아무리 많아도 컨테이너 몫은 이 값이 상한이다.
+    # DSA 는 세그먼트를 1MB 부터 **배로 키우며** 잡고 이전 것을 그대로 두므로,
+    # 256MB 세그먼트 하나를 얻으려면 누적 511MB 가 이미 잡혀 있어야 한다.
+    # 조인 하나당 Parallel Hash 노드가 붙으므로 곱으로 늘어난다.
+    #   SF=0.5(lineitem 300만) : 1g 로 충분
+    #   SF=10 (lineitem 6,000만): 1g 로 **부족하다** — 실제로 아래 에러가 났다
+    #     ERROR: could not resize shared memory segment ... to 268435456 bytes:
+    #            No space left on device
+    # 증상이 "디스크 부족"처럼 보이지만 디스크와 무관하다. 규모를 키우면 같이 키운다.
+    shm_size: 8g
 
   mysql:
     image: mysql:8.4
