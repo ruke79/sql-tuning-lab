@@ -102,10 +102,12 @@ cd docker && docker compose up -d && cd ..
 > (호스트 설치판이면 `./scripts/restore-lab.sh`) 를 먼저 돌린다.
 > Kafka 케이스는 브로커가 없으면 실패가 아니라 `SKIPPED` 로 넘어간다(정상).
 
-> **Docker 없이 호스트 PostgreSQL 로 돌리는 환경이라면 — 컨테이너·VM 이 재생성된 뒤 복구.**
+> **컨테이너·VM 이 재생성된 뒤 복구.** 호스트 설치판(`pg_ctlcluster`)과 Docker판
+> (`tuninglab-postgres`) 둘 다 다룬다 — 스크립트가 어느 쪽인지 알아서 판별한다.
 > ```bash
 > ./scripts/restore-lab.sh --check   # 점검만 (아무것도 바꾸지 않는다)
 > ./scripts/restore-lab.sh           # 빠진 것만 복구
+> ./scripts/restore-lab.sh --mysql   # **MySQL 쪽** (mt-*-mysql.sh · sysbench 실습용)
 > ```
 > 클러스터 기동 → 롤 `tuner` → DB `tpch`/`tpcds` → **측정 조건**(`shared_buffers=1GB`,
 > `work_mem=64MB`, `max_parallel_workers_per_gather=4`) → 비어 있는 DB 만 재적재 순으로 확인한다.
@@ -120,9 +122,12 @@ cd docker && docker compose up -d && cd ..
 > | `database "tpcds" does not exist` | DB 가 사라짐 |
 > | `relation "store_sales" does not exist` | 데이터만 사라짐 |
 > | 측정값이 문서와 배수로 다름 | 서버 설정이 기본값으로 돌아감 |
+> | `MySQL 의 tpch.lineitem 이 없습니다` | MySQL 쪽만 안 채워짐 → `--mysql` |
 >
-> 마지막 항목이 제일 위험하다 — 아무 에러 없이 **숫자만 조용히 틀린다.**
+> 측정값 항목이 제일 위험하다 — 아무 에러 없이 **숫자만 조용히 틀린다.**
 > 실습 잔여물(중간에 끊긴 스크립트가 남긴 `lineitem` 트리거 등)도 함께 경고한다.
+> `--mysql` 은 같은 일을 MySQL 에서 한다: 서버 기동 → 계정 권한 → `tpch`/`tpcds`/`sysbench_lab`
+> 의 데이터와 **인덱스** → 측정 조건(`innodb_buffer_pool_size` 등) → `mt_n*` 같은 잔여물.
 
 ## 모듈별 사용법
 

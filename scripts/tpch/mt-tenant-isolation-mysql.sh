@@ -53,7 +53,11 @@ q()   { my tpch -e "$1"; }
 qe()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" tpch -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 
 if ! q "SELECT 1 FROM lineitem LIMIT 1" >/dev/null 2>&1; then
-  echo "  MySQL 의 tpch.lineitem 이 없습니다. ./scripts/restore-lab.sh --mysql 을 먼저 실행하세요."
+  echo "  MySQL 의 tpch.lineitem 이 없습니다. 둘 중 하나:"
+  echo "    ./scripts/restore-lab.sh --mysql        # 빠진 것만 알아서 채운다(권장)"
+  echo "    ./gradlew :tpch:bootRun --args=\"schema --db=mysql\""
+  echo "    ./gradlew :tpch:bootRun --args=\"load   --db=mysql --dir=./data/tpch\""
+  echo "    ./gradlew :tpch:bootRun --args=\"index  --db=mysql\"   # 빠뜨리기 쉽다 — InnoDB 는 PK 가 물리 배치다"
   exit 1
 fi
 

@@ -35,7 +35,7 @@
 #   ONLY=123 ./mt-tenant-isolation-mysql.sh
 #   KEEP=1 ./mt-tenant-isolation-mysql.sh
 #
-# 선행 조건: MySQL 에 tpcds 가 적재돼 있어야 한다.
+# 선행 조건: MySQL 에 tpcds 가 적재돼 있어야 한다. 없으면 ./scripts/restore-lab.sh --mysql
 set -uo pipefail
 
 REPEAT="${1:-4}"
@@ -52,9 +52,11 @@ qe()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" tpcds -e "$1" 2
 qv()  { mysql -h "$MYHOST" -P "$MYPORT" -u "$MYUSER" -p"$MYPASS" tpcds -e "$1" 2>&1 | grep -v '^mysql: \[Warning\]'; }
 
 if ! q "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
-  echo "  MySQL 의 tpcds.store_sales 가 없습니다. 먼저 적재하세요:"
+  echo "  MySQL 의 tpcds.store_sales 가 없습니다. 둘 중 하나:"
+  echo "    ./scripts/restore-lab.sh --mysql        # 빠진 것만 알아서 채운다(권장)"
   echo "    ./gradlew :tpcds:bootRun --args=\"schema --db=mysql\""
   echo "    ./gradlew :tpcds:bootRun --args=\"load   --db=mysql\""
+  echo "    ./gradlew :tpcds:bootRun --args=\"index  --db=mysql\"   # 빠뜨리기 쉽다 — 실제로 빠져 있었다"
   exit 1
 fi
 

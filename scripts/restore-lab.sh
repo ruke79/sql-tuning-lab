@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # 랩 환경 복구 — 컨테이너/VM 이 재생성된 뒤 실습을 이어가기 위한 한 줄 진입점.
 #
-# 이 랩은 Docker 없이 **호스트에 직접 설치된 PostgreSQL 16** 위에서 돌아간다
-# (docker/ 의 compose 파일은 Docker 가 있는 환경용이고, 이 스크립트는 없는 환경용이다).
-# 컨테이너가 재생성되면 다음 중 하나가 깨져 있고, 증상이 서로 비슷해서 헷갈린다:
+# 이 랩은 **두 가지 모양**으로 돌아간다. 이 스크립트는 둘 다 다룬다:
+#   (a) 호스트에 직접 설치된 PostgreSQL 16 / MySQL 8  → pg_ctlcluster, service mysql
+#   (b) docker/docker-compose.yml 의 컨테이너         → tuninglab-postgres, tuninglab-mysql
+# 기동 방법만 다르고 나머지 점검은 같다. **어느 쪽인지 스크립트가 알아서 판별한다** —
+# 예전에는 (a)만 가정해서, Docker 를 쓰는 환경에서 `pg_ctlcluster: command not found` 로 죽었다.
+#
+# 컨테이너/클러스터가 재생성되면 다음 중 하나가 깨져 있고, 증상이 서로 비슷해서 헷갈린다:
 #
 #   증상                                          실제 원인            이 스크립트가 하는 일
 #   ─────────────────────────────────────────────────────────────────────────────
@@ -17,14 +21,34 @@
 # **데이터가 남아 있으면 건드리지 않는다.** 재적재는 비어 있을 때만 한다.
 #
 # 사용법:
-#   ./scripts/restore-lab.sh              # 점검하고 빠진 것만 복구
+#   ./scripts/restore-lab.sh              # PostgreSQL 을 점검하고 빠진 것만 복구
+#   ./scripts/restore-lab.sh --mysql      # **MySQL 쪽**을 점검/복구 (mt-*-mysql.sh·sysbench 용)
 #   ./scripts/restore-lab.sh --check      # 점검만 (아무것도 바꾸지 않는다)
+#   ./scripts/restore-lab.sh --mysql --check
 #   ./scripts/restore-lab.sh --force-tpch # tpch 를 데이터가 있어도 다시 적재
 #   SF=1 ./scripts/restore-lab.sh         # tpch 스케일 (기본 0.5 — 문서의 측정 조건)
 #   SALES=2000000 ./scripts/restore-lab.sh   # tpcds store_sales 행수 (기본 200만)
 set -uo pipefail
 
-MODE="${1:-}"
+usage() {
+  sed -n '/^# 사용법:/,/^set -uo/p' "$0" | sed '$d;s/^# \{0,1\}//'
+}
+
+# 모르는 인자를 **조용히 무시하면** 안 된다. 실제로 `--mysql` 이 없던 시절에 그 인자를 주면
+# 스크립트가 그걸 버리고 PostgreSQL 경로로 들어가, 엉뚱한 곳에서 실패했다
+# (`pg_ctlcluster: command not found`). 사용자는 MySQL 을 고치려다 PostgreSQL 에러를 받는다.
+MODE=""
+DO_MYSQL=0
+for a in "$@"; do
+  case "$a" in
+    --check)      MODE="--check" ;;
+    --force-tpch) MODE="--force-tpch" ;;
+    --mysql)      DO_MYSQL=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *) printf "  \033[33m!\033[0m 알 수 없는 인자: %s\n\n" "$a"; usage; exit 2 ;;
+  esac
+done
+
 SF="${SF:-0.5}"
 SALES="${SALES:-2000000}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,6 +69,37 @@ as_pg()  { sudo -u postgres psql -X -q -tAc "$1" 2>/dev/null; }
 as_pgc() { sudo -u postgres psql -X -q -c "$1" 2>&1; }
 t_sql()  { PGPASSWORD=tuner psql -h localhost -U tuner -d "$1" -X -q -tAc "$2" 2>/dev/null; }
 
+# 호스트 설치냐 Docker 냐 — 기동/재기동 방법만 다르다. 둘 다 없으면 그렇게 말한다.
+have()      { command -v "$1" >/dev/null 2>&1; }
+dk_exists() { have docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
+pg_start() {
+  if have pg_ctlcluster; then
+    # 컨테이너가 죽을 때 남은 pid 파일이 기동을 막는다 — pg_ctlcluster 가 알아서 치운다
+    pg_ctlcluster 16 main start 2>&1 | sed 's/^/     /'
+  elif dk_exists tuninglab-postgres; then
+    say "     (호스트 설치가 아니라 Docker 다 — tuninglab-postgres 를 올린다)"
+    docker start tuninglab-postgres 2>&1 | sed 's/^/     /'
+  elif have docker && [ -f docker/docker-compose.yml ]; then
+    say "     (컨테이너가 아직 없다 — docker compose up -d postgres)"
+    ( cd docker && docker compose up -d postgres ) 2>&1 | tail -3 | sed 's/^/     /'
+  else
+    warn "PostgreSQL 을 기동할 방법이 없다 — pg_ctlcluster 도 docker 도 안 보인다"
+    return 1
+  fi
+}
+pg_restart() {
+  if have pg_ctlcluster;                then pg_ctlcluster 16 main restart 2>&1 | sed 's/^/     /'
+  elif dk_exists tuninglab-postgres;    then docker restart tuninglab-postgres 2>&1 | sed 's/^/     /'
+  else warn "재기동 방법을 못 찾았다 — 설정이 반영되지 않았다"; fi
+}
+
+# MySQL 쪽은 PostgreSQL 과 겹치는 점검이 하나도 없어서 별도 경로로 끝낸다.
+if [ "$DO_MYSQL" = "1" ]; then
+  . "$HERE/scripts/restore-lab-mysql.inc"
+  restore_mysql
+  exit $?
+fi
+
 say "랩 환경 점검 — $HERE"
 say
 
@@ -56,12 +111,12 @@ else
     warn "클러스터 down"
   else
     act "클러스터를 기동한다"
-    # 컨테이너가 죽을 때 남은 pid 파일이 기동을 막는다 — pg_ctlcluster 가 알아서 치운다
-    pg_ctlcluster 16 main start 2>&1 | sed 's/^/     /'
+    pg_start
     sleep 2
     pg_isready -h localhost -p 5432 >/dev/null 2>&1 \
       && { ok "클러스터 기동됨"; CHANGED=1; } \
-      || { warn "기동 실패 — /var/log/postgresql/postgresql-16-main.log 확인"; exit 1; }
+      || { warn "기동 실패 — 호스트 설치면 /var/log/postgresql/postgresql-16-main.log,"
+           warn "           Docker 면 docker logs tuninglab-postgres"; exit 1; }
   fi
 fi
 pg_isready -h localhost -p 5432 >/dev/null 2>&1 || { warn "클러스터가 없으면 아래를 볼 수 없다"; exit 1; }
@@ -116,7 +171,7 @@ chk max_parallel_workers_per_gather "$WANT_PARALLEL"
 chk wal_level "${WANT_WAL_LEVEL:-replica}"
 if [ "$NEED_RESTART" = "1" ]; then
   act "설정 반영을 위해 재기동"
-  pg_ctlcluster 16 main restart 2>&1 | sed 's/^/     /'; sleep 2
+  pg_restart; sleep 2
 fi
 
 # ── 5) 데이터 ─────────────────────────────────────────────────────────
