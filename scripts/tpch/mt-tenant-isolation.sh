@@ -29,7 +29,8 @@
 #
 # 사용법:
 #   ./mt-tenant-isolation.sh            # 전부, 각 측정 4회 최소값
-#   WORK_MEM=512MB ./mt-tenant-isolation.sh   # SF=10 이상에서 ⑥의 N 이 공유메모리로 죽으면
+#   (SF=10 이상에서 ⑥의 N 이 공유메모리로 죽으면 — work_mem 이 아니라 /dev/shm 문제다.
+#    스크립트가 원인과 처방을 찍고, 병렬을 꺼서라도 값을 남긴다.)
 #   ./mt-tenant-isolation.sh 6
 #   ONLY=125 ./mt-tenant-isolation.sh   # ①②⑤만
 #   KEEP=1 ./mt-tenant-isolation.sh     # 실험 객체를 남겨 둔다
@@ -346,24 +347,38 @@ XC="SELECT * FROM ($XC) u ORDER BY 2 DESC"
 # 서버가 죽는 일이 있어, 재기 전에 **한 번 돌려 에러를 먼저 확인한다** —
 # 실패를 삼키면 표에 '?' 만 남아 원인을 알 수 없다.
 XN_ERR=$(sql "EXPLAIN (ANALYZE) $XN" 2>&1 | grep -m1 "ERROR" || true)
+XN_PRE=""; XN_TAG=""
 if [ -n "$XN_ERR" ]; then
   echo "  [N 측정 실패] $XN_ERR"
   case "$XN_ERR" in
     *"shared memory segment"*|*"No space left on device"*)
-      echo "    원인: 병렬 해시가 쓰는 **동적 공유메모리(/dev/shm)** 가 모자란다."
-      echo "          이 스크립트는 WORK_MEM=${WORK_MEM} 로 도는데, 규모가 크면 워커마다"
-      echo "          큰 세그먼트를 잡아 /dev/shm 을 넘긴다. 셋 중 하나로 푼다:"
-      echo "            WORK_MEM=512MB $0          # 가장 간단하다"
-      echo "            mount -o remount,size=8G /dev/shm"
-      echo "            (컨테이너면) docker run --shm-size=8g ..."
-      echo "    ※ 이건 데이터나 계획의 문제가 아니라 **환경 한계**다 — A·B·C 는 같은 규모에서"
-      echo "       멀쩡히 돌았다(단일 테이블이라 병렬 해시를 안 쓴다). N 만 못 잰 것이다." ;;
+      echo "    원인: 병렬 해시가 쓰는 **동적 공유메모리(DSA)** 세그먼트를 /dev/shm 에 못 잡는다."
+      echo "          DSA 는 1MB 에서 시작해 **배로 키우며**(…64→128→256MB) 잡으므로,"
+      echo "          요구 크기는 work_mem 이 아니라 **총 할당량**이 정한다."
+      echo "          → **work_mem 을 낮춰도 같은 크기를 요구한다**(512MB 로 낮춰도 동일 확인)."
+      echo "    확인:  df -h /dev/shm      # 여유가 요구 크기보다 큰가"
+      echo "           ls -la /dev/shm     # 죽은 실행이 남긴 PostgreSQL.* 가 쌓여 있지 않은가"
+      echo "    처방:  sudo mount -o remount,size=8G /dev/shm      # 가장 직접적이다"
+      echo "           (컨테이너면) docker run --shm-size=8g ..."
+      echo "           ALTER SYSTEM SET dynamic_shared_memory_type='mmap'; 후 재기동"
+      echo "             — 세그먼트를 /dev/shm 대신 \$PGDATA 에 둔다(느리지만 용량 제약이 없다)"
+      echo "    ※ A·B·C 는 같은 규모에서 멀쩡히 돌았다 — 단일 테이블이라 병렬 해시를 안 쓴다."
+      echo "       **데이터나 계획의 문제가 아니라 환경 한계다.**" ;;
   esac
+  # 그래도 숫자는 남긴다 — 병렬을 끄면 DSA 가 필요 없다. 조건이 다르므로 **표에 표시**한다.
+  XN_PRE="SET max_parallel_workers_per_gather=0;"
+  if [ -z "$(sql "$XN_PRE EXPLAIN (ANALYZE) $XN" 2>&1 | grep -m1 'ERROR' || true)" ]; then
+    XN_TAG=" (직렬 강제)"
+    echo "    → 병렬을 끄고 잰 값을 아래 표에 '(직렬 강제)' 로 표시해 싣는다."
+    echo "       **다른 행과 직접 비교하면 안 된다** — 저 행만 워커 없이 돈 것이다."
+  else
+    XN_PRE=""; echo "    → 병렬을 꺼도 실패했다. N 은 이 환경에서 못 잰다."
+  fi
   echo
 fi
 printf "  %-22s %9s %-16s %s\n" "전략" "min(ms)" "buffers" "쿼리 길이"
 printf "  %s\n" "-----------------------------------------------------------------"
-printf "  %-22s %9s %-16s %s자\n" "N 정규화 (2조인)" "$(best_ms '' "$XN")" "$(bufs_of '' "$XN")" "${#XN}"
+printf "  %-22s %9s %-16s %s자%s\n" "N 정규화 (2조인)" "$(best_ms "$XN_PRE" "$XN")" "$(bufs_of "$XN_PRE" "$XN")" "${#XN}" "$XN_TAG"
 printf "  %-22s %9s %-16s %s자\n" "A 비정규화"       "$(best_ms '' "$XA")" "$(bufs_of '' "$XA")" "${#XA}"
 printf "  %-22s %9s %-16s %s자\n" "B 파티션"         "$(best_ms '' "$XB")" "$(bufs_of '' "$XB")" "${#XB}"
 printf "  %-22s %9s %-16s %s자 (UNION ALL ×%s)\n" "C 스키마" "$(best_ms '' "$XC")" "$(bufs_of '' "$XC")" "${#XC}" "$NT"
