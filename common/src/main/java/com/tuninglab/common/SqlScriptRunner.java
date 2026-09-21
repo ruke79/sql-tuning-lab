@@ -26,12 +26,41 @@ public class SqlScriptRunner {
         } catch (IOException e) {
             throw new RuntimeException("Cannot read " + resource, e);
         }
-        for (String statement : script.split(";\\s*(\\r?\\n|$)")) {
+        for (String statement : split(script)) {
             String sql = stripComments(statement).trim();
             if (sql.isEmpty()) continue;
             log.info("DDL: {}", firstLine(sql));
             jdbc.execute(sql);
         }
+    }
+
+    /**
+     * 세미콜론으로 나누되 <b>달러 인용 블록({@code $$ ... $$}) 안의 세미콜론은 건너뛴다.</b>
+     * 단순히 {@code split(";")} 하면 PostgreSQL 의 {@code DO $$ ... END $$} 가 조각나서
+     * 문법 오류가 난다. 인덱스 스크립트가 "이미 있으면 건너뛴다"를 DO 블록으로 표현하므로
+     * 이 처리가 필요하다.
+     */
+    static java.util.List<String> split(String script) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inDollar = false;
+        for (int i = 0; i < script.length(); i++) {
+            char c = script.charAt(i);
+            if (c == '$' && i + 1 < script.length() && script.charAt(i + 1) == '$') {
+                inDollar = !inDollar;
+                cur.append("$$");
+                i++;
+                continue;
+            }
+            if (c == ';' && !inDollar) {
+                out.add(cur.toString());
+                cur.setLength(0);
+                continue;
+            }
+            cur.append(c);
+        }
+        if (!cur.toString().isBlank()) out.add(cur.toString());
+        return out;
     }
 
     private String stripComments(String sql) {

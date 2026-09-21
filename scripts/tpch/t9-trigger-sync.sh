@@ -17,8 +17,12 @@
 #       반정규화 테이블에는 원본 키를 반드시 함께 가져와야 한다 — 이 스크립트가 그 형태다.
 #
 # 사용법:
-#   ./t9-trigger-sync.sh          # 기본 6라운드
+#   ./t9-trigger-sync.sh          # 기본 6라운드. 끝나면 트리거·denorm·실험 행을 **직접 지운다**
 #   ./t9-trigger-sync.sh 10
+#   KEEP=1 ./t9-trigger-sync.sh   # 남겨 둔다 (§T-9 의 뒤 절들이 denorm 을 쓴다)
+#
+# ⚠️ 이 스크립트가 다는 트리거는 lineitem·orders·customer 의 **모든 쓰기**에 발화한다.
+#    남으면 이후의 모든 측정이 **에러 없이** 달라진다. 그래서 기본값이 자동 정리다.
 #
 # 선행 조건: schema → load → index 완료
 set -uo pipefail
@@ -178,14 +182,32 @@ done; echo; echo
 mn(){ echo "$1"|tr ' ' '\n'|grep -v '^$'|sort -g|head -1; }
 printf "%-34s %11s %11s %9s\n" "작업 (전파 팬아웃)" "트리거OFF" "트리거ON" "배수"
 printf "%s\n" "------------------------------------------------------------------------"
+# 배수를 모으면서 **범위도 같이 계산한다.** 예전에는 표 아래 해석문에 "1.5~3.2배"가
+# 박혀 있었는데, SF=10 에서 실측이 1.3~4.4배로 나와도 같은 문장을 찍었다.
+# 측정하고서 결론을 고정해 두면 표와 해설이 어긋난다 — 재서 쓴다.
+RMIN=""; RMAX=""; FLOOR=""
+# psql \timing 으로 0.1ms 아래를 재면 문장 실행보다 계측·왕복 몫이 커진다. 그 구간의
+# 값끼리 나눈 배수는 '작은 수를 더 작은 수로 나눈 것'이라 신뢰할 수 없다 — 표시해 준다.
+FLOOR_MS=0.1
 row(){ a=$(mn "${OFF[$1]}"); b=$(mn "${ON[$1]}")
-  printf "%-34s %8s ms %8s ms %8s\n" "$2" "$a" "$b" "$(awk -v x=$a -v y=$b 'BEGIN{if(x>0)printf "%.1f배",y/x; else print "-"}')"; }
+  local rt mark=""
+  rt=$(awk -v x=$a -v y=$b 'BEGIN{if(x>0)printf "%.1f",y/x; else print "0"}')
+  if awk -v x="$a" -v f="$FLOOR_MS" 'BEGIN{exit !(x<f)}'; then mark="†"; FLOOR="$FLOOR $2"; fi
+  [ -z "$RMIN" ] && RMIN="$rt" || RMIN=$(awk -v a="$RMIN" -v b="$rt" 'BEGIN{print (b<a)?b:a}')
+  [ -z "$RMAX" ] && RMAX="$rt" || RMAX=$(awk -v a="$RMAX" -v b="$rt" 'BEGIN{print (b>a)?b:a}')
+  printf "%-34s %8s ms %8s ms %7s배%s\n" "$2" "$a" "$b" "$rt" "$mark"; }
 row cust   "customer 1행 UPDATE (→38행)"
 row ord    "orders 1행 UPDATE (→4행)"
 row li_upd "lineitem 1행 UPDATE (→1행)"
 row li_del "lineitem DELETE 1주문 (→4행)"
 row li_ins "lineitem INSERT 약1,200행"
 echo
+if [ -n "$FLOOR" ]; then
+  echo "  † 트리거OFF 가 ${FLOOR_MS}ms 아래다 — 그 구간에서는 계측·왕복 몫이 문장 실행보다 커서"
+  echo "    **배수를 믿으면 안 된다.** 해당 행:${FLOOR}"
+  echo "    (SF=10 실행에서 DELETE 의 OFF 가 0.062ms 로 찍혀 배수가 4.4배까지 부풀었다.)"
+  echo
+fi
 echo "  주목: 38행을 고치는 customer UPDATE 가 가장 싸고, 1행만 고치는 lineitem UPDATE 가"
 echo "        가장 비싸다. 전자는 트리거 1회 발화 + 집합 UPDATE 1회로 끝나지만,"
 echo "        후자는 상속 컬럼을 채우려고 orders·customer 를 매번 거슬러 올라가기 때문이다."
@@ -218,11 +240,36 @@ echo "  누락·유령행이 모두 0이면 트리거가 완벽히 동기화한 
 echo
 echo "해석:"
 echo "  Tow 의 전제('엄밀한 트리거면 기능적으로 안전하다')는 성립한다."
-echo "  다만 그 대가가 모든 쓰기에 붙는 1.5~3.2배이고, 조회가 있든 없든 영구히 지불된다."
+echo "  다만 그 대가가 모든 쓰기에 붙는 **이번 실행 기준 ${RMIN}~${RMAX}배**이고,"
+echo "  조회가 있든 없든 영구히 지불된다(문서 실측 SF=0.5 는 1.5~3.2배였다)."
 echo "  읽기 편중 + 잦은 조회 + §T-8로 안 되는 경우, 셋을 모두 만족할 때만 성립하는 거래다."
 echo
+# ── 6) 정리 ───────────────────────────────────────────────────────────
+# **명령을 찍기만 하면 안 된다.** 이 스크립트가 다는 트리거는 lineitem·orders·customer 의
+# **모든 쓰기**에 발화하므로, 남으면 이후의 모든 측정을 에러 없이 바꿔 놓는다.
+# 실제로 손으로 안 지워 남은 채 다음 실습을 돌린 적이 있다(restore-lab 의 잔여물 검사가
+# t_sync%/t_enq% 를 둘 다 보게 된 계기). 그래서 직접 지운다 — 남기려면 KEEP=1.
 echo "정리:"
-echo "  psql -d tpch -c \"DROP TRIGGER IF EXISTS t_sync_li ON lineitem;"
-echo "                    DROP TRIGGER IF EXISTS t_sync_ord ON orders;"
-echo "                    DROP TRIGGER IF EXISTS t_sync_cust ON customer;"
-echo "                    DROP TABLE IF EXISTS lineitem_denorm;\""
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "  KEEP=1 — 트리거 3종과 lineitem_denorm 을 남겨 둔다."
+  echo "  ⚠️ 트리거는 lineitem·orders·customer 의 **모든 쓰기**에 발화한다."
+  echo "     다음 측정 전에 반드시 지울 것:"
+  echo "       psql -d tpch -c \"DROP TRIGGER IF EXISTS t_sync_li ON lineitem;"
+  echo "                         DROP TRIGGER IF EXISTS t_sync_ord ON orders;"
+  echo "                         DROP TRIGGER IF EXISTS t_sync_cust ON customer;"
+  echo "                         DROP TABLE IF EXISTS lineitem_denorm;\""
+else
+  sql "DROP TRIGGER IF EXISTS t_sync_li ON lineitem;
+       DROP TRIGGER IF EXISTS t_sync_ord ON orders;
+       DROP TRIGGER IF EXISTS t_sync_cust ON customer;
+       DROP TABLE IF EXISTS lineitem_denorm;" >/dev/null 2>&1
+  LTRG=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\_sync%'")
+  # 드리프트 워크로드가 lineitem 에 l_linenumber+90 행을 넣고 커밋한다 — 이것도 잔여물이다.
+  # (SF=0.5·SF=10 양쪽에서 +92행으로 재현된다. 원본 행수가 달라지면 이후 표가 조용히 어긋난다.)
+  sql "DELETE FROM lineitem WHERE l_linenumber >= 90" >/dev/null 2>&1
+  LROW=$(sql "SELECT count(*) FROM lineitem WHERE l_linenumber >= 90")
+  echo "  트리거 3종·lineitem_denorm·실험 행을 지웠다."
+  echo "  남은 t_sync% 트리거 ${LTRG} / 실험 lineitem 행 ${LROW}   (둘 다 0 이어야 한다)"
+  echo "  ※ 드리프트 검사의 UPDATE·DELETE 는 커밋됐다 — l_orderkey 300~320 의 lineitem 행은"
+  echo "    지워진 채다. 원본 상태가 필요하면 ./scripts/restore-lab.sh --force-tpch 로 재적재한다."
+fi
