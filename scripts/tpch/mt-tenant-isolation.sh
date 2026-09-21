@@ -77,7 +77,12 @@ scan_of() { sql "$1 EXPLAIN (COSTS OFF) $2" | grep -oE '(Parallel )?(Seq Scan|In
 # top 노드 줄을 건너뛰고 더 깊은 노드 값을 집는다 — 테이블이 shared_buffers 보다 크면
 # (SF=10 등) 늘 그렇게 되고, buffers 열이 시간과 전혀 안 맞는 작은 값으로 찍힌다.
 # 첫 'Buffers: shared' 줄을 잡고 두 항목을 각각 0 기본값으로 읽는다.
-bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
+# **시간과 같은 캐시 상태에서 재야 한다.** best_ms 는 워밍업 뒤 4회 최소값인데
+# bufs_of 가 워밍업 없이 한 번만 돌면(그리고 printf 인자 순서상 먼저 돌면) buffers 는
+# 가장 차가운 실행이 된다 — SF=10 에서 A·B·C 가 전부 hit=0 으로 찍힌 것이 그 증상이다.
+# 한 번 버리고 두 번째를 읽어 두 열의 조건을 맞춘다.
+bufs_of() { sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" >/dev/null 2>&1
+            sql "$1 EXPLAIN (ANALYZE, BUFFERS) $2" | awk '/Buffers: shared/{h=0;r=0; if (match($0,/hit=[0-9]+/)) h=substr($0,RSTART+4,RLENGTH-4); if (match($0,/read=[0-9]+/)) r=substr($0,RSTART+5,RLENGTH-5); printf "hit=%d read=%d", h, r; exit}'; }
 joins_of() { sql "EXPLAIN (COSTS OFF) $1" | grep -cE 'Nested Loop|Hash Join|Merge Join'; }
 
 # tpcds 판의 teardown 버그를 그대로 답습하지 않는다 — 문장을 따로 보낸다.
