@@ -301,11 +301,22 @@ declare -A T1
 for e in "${LEVELS[@]}"; do
   LVL="${e%%:*}"; LBL="${e#*:}"
   for MT in 1 10; do
+    # **-f 로 주는 파일은 컨테이너 안에 있어야 한다.** 다른 스크립트의 -f 는 pg_stage 로
+    # 감쌌는데 여기만 놓쳤다 — docker 경로에서 pgbench 가 호스트 경로를 못 찾아 죽었고,
+    # 표가 통째로 0 과 ? 로 찍혔다(TPS 0 / 실패 ? / 재시도 0). 그리고 ③이 그 위에서
+    # "직렬화 실패를 수백 건 낸 뒤"라고 말했다 — 한 건도 안 났는데.
     R=$(PGOPTIONS="-c default_transaction_isolation=$LVL" \
         PGBENCH -d "$DB" -n \
-          -f "$TMPD/wa.sql" -f "$TMPD/wb.sql" -c "$CLIENTS" -j "$JOBS" -T "$SECS" \
+          -f "$(pg_stage "$TMPD/wa.sql")" -f "$(pg_stage "$TMPD/wb.sql")" \
+          -c "$CLIENTS" -j "$JOBS" -T "$SECS" \
           --max-tries=$MT --failures-detailed 2>&1)
     TPS=$(echo "$R" | grep -oE "^tps = [0-9.]+" | grep -oE "[0-9.]+" | head -1)
+    # **빈 값을 0 으로 찍고 넘어가지 않는다.** 왜 비었는지를 보여 준다.
+    if [ -z "$TPS" ]; then
+      echo "  [중단] pgbench 가 결과를 안 냈습니다 (격리수준 $LVL, max-tries=$MT)."
+      printf "%s\n" "$R" | sed 's/^/         /' | head -8
+      exit 1
+    fi
     FAIL=$(echo "$R" | grep -oE "number of failed transactions: [0-9]+" | grep -oE "[0-9]+" | head -1)
     RETR=$(echo "$R" | grep -oE "number of transactions retried: [0-9]+" | grep -oE "[0-9]+" | head -1)
     [ "$MT" = 1 ] && { T1["$LBL"]="$TPS"; RL="없음 (max-tries=1)"; } || RL="있음 (max-tries=10)"

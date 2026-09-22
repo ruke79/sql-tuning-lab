@@ -42,15 +42,28 @@ WORK_MEM="${WORK_MEM:-4096MB}"
 export PGOPTIONS="-c work_mem=$WORK_MEM"
 export PGPASSWORD=tuner          # pgbench 도 같은 자격증명을 쓴다
 
+# psql 은 폴백이 있었는데 **pgbench 는 맨 호출이었다.** docker 경로에서 pgbench 가
+# 호스트 경로의 -f 파일을 못 찾아 조용히 빈 값을 냈다(같은 함정을 t9-isolation-levels
+# 에서 먼저 맞았다 — 표가 통째로 0 으로 찍혔다). 둘을 같이 갈라 둔다.
 if command -v psql >/dev/null 2>&1; then
+  PG_VIA=host
   sql()  { psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpcds -X -q -tAc "$1"; }
   sqlv() { psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpcds -X -q -c "$1"; }
   sqlf() { psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpcds -X -q -f "$1"; }
+  PGBENCH(){ pgbench -h "$PGHOST_" -p "$PGPORT_" -U tuner "$@"; }
 else
+  PG_VIA=docker
   sql()  { docker exec -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" psql -U tuner -d tpcds -X -q -tAc "$1"; }
   sqlv() { docker exec -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" psql -U tuner -d tpcds -X -q -c "$1"; }
   sqlf() { docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" psql -U tuner -d tpcds -X -q < "$1"; }
+  PGBENCH(){ docker exec -i -e PGPASSWORD=tuner -e PGOPTIONS="$PGOPTIONS" "$CONTAINER" pgbench -U tuner "$@"; }
 fi
+# -f 로 주는 파일은 컨테이너 안에 있어야 한다.
+pg_stage() {
+  if [ "$PG_VIA" = host ]; then printf %s "$1"; return; fi
+  docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
+  printf %s "/tmp/$(basename "$1")"
+}
 
 if ! sql "SELECT 1 FROM store_sales LIMIT 1" >/dev/null 2>&1; then
   echo "  store_sales 가 없습니다. §0-4 의 tpcds 준비 명령을 먼저 실행하세요."; exit 1
@@ -315,13 +328,15 @@ cat > "$SD/n_cpu.sql" <<EOF
 SELECT sum(i::bigint * i) FROM generate_series(1, 2000000) i;
 EOF
 bench() {  # $1 = 스크립트, $2 = clients → "tps lat_avg"
-  pgbench -n -h "$PGHOST_" -p "$PGPORT_" -U tuner -c "$2" -T 8 -f "$1" tpcds 2>/dev/null \
+  PGBENCH -n -c "$2" -T 8 -f "$(pg_stage "$1")" tpcds 2>/dev/null \
     | awk '/^tps/{t=$3} /latency average/{l=$4} END{printf "%s %s", t, l}'
 }
 noisy() {  # $1 = 라벨, $2 = 피해자 스크립트, $3 = 이웃 스크립트, $4 = 이웃 세션 수
   local t1 l1 t2 l2
   read -r t1 l1 <<<"$(bench "$2" 1)"
-  ( pgbench -n -h "$PGHOST_" -p "$PGPORT_" -U tuner -c "$4" -T 9 -f "$3" tpcds >/dev/null 2>&1
+  # 빈 값을 그대로 표에 넣지 않는다 — 왜 비었는지 모르는 0 이 제일 나쁘다.
+  [ -n "$t1" ] || { echo "    [중단] pgbench 가 결과를 안 냈다 ($2, 경로 $PG_VIA)."; return 1; }
+  ( PGBENCH -n -c "$4" -T 9 -f "$(pg_stage "$3")" tpcds >/dev/null 2>&1
     [ $? -ne 0 ] && echo "    [경고] 이웃 pgbench 가 비정상 종료했다 — '이웃 동시' 열을 믿지 말 것" ) &
   sleep 0.5
   read -r t2 l2 <<<"$(bench "$2" 1)"
