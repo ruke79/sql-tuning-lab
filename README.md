@@ -288,7 +288,7 @@ tpch 에서 얻은 결론을 그대로 옮기면 틀리는 곳이 셋 있다:
 store_returns 가 없어 적재 시 **조용히 무시**된다(오류가 아니다).
 WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성해야 I/O가 몇 배 빠르다.
 
-### :pgbench-lab — B-Tree Split / Shared Buffers / WAL Flush / HOT
+### :pgbench-lab — HOT / 인덱스 쓰기 비용 + 서버 지표 관측
 
 ```bash
 ./gradlew :pgbench-lab:bootRun --args="init --scale=10"                       # accounts 100만
@@ -299,17 +299,40 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 
 **1억 건**: `--scale=1000` (Java 적재도 가능하지만 공식이 빠름: `scripts/pgbench/run-official-pgbench.sh init 1000`)
 
+> **무엇을 잴 수 있고 무엇은 못 재는가** — 제목이 실제보다 많이 약속하고 있어서 고쳐 적는다.
+> `run` 의 워크로드는 **TPC-B 한 종류로 고정**이다(3 UPDATE + 1 SELECT + 1 INSERT).
+> 손잡이는 `clients` / `seconds` / `scale` 뿐이고, 쿼리를 바꾸려면 `TpcbWorkload.java` 를 고쳐야 한다.
+>
+> | 주제 | 상태 |
+> |---|---|
+> | HOT / fillfactor | ✅ `monitor` 의 `n_tup_hot_upd` + `t8-dml-cost.sh` 의 통제 실험 |
+> | 인덱스의 쓰기 비용 | ✅ `t8-dml-cost.sh` (§T-8 후반) |
+> | WAL / 체크포인트 | ⚠️ 카운터와 UPDATE당 WAL 은 재지만 `synchronous_commit` 실험은 **없다** |
+> | 버퍼 적중률 | ⚠️ 찍기만 한다. `shared_buffers` 를 바꿔 보는 코드는 **없고**, 그 값은 DB 전체 **누적**이라 한 실행의 측정치가 아니다(`reset-stats` 후에 보라) |
+> | B-Tree 페이지 분할 | ❌ **코드가 없다.** `pageinspect` / `bt_page_stats` 를 쓰는 곳이 한 군데도 없다 |
+>
+> `TpcbWorkload` 주석이 "튜닝 관찰 포인트"로 세 가지를 적어 뒀는데 자동화된 것은 fillfactor 하나다.
+> 그리고 거기 적힌 **branches 행 락 경합은 작은 scale 에서만 성립한다** — `scale` 이 크면
+> branches 가 `scale` 행이라 8 클라이언트가 같은 행을 칠 일이 거의 없다.
+
 인덱스의 **쓰기 비용**(§T-8 후반)은 스크립트로 자동화되어 있다. pgbench_lab 이 없으면 만든다:
 
 ```bash
-./scripts/pgbench/t8-dml-cost.sh                # 전부 (약 6분)
+./scripts/pgbench/t8-dml-cost.sh                # 전부 (scale=10 에서 약 20분)
 ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
 ```
 
 > **"인덱스를 늘리면 TPS 가 떨어진다"는 절반만 맞다.** 같은 개수를 늘려도 `(filler)` 는 HOT 을
 > 안 깨고 `(abalance)` 는 0% 로 무너뜨린다 — 갱신되는 컬럼인가가 먼저다. 그리고 그 비용은
-> **TPS 에 거의 안 나타난다**: HOT 68%→0%, 레코드 WAL +75% 인데 TPS 는 3~6% 다(편차 안이다).
-> 전역 지표가 국소 변화를 삼킨 경우라 `n_tup_hot_upd` 와 `pg_stat_wal` 을 봐야 한다.
+> **TPS 에 거의 안 나타난다**: HOT 이 무너지고 레코드 WAL 이 2배가 되는 동안 TPS 변화는
+> 라운드 간 편차 안이다. 전역 지표가 국소 변화를 삼킨 경우라 `n_tup_hot_upd` 와
+> `pg_stat_wal` 을 봐야 한다.
+>
+> **기준선 HOT 비율을 상수로 외우지 마라.** `fillfactor=100` 은 필요조건일 뿐이고, 실제 값은
+> **페이지당 갱신 횟수(`tps × SECS ÷ 힙 페이지 수`)** 가 정한다. 같은 scale=10 에서도
+> `SECS=6` 이면 42%, `SECS=45` 면 89% 가 나오고, `scale=2000` 에서는 0.1% 였다.
+> 너무 짧게 재면 표가 **거꾸로** 나온다 — HOT 을 깨는 인덱스가 안 깨는 인덱스보다 싸게 보인다.
+> 스크립트가 페이지당 갱신을 찍고, 5회에 못 미치면 필요한 `SECS` 를 역산해 알려준다.
 > fillfactor 를 100→90 으로 내리면 HOT 이 100% 가 되고, 70 까지 더 내려도 남는 이득이 없다.
 
 실험 아이디어:
