@@ -20,9 +20,9 @@
 #   원인이다. 원인 지표가 같이 움직이는 걸 봐야 인과를 주장할 수 있다(§T-0).
 #
 # 사용법:
-#   ./t8-dml-cost.sh              # 전부 (약 6분)
+#   ./t8-dml-cost.sh              # 전부 (scale=10 에서 약 20분 — 대부분이 VACUUM FULL 이다)
 #   ROUNDS=3 ./t8-dml-cost.sh     # 라운드 수(기본 2). 라운드마다 조건을 **교차**한다
-#   SECS=20   ./t8-dml-cost.sh    # 조건당 부하 시간(기본 12초)
+#   SECS=20   ./t8-dml-cost.sh    # 조건당 부하 시간(기본 45초 — 아래 이유로 짧으면 안 된다)
 #   CLIENTS=8 ./t8-dml-cost.sh
 #   ONLY=2 ./t8-dml-cost.sh       # ②(fillfactor) 절만
 #
@@ -33,7 +33,11 @@
 set -uo pipefail
 
 ROUNDS="${ROUNDS:-2}"
-SECS="${SECS:-12}"
+# 기본 45초 — 12초로는 이 실습이 성립하지 않는다. 페이지당 갱신이 5회를 넘어야
+# FPI 몫이 내려가고 'FPI 제외' 열이 신호를 담는다. 실측(scale=10):
+#   SECS=6  (페이지당 0.88회): FPI제외 319 → 403 → 377 → 481 B  ← ②가 ③보다 크다(이야기가 거꾸로)
+#   SECS=45 (페이지당 9.2회) : FPI제외 401 → 417 → 571 → 800 B  ← 단조 증가, 의도한 모양
+SECS="${SECS:-45}"
 CLIENTS="${CLIENTS:-8}"
 JOBS="${JOBS:-4}"
 SCALE="${SCALE:-10}"
@@ -157,8 +161,7 @@ if [ "$TOTMB" -gt 0 ] && [ "${NMEAS:-0}" -gt 0 ]; then
     echo
     echo "         작은 규모에서 재라 — 이 실습이 보이려는 것(HOT, fillfactor, WAL)은"
     echo "         규모가 아니라 **갱신 컬럼과 페이지 여유**가 정한다:"
-    echo "           dropdb pgbench_lab && SCALE=10 $0            # 100만 행, 수 분"
-    echo "           dropdb pgbench_lab && SCALE=10 SECS=45 $0    # 페이지당 갱신을 더 올린다"
+    echo "           dropdb pgbench_lab && SCALE=10 $0      # 100만 행 (SECS 기본 45초)"
     echo "         지금 규모 그대로 강행하려면: FORCE=1 $0"
     exit 1
   fi
@@ -326,6 +329,13 @@ UPP=$(awk -v t="${BEST_T[$L1]:-0}" -v s="$SECS" -v p="$RELP" \
 echo "   · **페이지당 갱신 ${UPP}회** (기준 ${BEST_T[$L1]:-?} tps × ${SECS}초 ÷ 힙 ${RELP} 페이지)."
 echo "     이 값이 HOT 비율과 FPI 몫을 **둘 다** 정한다 — 같은 페이지를 여러 번 쳐야"
 echo "     (a) 첫 변경만 FPI 가 되고 (b) 페이지 안에 자리가 생겨 HOT 이 산다."
+# 5회를 못 넘으면 필요한 SECS 를 역산해서 준다. "더 길게 돌려라"보다 숫자를 주는 게 낫다.
+if awk -v u="$UPP" 'BEGIN{exit !(u!="?" && u+0<5)}'; then
+  NEED=$(awk -v t="${BEST_T[$L1]:-0}" -v p="$RELP" 'BEGIN{ if(t>0) printf "%d", (5*p/t)+1; else printf "?" }')
+  echo "     ⚠️ **5회에 못 미친다.** 이 규모에서 5회를 넘기려면 **SECS=${NEED}** 이상이어야 한다:"
+  echo "       SECS=${NEED} $0"
+  echo "     짧게 재면 ①의 표가 조건 차이가 아니라 '페이지를 처음 만지는 비용'을 잰다."
+fi
 if awk -v p="$P1" 'BEGIN{exit !(p+0>=95)}'; then
   echo "   · ⚠️ **'FPI 제외' 열을 믿지 마라 — WAL 의 ${P1}% 가 FPI 다.**"
   echo "     wal_fpi 는 장수이지 바이트가 아니고, PostgreSQL 은 FPI 에서 페이지의 빈 공간을"
