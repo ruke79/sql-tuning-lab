@@ -110,11 +110,19 @@ measure() {  # $1=clients $2=on|off
     printf %s "$out" | sed 's/^/         /' | head -8
     exit 1
   fi
-  # 대기 이벤트 상위 1개와 그 비율
-  local top
-  top=$(sort "$f" | grep -v '^$' | uniq -c | sort -rn | head -1 \
-        | awk -v n="$(grep -vc '^$' "$f" 2>/dev/null || echo 1)" \
-              '{printf "%s %d%%", $2, (n>0)? $1*100/n : 0}')
+  # 대기 이벤트. **'(실행중)'을 빼고 세야 한다** — 안 그러면 상위가 전부 (실행중)으로 나와서
+  # '무엇을 기다렸나'를 못 본다. 처음에 그렇게 짰다가 대기 이벤트 열이 무용지물이었다.
+  # 실제로 기다린 비율(대기%)과 그중 최상위 이벤트를 같이 준다.
+  local top ntot nwait
+  ntot=$(grep -vc '^$' "$f" 2>/dev/null); ntot=${ntot:-0}
+  nwait=$(grep -v '^$' "$f" 2>/dev/null | grep -vc '^(실행중)$'); nwait=${nwait:-0}
+  if [ "$nwait" -gt 0 ]; then
+    top=$(grep -v '^$' "$f" | grep -v '^(실행중)$' | sort | uniq -c | sort -rn | head -1 \
+          | awk -v n="$ntot" '{printf "%s %d%%", $2, (n>0)? $1*100/n : 0}')
+    top="$top (대기 $(awk -v a="$nwait" -v b="$ntot" 'BEGIN{printf "%d%%",(b>0)?a*100/b:0}'))"
+  else
+    top="대기 0% (전부 실행중)"
+  fi
   echo "${tps}|${lat}|${top:-(샘플없음)}"
 }
 
