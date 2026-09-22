@@ -198,7 +198,11 @@ RN=$(awk -v a="$(med "${T_OFF[$LAST]}")"  -v b="$(med "${T_ON[$LAST]}")"  'BEGIN
 WALC=""; LOCKC=""
 for c in $CLIST; do
   printf %s "${W_ON[$c]:-}"  | grep -qE "WALSync|WALWrite" && WALC="$WALC $c"
-  printf %s "${W_ON[$c]:-}${W_OFF[$c]:-}" | grep -qE "Lock\\." && LOCKC="$LOCKC $c"
+  # **^Lock. 로 앵커해야 한다.** 앵커 없이 Lock\\. 로 잡으면 LWLock.WALWrite 에도 걸린다 —
+  # LWLock 은 경량 락(내부 구조 보호)이고 Lock 은 중량 락(행·테이블)이라 전혀 다른 얘기다.
+  # 실제로 clients=8 의 LWLock.WALWrite 를 "행 락으로 병목이 옮겨 갔다"고 읽었다.
+  { printf %s "${W_ON[$c]:-}" | grep -qE "^Lock\\." || \
+    printf %s "${W_OFF[$c]:-}" | grep -qE "^Lock\\."; } && LOCKC="$LOCKC $c"
 done
 echo "  · fsync 는 비싼가 — off/on 처리량 비: clients=${FIRST} 에서 **${R1}배**, clients=${LAST} 에서 **${RN}배**."
 # **분할상환 판정은 처리량 비가 아니라 WAL 대기 점유율로 한다.**
