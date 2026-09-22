@@ -241,9 +241,14 @@ echo
 echo "  · ${FIRST}→${SECOND} 지연 변화 — on: ${BON} → $(med "${L_ON[$SECOND]}") ms (**${J_ON}배**),"
 echo "    off: ${BOFF} → $(med "${L_OFF[$SECOND]}") ms (**${J_OFF}배**)"
 if awk -v j="$J_ON" 'BEGIN{exit !(j+0>1.2)}'; then
-  if awk -v a="$J_OFF" -v b="$J_ON" 'BEGIN{exit !(a+0 < b*0.6)}'; then
-    echo "    ★ **on 에서만 뛴다 — 그 점프는 fsync 다.** 둘이 되면 서로의 flush 를 기다리느라"
-    echo "      지연이 붙고, 그 뒤로는 분할상환되어 더 안 는다."
+  # **배수끼리 비교하면 안 된다.** J_OFF < J_ON*0.6 으로 썼다가, J_ON=1.61 / J_OFF=1.03
+  # (= off 는 사실상 안 뛴 것)인 실행을 "off 도 뛴다, fsync 가 아니다"로 읽었다.
+  # 점프가 조금이라도 있으면 J_OFF >= 1 이므로 그 식은 1.03 < 0.966 을 요구한다 —
+  # **사실상 절대 안 켜지는 가지였다.** 1 을 넘는 **초과분**을 비교해야 한다.
+  EXC=$(awk -v a="$J_OFF" -v b="$J_ON" 'BEGIN{printf "%.0f", (b>1)? (a-1)*100/(b-1) : 100}')
+  if [ "${EXC:-100}" -lt 40 ]; then
+    echo "    ★ **on 에서만 뛴다 — 그 점프는 fsync 다.** off 의 상승폭은 on 의 ${EXC}% 뿐이다."
+    echo "      둘이 되면 서로의 flush 를 기다리느라 지연이 붙고, 그 뒤로는 분할상환되어 더 안 는다."
   else
     echo "    ★ **off 로 바꿔도 점프가 남는다.** fsync 가 아니다 — 커밋을 안 기다려도 직렬화되는"
     echo "      지점이 있다는 뜻이고, 후보는 WAL 삽입 락이나 같은 행/페이지 경합이다."
@@ -270,7 +275,19 @@ for c in $CLIST; do
 done
 if [ -n "$WALC" ]; then
   echo "    ★ **clients=${WALC# } 에서 on 쪽 최상위 대기가 WAL flush 다 — 추론이 아니라 관측이다.**"
-  echo "      off 쪽에는 안 나온다. 위 처리량 차이의 원인이 fsync 라는 것이 여기서 확정된다."
+  # off 쪽에도 WAL 계열이 뜨는 실행이 있다(LWLock.WALInsert). '없다'고 단정하지 말고 확인한다.
+  WOFFC=""
+  for c in $CLIST; do
+    printf %s "${W_OFF[$c]:-}" | grep -qE "WALSync|WALWrite|WALInsert" && WOFFC="$WOFFC $c"
+  done
+  if [ -z "$WOFFC" ]; then
+    echo "      off 쪽에는 안 나온다. 위 처리량 차이의 원인이 fsync 라는 것이 여기서 확정된다."
+  else
+    echo "      off 쪽에도 clients=${WOFFC# } 에서 WAL 계열이 뜨는데 **종류가 다르다** —"
+    echo "      on 은 flush(WALSync/WALWrite) 를, off 는 주로 **삽입(WALInsert)** 을 기다린다."
+    echo "      커밋이 디스크를 안 기다려도 WAL 버퍼에 쓰는 일 자체는 남기 때문이다 —"
+    echo "      **fsync 를 꺼서 얻을 수 있는 상한이 거기서 정해진다.**"
+  fi
   if [ -n "$LOCKC" ]; then
     echo "    ★ 그런데 clients=${LOCKC# } 에서는 Lock 계열이 올라온다 — **병목이 옮겨 간 것**이다."
     echo "      fsync 는 동시성이 오르면 분할상환되지만 행 락은 반대로 심해진다. 그래서"
