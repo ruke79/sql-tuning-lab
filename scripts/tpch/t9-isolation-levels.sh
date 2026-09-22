@@ -297,7 +297,7 @@ echo "  고객 ${NCUST}명으로 좁혀 경합을 만든다. lineitem 은 넣고
 echo
 printf "  %s%s %10s %10s %10s\n" "$(padr 격리수준 18)" "$(padr 재시도 20)" "$(padl TPS 10)" "$(padl 실패 10)" "$(padl 재시도수 10)"
 printf "  %s\n" "-------------------------------------------------------------------------"
-declare -A T1
+declare -A T1 FAIL1 NTX1
 for e in "${LEVELS[@]}"; do
   LVL="${e%%:*}"; LBL="${e#*:}"
   for MT in 1 10; do
@@ -319,7 +319,13 @@ for e in "${LEVELS[@]}"; do
     fi
     FAIL=$(echo "$R" | grep -oE "number of failed transactions: [0-9]+" | grep -oE "[0-9]+" | head -1)
     RETR=$(echo "$R" | grep -oE "number of transactions retried: [0-9]+" | grep -oE "[0-9]+" | head -1)
-    [ "$MT" = 1 ] && { T1["$LBL"]="$TPS"; RL="없음 (max-tries=1)"; } || RL="있음 (max-tries=10)"
+    if [ "$MT" = 1 ]; then
+      T1["$LBL"]="$TPS"; FAIL1["$LBL"]="${FAIL:-0}"
+      # 표본 크기 = tps × 초. 실패 '건수'는 이것에 비례하므로, 건수만 보고
+      # 배수를 말하면 규모가 다른 실행끼리 비교가 안 된다 — 비율로 바꿔 둔다.
+      NTX1["$LBL"]=$(awk -v t="${TPS:-0}" -v s="$SECS" 'BEGIN{printf "%.0f", t*s}')
+      RL="없음 (max-tries=1)"
+    else RL="있음 (max-tries=10)"; fi
     printf "  %s%s %10s %10s %10s\n" "$(padr "$LBL" 18)" "$(padr "$RL" 20)" \
       "$(printf '%.0f' "${TPS:-0}")" "${FAIL:-?}" "${RETR:-0}"
   done
@@ -328,7 +334,13 @@ echo
 echo "  읽는 법 — **실패 열이 이 절의 핵심이다.**"
 echo "   · READ COMMITTED 는 실패가 0 이다. FOR SHARE 가 기다렸다 읽으므로 재시도할 일이 없다."
 echo "   · REPEATABLE READ 는 실패가 생기지만 적고, 재시도하면 전부 복구되며 TPS 도 거의 안 준다."
-echo "   · SERIALIZABLE 은 실패가 RR 의 10배 수준으로 뛴다. RR 은 '내가 잠근 행이 바뀌었다'만 잡지만"
+# 배수를 박아 두지 않는다 — 재서 쓴다. 참고로 두 규모에서 8배 안팎으로 일관됐다
+# (SF=0.5: 151/19 = 7.9배, SF=10: 17/2 = 8.5배). 그래도 '10배'라고 고정하지는 않는다.
+# 키는 **표시용 라벨**이다(LEVELS 의 'serializable:SERIALIZABLE' 에서 오른쪽).
+# 소문자 키로 읽었다가 set -u 아래에서 unbound variable 로 죽었다.
+SERR=$(awk -v a="${FAIL1[SERIALIZABLE]:-0}" -v b="${FAIL1[REPEATABLE READ]:-0}" \
+        'BEGIN{ if (b+0>0) printf "%.1f배", a/b; else print "(RR 실패 0 이라 계산 불가)" }')
+echo "   · SERIALIZABLE 은 실패가 RR 의 **${SERR}** 다. RR 은 '내가 잠근 행이 바뀌었다'만 잡지만"
 echo "     SER 은 **읽기-쓰기 의존성까지** 잡기 때문이다. 재시도를 붙이면 대부분 복구되는 대신"
 echo "     그만큼 일을 두 번 하므로 TPS 가 떨어지고, 10번을 다 쓰고도 실패하는 것이 남을 수 있다."
 echo "   → **재시도 정책이 없는 애플리케이션에 SERIALIZABLE 을 켜는 것은 설정이 아니라 사고다.**"
@@ -349,7 +361,14 @@ DR=$(q "WITH truth AS (
  SELECT (SELECT count(*) FROM (SELECT * FROM truth EXCEPT SELECT * FROM lineitem_denorm) x)
       + (SELECT count(*) FROM (SELECT * FROM lineitem_denorm EXCEPT SELECT * FROM truth) y)")
 LEFT=$(q "SELECT count(*) FROM lineitem WHERE l_comment='t9iso'")
-echo "  ②에서 직렬화 실패를 수백 건 낸 뒤의 상태:"
+# "수백 건"이 박혀 있었다. SF=10 에서는 19건이었다 — 규모가 바뀌면 건수도 바뀐다.
+TOTF=$(( ${FAIL1[REPEATABLE READ]:-0} + ${FAIL1[SERIALIZABLE]:-0} ))
+echo "  ②에서 직렬화 실패를 ${TOTF}건 낸 뒤의 상태:"
+if [ "${NTX1[SERIALIZABLE]:-0}" -lt 300 ]; then
+  echo "  ※ 이번 실행은 조건당 약 ${NTX1[SERIALIZABLE]}건밖에 못 돌았다(${SECS}초 × ${T1[SERIALIZABLE]:-0} tps)."
+  echo "    실패 **건수**는 그만큼 작게 나온다 — 규모가 다른 실행과는 건수가 아니라"
+  echo "    **비율**로 비교할 것(이번 SER 실패율 $(awk -v f="${FAIL1[SERIALIZABLE]:-0}" -v n="${NTX1[SERIALIZABLE]:-1}" 'BEGIN{printf "%.0f%%", f*100/n}'))."
+fi
 echo "    파생 테이블 불일치 행: $DR   (0 이어야 한다)"
 echo "    남은 실험용 lineitem: $LEFT   (0 이어야 한다)"
 echo
