@@ -49,6 +49,10 @@ for a in "$@"; do
   esac
 done
 
+# **명시적으로 준 값인지 기억해 둔다.** 아래 재적재에서 generate 를 돌릴지 말지가
+# 여기에 달렸다 — 안 준 경우에는 디스크의 기존 데이터 파일을 존중한다.
+SF_GIVEN="${SF+1}"
+SALES_GIVEN="${SALES+1}"
 SF="${SF:-0.5}"
 SALES="${SALES:-2000000}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -258,9 +262,19 @@ if [ -n "$TPCH_N" ] && [ "$TPCH_N" -gt 0 ] && [ "$MODE" != "--force-tpch" ]; the
   fi
 else
   if [ "$MODE" = "--check" ]; then warn "tpch 가 비어 있다"; else
-    act "tpch 재적재 (SF=$SF — 문서 실측표의 조건)"
-    gen tpch "generate --sf=$SF --dir=./data/tpch" "schema --db=postgres" \
-             "load --db=postgres --dir=./data/tpch" "index --db=postgres"
+    # **기존 데이터 파일을 함부로 덮지 않는다.** 예전에는 --force-tpch 가 무조건
+    # generate 를 돌려, SF=10 으로 만들어 둔 .tbl 을 기본값 SF=0.5 로 갈아엎었다.
+    # 사용자가 41분 걸려 만든 데이터가 그렇게 날아갔다. MySQL 경로에는 이 가드를
+    # 넣어 두고 PostgreSQL 경로에만 안 넣었던 자리다.
+    if [ -s "$HERE/tpch/data/tpch/lineitem.tbl" ] && [ -z "$SF_GIVEN" ]; then
+      act "tpch 재적재 — 기존 데이터 파일을 그대로 쓴다 (lineitem.tbl $(du -h "$HERE/tpch/data/tpch/lineitem.tbl" | cut -f1))"
+      say "     다른 스케일로 **다시 만들려면** 스케일을 명시한다: SF=10 $0 --force-tpch"
+      gen tpch "schema --db=postgres" "load --db=postgres --dir=./data/tpch" "index --db=postgres"
+    else
+      act "tpch 재적재 (SF=$SF — 데이터 파일부터 새로 만든다)"
+      gen tpch "generate --sf=$SF --dir=./data/tpch" "schema --db=postgres" \
+               "load --db=postgres --dir=./data/tpch" "index --db=postgres"
+    fi
     ok "tpch lineitem $(t_sql tpch "SELECT count(*) FROM lineitem") 행"; CHANGED=1
   fi
 fi
@@ -280,8 +294,14 @@ if [ -n "$TPCDS_N" ] && [ "$TPCDS_N" -gt 0 ]; then
   fi
 else
   if [ "$MODE" = "--check" ]; then warn "tpcds 가 비어 있다"; else
-    act "tpcds 재적재 (store_sales $SALES 행)"
-    gen tpcds "generate --sales=$SALES" "schema --db=postgres" "load --db=postgres" "index --db=postgres"
+    if [ -s "$HERE/tpcds/data/tpcds/store_sales.dat" ] && [ -z "$SALES_GIVEN" ]; then
+      act "tpcds 재적재 — 기존 데이터 파일을 그대로 쓴다 ($(du -h "$HERE/tpcds/data/tpcds/store_sales.dat" | cut -f1))"
+      say "     다시 만들려면 행수를 명시한다: SALES=5000000 $0"
+      gen tpcds "schema --db=postgres" "load --db=postgres" "index --db=postgres"
+    else
+      act "tpcds 재적재 (store_sales $SALES 행 — 데이터 파일부터 새로 만든다)"
+      gen tpcds "generate --sales=$SALES" "schema --db=postgres" "load --db=postgres" "index --db=postgres"
+    fi
     ok "tpcds store_sales $(t_sql tpcds "SELECT count(*) FROM store_sales") 행"; CHANGED=1
   fi
 fi
