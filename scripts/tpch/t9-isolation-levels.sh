@@ -99,8 +99,25 @@ dispw() { local b k; b=$(printf %s "$1" | wc -c); k=$(printf %s "$1" | LC_ALL=C 
 padr()  { local n; n=$(dispw "$1"); printf "%s" "$1"; while [ "$n" -lt "$2" ]; do printf " "; n=$((n+1)); done; }
 padl()  { local n; n=$(dispw "$1"); while [ "$n" -lt "$2" ]; do printf " "; n=$((n+1)); done; printf "%s" "$1"; }
 
-PGBV=$(PGBENCH --version 2>/dev/null | grep -oE "[0-9]+" | head -1)
-[ -n "$PGBV" ] || { echo "  [중단] pgbench 를 찾을 수 없습니다 (경로: $PG_VIA)."; exit 1; }
+# **버전 확인에는 PGBENCH 래퍼를 쓰면 안 된다.** 래퍼가 -U 를 앞에 끼워 넣는데,
+# pgbench 는 다른 옵션이 앞서면 --version 을 거부한다:
+#   pgbench --version          → pgbench (PostgreSQL) 16.13
+#   pgbench -U tuner --version → unrecognized option '--version'
+# 그래서 "pgbench 를 찾을 수 없습니다" 가 찍혔다 — 컨테이너에 멀쩡히 있는데도.
+# 메타 옵션은 인자를 안 끼우고 그대로 부른다.
+if [ "$PG_VIA" = host ]; then
+  pgbench_ver(){ pgbench --version 2>&1; }
+else
+  pgbench_ver(){ docker exec -i "$CONTAINER" pgbench --version 2>&1; }
+fi
+PGBVRAW=$(pgbench_ver)
+PGBV=$(printf %s "$PGBVRAW" | grep -oE "[0-9]+" | head -1)
+if [ -z "$PGBV" ]; then
+  echo "  [중단] pgbench 버전을 읽지 못했습니다 (경로: $PG_VIA)."
+  echo "         받은 출력: ${PGBVRAW:-(없음)}"
+  [ "$PG_VIA" = docker ] && echo "         확인: docker exec -i $CONTAINER pgbench --version"
+  exit 1
+fi
 if [ "${PGBV:-0}" -lt 14 ]; then
   echo "  [중단] pgbench $PGBV 입니다. --max-tries 는 14 이상에서만 됩니다 — ②를 잴 수 없습니다."
   exit 1
