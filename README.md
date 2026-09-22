@@ -111,6 +111,33 @@ cd docker && docker compose up -d && cd ..
 > (호스트 설치판이면 `./scripts/restore-lab.sh`) 를 먼저 돌린다.
 > Kafka 케이스는 브로커가 없으면 실패가 아니라 `SKIPPED` 로 넘어간다(정상).
 
+> **`Failed to exec spawn helper` 로 `bootRun` 이 안 뜬다면 — JDK 가 바뀐 것이다.**
+> ```
+> Caused by: java.io.IOException: Cannot run program ".../bin/java" ...
+>   Failed to exec spawn helper: pid: 1032364, exit code: 1, error: 0 (none)
+> ```
+> 리눅스에서 JDK 의 기본 프로세스 생성 방식(`POSIX_SPAWN`)은 `$JAVA_HOME/lib/jspawnhelper`
+> 를 `exec` 한 뒤 파이프로 **핸드셰이크**를 한다. 실행 중인 JVM 의 `java` 와 디스크의
+> `jspawnhelper` 가 **다른 JDK 빌드**면 그 핸드셰이크가 깨진다. 즉 오래 떠 있던 Gradle
+> 데몬이 옛 JDK 를 물고 있는데 그 사이 JDK 가 교체된 상황이다. DB 와 무관하다.
+>
+> ```bash
+> ./gradlew --stop          # 데몬 종료 → 다음 실행은 현재 JDK 로 새 JVM
+> pkill -f GradleDaemon     # 그래도 남으면
+> ./gradlew --no-daemon :tpch:bootRun --args="..."   # 일회성
+> ```
+>
+> **실측 확인**: 실패 직전 실행 로그는 `Java 21.0.12`, 데몬을 내리고 성공한 실행은
+> `Java 21.0.12.1` 이었다. 그 사이 JDK 가 in-place 로 올라간 것이 로그에 그대로 남았다.
+> 같은 증상이 반복되면 버전 불일치가 아니라 메모리일 수 있으니 `free -h` 를 본다
+> (`fork`/`spawn` 은 메모리 압박에서도 실패한다).
+>
+> 끝까지 안 풀리면 `jspawnhelper` 를 아예 안 쓰게 할 수 있다 — `gradle.properties` 에서:
+> ```properties
+> org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8 -Djdk.lang.Process.launchMechanism=vfork
+> ```
+> `vfork`/`fork` 는 헬퍼를 거치지 않는다(JDK 21 에서 세 방식 모두 동작함을 확인했다).
+
 > **컨테이너·VM 이 재생성된 뒤 복구.** 호스트 설치판(`pg_ctlcluster`)과 Docker판
 > (`tuninglab-postgres`) 둘 다 다룬다 — 스크립트가 어느 쪽인지 알아서 판별한다.
 > ```bash
@@ -298,6 +325,21 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 ```
 
 **1억 건**: `--scale=1000` (Java 적재도 가능하지만 공식이 빠름: `scripts/pgbench/run-official-pgbench.sh init 1000`)
+
+> ⚠️ **`run` 의 `--scale` 은 적재량이 아니라 키를 뽑는 범위다.**
+> `aid = 1 + rnd(scale×100000)`, `tid = 1 + rnd(scale×10)`, `bid = 1 + rnd(scale)`.
+> 적재된 것과 다르면 **에러 하나 없이 다른 것을 재게 된다** — 어느 방향이든 나쁘다:
+>
+> - 준 값이 **크면** → 대부분의 UPDATE 가 0행을 맞춘다. 0행 UPDATE 는 에러가 아니므로
+>   `errors=0` 에 TPS 도 멀쩡히 찍히는데 사실상 아무 일도 안 한 것이다.
+> - 준 값이 **작으면** → 워크로드가 앞쪽 일부에만 몰린다. 캐시에 다 들어가 빨라지고,
+>   `branches` 행이 적어져 **행 락 경합**이 생긴다. 유효하지만 **다른 실험**이다.
+>   (scale=2000 적재에 `--scale=10` 을 준 실행에서 TPS 가 721 → 1,376 으로 뛰고
+>   `pgbench_branches` UPDATE 가 평균 1.51ms 로 `accounts` UPDATE(0.032ms)의 **47배**가 됐다.
+>   10개 branch 행을 8 클라이언트가 두고 다퉈서다.)
+>
+> 이제 `run` 이 적재 규모(`pgbench_branches` 행 수)와 비교해 다르면 멈추고 어느 쪽인지
+> 말해 준다. 일부러 어긋나게 돌리려면 `--force=1`.
 
 > **무엇을 잴 수 있고 무엇은 못 재는가** — 제목이 실제보다 많이 약속하고 있어서 고쳐 적는다.
 > `run` 의 워크로드는 **TPC-B 한 종류로 고정**이다(3 UPDATE + 1 SELECT + 1 INSERT).

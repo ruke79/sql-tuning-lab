@@ -60,8 +60,14 @@ public class PgbenchApplication implements CommandLineRunner {
                     new SqlScriptRunner(jdbc).run(new ClassPathResource("sql/schema.sql"));
                     fill(jdbc, scale);
                 }
-                case "run" -> new TpcbWorkload(ds, scale)
-                        .run(args.getInt("clients", 8), args.getInt("seconds", 30));
+                case "run" -> {
+                    // --scale 은 **적재 규모가 아니라 키를 뽑는 범위**다. 적재된 것과 다르면
+                    // 에러 없이 다른 것을 재게 되므로, 다르면 여기서 멈추고 뜻을 물어본다.
+                    if (checkScale(jdbc, scale, args.getInt("force", 0) == 1)) {
+                        new TpcbWorkload(ds, scale)
+                                .run(args.getInt("clients", 8), args.getInt("seconds", 30));
+                    }
+                }
                 case "monitor" -> new PgMonitor(jdbc).report();
                 case "reset-stats" -> {
                     jdbc.execute("SELECT pg_stat_reset()");
@@ -82,6 +88,53 @@ public class PgbenchApplication implements CommandLineRunner {
                         """);
             }
         }
+    }
+
+    /**
+     * run 의 --scale 이 실제 적재 규모와 맞는지 본다. 맞으면 true.
+     *
+     * <p>--scale 은 적재량이 아니라 <b>키를 뽑는 범위</b>다:
+     * {@code aid = 1 + rnd(scale*100000)}, {@code tid = 1 + rnd(scale*10)}, {@code bid = 1 + rnd(scale)}.
+     * 그래서 적재된 것과 다르면 <b>에러 하나 없이 다른 것을 재게 된다</b> — 어느 방향이든 나쁘다:
+     *
+     * <ul>
+     *   <li>준 값이 더 크면 → 대부분의 UPDATE 가 0행을 맞춘다. 0행 UPDATE 는 에러가 아니므로
+     *       {@code errors=0} 에 TPS 도 멀쩡히 찍히는데, 사실상 아무 일도 안 한 것이다.</li>
+     *   <li>준 값이 더 작으면 → 워크로드가 앞쪽 일부에만 몰린다. 캐시에 다 들어가서 빨라지고,
+     *       branches 행이 적어져 <b>행 락 경합</b>이 생긴다. 유효한 실험이지만 <b>다른 실험</b>이고,
+     *       규모를 맞춘 실행과 나란히 놓고 비교하면 안 된다.</li>
+     * </ul>
+     *
+     * <p>적재 규모는 pgbench_branches 의 행 수와 같다(fill 이 scale 개를 넣는다).
+     */
+    private boolean checkScale(JdbcTemplate jdbc, int scale, boolean force) {
+        Integer loaded;
+        try {
+            loaded = jdbc.queryForObject("SELECT count(*) FROM pgbench_branches", Integer.class);
+        } catch (Exception e) {
+            log.error("pgbench_branches 를 읽지 못했습니다 — 먼저 적재하세요: init --scale=N ({})", e.getMessage());
+            return false;
+        }
+        if (loaded == null || loaded == 0) {
+            log.error("pgbench_branches 가 비어 있습니다 — 먼저 적재하세요: init --scale=N");
+            return false;
+        }
+        if (loaded == scale) return true;
+
+        log.error("--scale={} 인데 적재된 규모는 {} 입니다. --scale 은 적재량이 아니라 키 범위입니다.",
+                scale, loaded);
+        if (scale > loaded) {
+            log.error("  준 값이 더 큽니다 → UPDATE 의 약 {}% 가 0행을 맞춥니다.",
+                    String.format("%.1f", 100.0 * (scale - loaded) / scale));
+            log.error("  0행 UPDATE 는 에러가 아니라서 errors=0 에 TPS 도 찍히지만, 사실상 아무 일도 안 합니다.");
+        } else {
+            log.error("  준 값이 더 작습니다 → 워크로드가 앞쪽 1/{} 에만 몰립니다.", loaded / scale);
+            log.error("  캐시에 다 들어가 빨라지고, branches 행이 {}개뿐이라 행 락 경합이 생깁니다.", scale);
+            log.error("  유효한 실험이지만 **다른 실험**입니다 — 규모를 맞춘 실행과 나란히 비교하지 마세요.");
+        }
+        log.error("  맞추려면: run --scale={}", loaded);
+        log.error("  일부러 어긋나게 돌리려면: run --scale={} --force=1", scale);
+        return force;
     }
 
     /** pgbench -i 와 동일한 비율로 데이터 적재: branches=scale, tellers=scale*10, accounts=scale*100000 */
