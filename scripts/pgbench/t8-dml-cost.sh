@@ -145,13 +145,20 @@ if [ "$TOTMB" -gt 0 ] && [ "${NMEAS:-0}" -gt 0 ]; then
     echo "         지금 설정(ROUNDS=$ROUNDS, ONLY=$ONLY)이면 **${NMEAS}회** 재작성한다."
     echo "         실측 ${VF_RATE}MB/s 로 잡으면 **약 $(( EST / 60 ))분** 걸린다 — 벤치마크(${SECS}초×${NMEAS})는 그중 일부일 뿐이다."
     echo
-    echo "         그리고 큰 규모에서는 **측정 자체가 무너진다.** 행이 많아 갱신이 흩어지면"
-    echo "         UPDATE 마다 새 페이지를 건드려 WAL 이 거의 전부 FPI 가 되고,"
-    echo "         'FPI 제외' 열이 큰 두 수의 차가 되어 신호를 못 담는다(음수까지 나온다)."
+    echo "         그리고 이 규모에서는 **측정 자체가 무너진다.** 결정하는 값은"
+    echo "         **페이지당 갱신 횟수 = tps × SECS ÷ 힙 페이지 수** 다."
+    echo "         여기서는 힙만 $(( TOTMB * 8 / 10 ))MB 가 넘으니 페이지가 수백만 장이고,"
+    echo "         ${SECS}초 부하로는 페이지당 1회에 한참 못 미친다. 그러면"
+    echo "           · 모든 변경이 그 페이지의 첫 변경이라 WAL 이 거의 전부 FPI 가 되고"
+    echo "             ('FPI 제외' 열이 큰 두 수의 차가 되어 음수까지 나온다)"
+    echo "           · 페이지에 죽은 튜플 자리가 안 생겨 HOT 도 0% 근처로 죽는다"
+    echo "         실측: scale=10 에서 페이지당 0.88회 → HOT 42.0% / FPI 몫 94.8%,"
+    echo "               페이지당 6.6회 → HOT 89.1% / FPI 몫 71.8%."
     echo
     echo "         작은 규모에서 재라 — 이 실습이 보이려는 것(HOT, fillfactor, WAL)은"
     echo "         규모가 아니라 **갱신 컬럼과 페이지 여유**가 정한다:"
-    echo "           dropdb pgbench_lab && SCALE=10 $0      # 100만 행, 수 분"
+    echo "           dropdb pgbench_lab && SCALE=10 $0            # 100만 행, 수 분"
+    echo "           dropdb pgbench_lab && SCALE=10 SECS=45 $0    # 페이지당 갱신을 더 올린다"
     echo "         지금 규모 그대로 강행하려면: FORCE=1 $0"
     exit 1
   fi
@@ -304,16 +311,32 @@ echo "     새 엔트리를 받으므로, ②에서 조금이던 (filler) 의 �
 # wal_fpi 는 장수이고 바이트가 아니다. PostgreSQL 은 FPI 에서 페이지의 빈 공간을 떼고 싣기
 # 때문에 wal_fpi*8192 는 상한이다. 거의 같은 두 수를 빼면 그 과대평가분만 남고, 실제로
 # 음수가 찍혔다. 그때는 열을 신호라고 말하지 않는다.
+# **FPI 몫과 HOT 비율을 동시에 정하는 변수는 규모가 아니라 '페이지당 갱신 횟수'다.**
+# 같은 페이지를 여러 번 치면 (a) 첫 변경만 FPI 라 FPI 몫이 내려가고,
+# (b) 페이지 안에 죽은 튜플 자리가 생겨 HOT 이 살아난다.
+# 실측(scale=10, 힙 23,256 페이지, 기준 조건):
+#   SECS=6  → 페이지당 0.88회 : HOT 42.0% / FPI 몫 94.8% / FPI제외 316B
+#   SECS=45 → 페이지당 6.6회  : HOT 89.1% / FPI 몫 71.8% / FPI제외 401B
+# scale=2000·SECS=12 은 페이지당 0.004회였고, 거기서 HOT 0.1% / FPI 몫 100%(음수)가 나왔다.
+# 그래서 이 값을 찍고, 낮으면 SECS 를 올리라고 말한다 — 규모를 줄이는 것과 같은 효과다.
+RELP=$(q "SELECT relpages FROM pg_class WHERE relname='pgbench_accounts'")
+case "$RELP" in ''|*[!0-9]*) RELP=0;; esac
+UPP=$(awk -v t="${BEST_T[$L1]:-0}" -v s="$SECS" -v p="$RELP" \
+      'BEGIN{ if(p>0) printf "%.2f", t*s/p; else printf "?" }')
+echo "   · **페이지당 갱신 ${UPP}회** (기준 ${BEST_T[$L1]:-?} tps × ${SECS}초 ÷ 힙 ${RELP} 페이지)."
+echo "     이 값이 HOT 비율과 FPI 몫을 **둘 다** 정한다 — 같은 페이지를 여러 번 쳐야"
+echo "     (a) 첫 변경만 FPI 가 되고 (b) 페이지 안에 자리가 생겨 HOT 이 산다."
 if awk -v p="$P1" 'BEGIN{exit !(p+0>=95)}'; then
-  echo "   · ⚠️ **'FPI 제외' 열을 믿지 마라 — 이 실행에서는 WAL 의 ${P1}% 가 FPI 다.**"
+  echo "   · ⚠️ **'FPI 제외' 열을 믿지 마라 — WAL 의 ${P1}% 가 FPI 다.**"
   echo "     wal_fpi 는 장수이지 바이트가 아니고, PostgreSQL 은 FPI 에서 페이지의 빈 공간을"
   echo "     떼고 싣는다. 그래서 wal_fpi×8192 는 **상한**이고 항상 조금 과대평가다."
   echo "     FPI 가 거의 전부면 뺄셈이 '거의 같은 두 수의 차'가 되어 그 오차만 남는다"
-  echo "     (기준선 ${F1}B — 음수면 그게 증거다)."
-  echo "     왜 이렇게 되나: 행이 많아 갱신이 흩어지면 UPDATE 마다 새 힙 페이지 + 새 인덱스"
-  echo "     리프를 건드리고, CHECKPOINT 직후라 둘 다 첫 변경이라 둘 다 FPI 가 된다."
-  echo "     → **작은 규모에서 다시 재라.** 같은 갱신이 좁은 페이지 집합을 반복해서 치면"
-  echo "       FPI 비중이 내려가고 이 열이 의미를 갖는다. 이 실행에서는 HOT 비율만 보라."
+  echo "     (기준선 ${F1}B — 음수면 그게 증거다). 이 실행에서는 **HOT 비율만** 보라."
+  echo "     → 고치는 법: **SECS 를 늘려라**(페이지당 갱신을 5회 이상으로). 규모를 줄여도 같다."
+elif awk -v p="$P1" 'BEGIN{exit !(p+0>=85)}'; then
+  echo "   · ※ FPI 몫이 ${P1}% 로 높다. 'FPI 제외'(기준선 ${F1}B)가 전체 WAL 의 $(awk -v f="$F1" -v w="${BEST_W[$L1]:-1}" 'BEGIN{printf "%.0f%%", f*100/w}') 뿐이라"
+  echo "     조건 간 차이를 노이즈와 가르기 어렵다. **SECS 를 늘려 다시 보라** —"
+  echo "     실측으로 SECS 6→45(페이지당 0.88→6.6회)에서 FPI 몫이 94.8%→71.8% 로 내려갔다."
 else
   echo "   · **FPI 제외 열이 이 실습의 신호다**(FPI 몫 ${P1}%). 전체 WAL 은 체크포인트 직후의"
   echo "     전체 페이지 이미지가 상당 부분을 차지해 조건 차이를 덮는다. 빼고 나면 인덱스"
