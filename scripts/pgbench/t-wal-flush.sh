@@ -195,16 +195,30 @@ LAST=$(echo $CLIST | awk '{print $NF}')
 R1=$(awk -v a="$(med "${T_OFF[$FIRST]}")" -v b="$(med "${T_ON[$FIRST]}")" 'BEGIN{printf "%.2f",(b>0)?a/b:0}')
 RN=$(awk -v a="$(med "${T_OFF[$LAST]}")"  -v b="$(med "${T_ON[$LAST]}")"  'BEGIN{printf "%.2f",(b>0)?a/b:0}')
 echo "  · fsync 는 비싼가 — off/on 처리량 비: clients=${FIRST} 에서 **${R1}배**, clients=${LAST} 에서 **${RN}배**."
+# **분할상환 판정은 처리량 비가 아니라 WAL 대기 점유율로 한다.**
+# 처음에 비로 판정했다가 "분할상환이 안 되고 있다"고 썼는데, 같은 출력의 대기 점유율은
+# 51% → 29% → 20% 로 분명히 줄고 있었다 — 두 문장이 서로 모순됐다.
+# 비가 안 줄어드는 것은 분할상환이 없어서가 아니라, on 이 WAL 천장에 닿는 동안
+# off 는 계속 확장해서 격차가 유지되기 때문이다. 둘은 다른 얘기다.
+pct() { printf %s "${1:-}" | grep -oE '[0-9]+%' | head -1 | tr -d '%'; }
+SH1=$(pct "${W_ON[$FIRST]:-}"); SHN=$(pct "${W_ON[$LAST]:-}")
 if awk -v r="$R1" 'BEGIN{exit !(r+0<=1.2)}'; then
   echo "    ★ 가장 낮은 동시성에서도 차이가 없다 — **이 장비의 fsync 는 싸다**(쓰기 캐시·NVMe)."
   echo "      여기서는 synchronous_commit 으로 얻을 것이 없다."
-elif awk -v a="$RN" -v b="$R1" 'BEGIN{exit !(a+0 < b*0.7)}'; then
-  echo "    ★ **fsync 는 비싼데, 동시성이 오르면 그 값이 줄어든다** (${R1}배 → ${RN}배)."
-  echo "      그룹 커밋이다 — 혼자면 커밋마다 자기 fsync 를 끝까지 기다리지만, 여럿이면"
-  echo "      한 번의 flush 가 여러 커밋을 함께 실어 나른다. **fsync 비용은 동시성이 갚아 준다.**"
 else
-  echo "    ★ fsync 가 비싸고(${R1}배) 동시성이 올라도 그대로다(${RN}배) — 분할상환이 안 되고 있다."
-  echo "      commit_delay/commit_siblings 나 저장장치 쪽을 봐야 한다."
+  echo "    ★ **fsync 는 비싸다.** 가장 낮은 동시성에서 이미 ${R1}배 차다."
+  if [ -n "${SH1:-}" ] && [ -n "${SHN:-}" ] && [ "$SHN" -lt "$SH1" ]; then
+    echo "      그리고 WAL 대기 점유율이 clients=${FIRST} 의 ${SH1}% 에서 clients=${LAST} 의 ${SHN}% 로"
+    echo "      **줄어든다 — 그룹 커밋이 돌고 있다.** 여럿이 커밋하면 한 번의 flush 가 여러 커밋을"
+    echo "      함께 실어 나르므로, 커밋 하나가 무는 fsync 비용이 동시성으로 갚아진다."
+  fi
+  if awk -v a="$RN" -v b="$R1" 'BEGIN{exit !(a+0 >= b*0.9)}'; then
+    echo "      그런데 **처리량 격차는 안 줄어든다**(${R1}배 → ${RN}배). 분할상환이 없어서가 아니라,"
+    echo "      on 이 WAL flush 속도라는 천장에 닿는 동안 off 는 계속 확장하기 때문이다 —"
+    echo "      위 표의 on tps 가 어디서 평평해지는지 보라. 그 값이 이 장비의 커밋 상한이다."
+  else
+    echo "      처리량 격차도 ${R1}배 → ${RN}배로 줄어든다 — 분할상환이 격차까지 좁히고 있다."
+  fi
 fi
 echo
 echo "  · ${FIRST}→${SECOND} 지연 변화 — on: ${BON} → $(med "${L_ON[$SECOND]}") ms (**${J_ON}배**),"
