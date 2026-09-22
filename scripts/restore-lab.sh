@@ -65,13 +65,51 @@ warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
 act()  { printf "  \033[36m→\033[0m %s\n" "$*"; }
 CHANGED=0
 
-as_pg()  { sudo -u postgres psql -X -q -tAc "$1" 2>/dev/null; }
-as_pgc() { sudo -u postgres psql -X -q -c "$1" 2>&1; }
-t_sql()  { PGPASSWORD=tuner psql -h localhost -U tuner -d "$1" -X -q -tAc "$2" 2>/dev/null; }
-
 # 호스트 설치냐 Docker 냐 — 기동/재기동 방법만 다르다. 둘 다 없으면 그렇게 말한다.
 have()      { command -v "$1" >/dev/null 2>&1; }
 dk_exists() { have docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
+
+# **클라이언트가 호스트에 없을 수 있다.** 실습 스크립트 8개에는 이 분기를 넣어 놓고
+# 정작 이 파일은 안 고쳤다가, Docker 로 돌리는 환경에서 이렇게 나왔다:
+#   ! 클러스터 down        ← pg_isready 가 없는 것뿐이고 서버는 멀쩡했다
+# 바로 앞에서 gradlew schema/load/index 가 JDBC 로 성공한 직후였다.
+# **'도구가 없다'를 '서버가 죽었다'로 보고하면 안 된다.**
+PGCON="${PGCON:-tuninglab-postgres}"
+if have psql; then
+  PG_VIA=host
+elif dk_exists "$PGCON"; then
+  PG_VIA=docker
+else
+  PG_VIA=none
+fi
+# 슈퍼유저 접속: 호스트 설치는 OS 롤(postgres), compose 는 POSTGRES_USER=tuner 가 슈퍼유저다.
+as_pg()  {
+  case "$PG_VIA" in
+    host)   sudo -u postgres psql -X -q -tAc "$1" 2>/dev/null ;;
+    docker) docker exec -i -e PGPASSWORD=tuner "$PGCON" psql -U tuner -d postgres -X -q -tAc "$1" 2>/dev/null ;;
+  esac
+}
+as_pgc() {
+  case "$PG_VIA" in
+    host)   sudo -u postgres psql -X -q -c "$1" 2>&1 ;;
+    docker) docker exec -i -e PGPASSWORD=tuner "$PGCON" psql -U tuner -d postgres -X -q -c "$1" 2>&1 ;;
+  esac
+}
+t_sql()  {
+  case "$PG_VIA" in
+    host)   PGPASSWORD=tuner psql -h localhost -U tuner -d "$1" -X -q -tAc "$2" 2>/dev/null ;;
+    docker) docker exec -i -e PGPASSWORD=tuner "$PGCON" psql -U tuner -d "$1" -X -q -tAc "$2" 2>/dev/null ;;
+  esac
+}
+# pg_isready 도 psql 과 같은 패키지에 들어 있다 — 없으면 쿼리로 대신 확인한다.
+pg_up() {
+  case "$PG_VIA" in
+    host)   pg_isready -h localhost -p 5432 >/dev/null 2>&1 ;;
+    docker) [ "$(as_pg "SELECT 1" | tr -d ' ')" = "1" ] ;;
+    *)      return 1 ;;
+  esac
+}
+
 pg_start() {
   if have pg_ctlcluster; then
     # 컨테이너가 죽을 때 남은 pid 파일이 기동을 막는다 — pg_ctlcluster 가 알아서 치운다
@@ -103,8 +141,16 @@ fi
 say "랩 환경 점검 — $HERE"
 say
 
+if [ "$PG_VIA" = none ]; then
+  warn "psql 도 $PGCON 컨테이너도 없다 — 점검할 방법이 없다. 둘 중 하나:"
+  say  "       sudo apt install postgresql-client"
+  say  "       docker compose -f docker/docker-compose.yml up -d postgres"
+  exit 1
+fi
+[ "$PG_VIA" = docker ] && ok "호스트에 psql 이 없다 — 컨테이너($PGCON) 안의 것을 쓴다"
+
 # ── 1) 클러스터 ───────────────────────────────────────────────────────
-if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
+if pg_up; then
   ok "PostgreSQL 클러스터 online"
 else
   if [ "$MODE" = "--check" ]; then
@@ -113,13 +159,13 @@ else
     act "클러스터를 기동한다"
     pg_start
     sleep 2
-    pg_isready -h localhost -p 5432 >/dev/null 2>&1 \
+    pg_up \
       && { ok "클러스터 기동됨"; CHANGED=1; } \
       || { warn "기동 실패 — 호스트 설치면 /var/log/postgresql/postgresql-16-main.log,"
            warn "           Docker 면 docker logs tuninglab-postgres"; exit 1; }
   fi
 fi
-pg_isready -h localhost -p 5432 >/dev/null 2>&1 || { warn "클러스터가 없으면 아래를 볼 수 없다"; exit 1; }
+pg_up || { warn "클러스터가 없으면 아래를 볼 수 없다"; exit 1; }
 
 # ── 2) 롤 ─────────────────────────────────────────────────────────────
 if [ "$(as_pg "SELECT 1 FROM pg_roles WHERE rolname='tuner'")" = "1" ]; then
