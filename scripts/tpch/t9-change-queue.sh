@@ -98,9 +98,14 @@ pg_stage() {
   docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
   printf %s "/tmp/$(basename "$1")"
 }
+
+
 pg_precheck
 
 sql(){ PSQL -tAc "$1"; }
+# ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
+scale_guard "$(sql "SELECT count(*) FROM lineitem")" 17 "$0"
 # timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
 #   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
 # **래퍼를 거쳐야 한다.** 여기만 psql 을 직접 불렀다가, 호스트에 클라이언트가 없는
@@ -309,12 +314,31 @@ refill(){ sql "TRUNCATE lineitem_denorm; TRUNCATE denorm_queue; TRUNCATE denorm_
 natural(){ sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
                  WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1; }
 setsize(){ natural; sql "UPDATE orders SET o_custkey=1 WHERE o_orderkey <= $1;" >/dev/null 2>&1; }
-drift(){ sql "WITH truth AS (SELECT l.l_orderkey,l.l_linenumber,c.c_mktsegment,o.o_orderdate,o.o_shippriority
-              FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey
-                              JOIN customer c ON o.o_custkey=c.c_custkey),
-              d AS (SELECT l_orderkey,l_linenumber,c_mktsegment,o_orderdate,o_shippriority FROM lineitem_denorm)
-   SELECT (SELECT count(*) FROM (SELECT * FROM truth EXCEPT SELECT * FROM d) x)
-        + (SELECT count(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM truth) y)"; }
+# ── 드리프트 검사: 2단계 ───────────────────────────────────────────────
+# 예전에는 바로 **양방향 EXCEPT** 를 던졌다. 양쪽 6,000만 행을 정렬·해시하는 일이라
+# work_mem 을 넘는 순간 선형을 벗어난다 — SF=10 에서 사용자가 이 쿼리 하나에 갇혔다
+# (pg_stat_activity 상 wait_event 없음 = 락 대기 0, 순수한 일의 양이었다).
+#
+# 1단계: 행수 + 체크섬. **정렬이 없어** 각 한 번씩 훑으면 끝난다.
+#        SF=0.5 실측 EXCEPT 11.0초 vs 체크섬 6.1초이고, 규모가 커질수록 차이가 벌어진다
+#        (한쪽은 정렬, 다른 쪽은 스캔이라서). 같으면 0 으로 확정하고 끝낸다.
+# 2단계: 다를 때만 정확한 건수를 센다 — 틀린 걸 확인했으면 비용을 치를 값이 있다.
+DRIFT_TRUTH="SELECT l.l_orderkey,l.l_linenumber,c.c_mktsegment,o.o_orderdate,o.o_shippriority
+             FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey
+                             JOIN customer c ON o.o_custkey=c.c_custkey"
+drift(){
+  local same
+  same=$(sql "WITH truth AS ($DRIFT_TRUTH)
+    SELECT CASE WHEN (SELECT count(*) FROM truth) = (SELECT count(*) FROM lineitem_denorm)
+                 AND (SELECT sum(hashtext(t::text)::bigint) FROM truth t)
+                   = (SELECT sum(hashtext(d::text)::bigint) FROM lineitem_denorm d)
+                THEN 1 ELSE 0 END")
+  [ "$same" = "1" ] && { echo 0; return; }
+  sql "WITH truth AS ($DRIFT_TRUTH),
+            d AS (SELECT l_orderkey,l_linenumber,c_mktsegment,o_orderdate,o_shippriority FROM lineitem_denorm)
+       SELECT (SELECT count(*) FROM (SELECT * FROM truth EXCEPT SELECT * FROM d) x)
+            + (SELECT count(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM truth) y)"
+}
 mn(){ echo "$1"|tr ' ' '\n'|grep -v '^$'|sort -g|head -1; }
 
 # ── ① 단일 세션 쓰기 지연 ─────────────────────────────────────────────

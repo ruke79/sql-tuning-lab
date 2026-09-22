@@ -115,9 +115,14 @@ pg_stage() {
   docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
   printf %s "/tmp/$(basename "$1")"
 }
+
+
 pg_precheck
 
 sql(){ PSQL -tAc "$1"; }
+# ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
+scale_guard "$(sql "SELECT count(*) FROM lineitem")" 4 "$0"
 
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
 [ "${NIDX:-0}" -lt 2 ] && { echo "  [중단] index 를 먼저 실행하세요."; exit 1; }

@@ -90,9 +90,14 @@ pg_stage() {
   docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
   printf %s "/tmp/$(basename "$1")"
 }
+
+
 pg_precheck
 
 sql(){ PSQL -tAc "$1"; }
+# ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
+scale_guard "$(sql "SELECT count(*) FROM lineitem")" 4 "$0"
 
 # ── 선행 조건 점검 ────────────────────────────────────────────────────
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
@@ -301,13 +306,25 @@ trg(){ if [ "$1" = on ]; then A=ENABLE; else A=DISABLE; fi
   sql "ALTER TABLE lineitem $A TRIGGER t_sync_li; ALTER TABLE orders $A TRIGGER t_sync_ord;
        ALTER TABLE customer $A TRIGGER t_sync_cust;" >/dev/null 2>&1; }
 
-drift(){ sql "WITH truth AS (
-   SELECT l.l_orderkey,l.l_linenumber,l.l_extendedprice,l.l_discount,l.l_shipdate,
-          c.c_mktsegment,o.o_orderdate,o.o_shippriority
-   FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey
-                   JOIN customer c ON o.o_custkey=c.c_custkey)
- SELECT (SELECT count(*) FROM (SELECT * FROM truth EXCEPT SELECT * FROM lineitem_denorm) x)
-      + (SELECT count(*) FROM (SELECT * FROM lineitem_denorm EXCEPT SELECT * FROM truth) y)"; }
+# 드리프트 검사는 2단계다 — 싼 체크섬으로 먼저 보고, 다를 때만 정확히 센다.
+# 양방향 EXCEPT 는 양쪽을 정렬·해시하므로 work_mem 을 넘으면 선형을 벗어난다.
+# SF=10 에서 이 쿼리 하나에 갇힌 사례가 있었다(락 대기 0, 순수한 일의 양).
+DRIFT_TRUTH="SELECT l.l_orderkey,l.l_linenumber,l.l_extendedprice,l.l_discount,l.l_shipdate,
+                    c.c_mktsegment,o.o_orderdate,o.o_shippriority
+             FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey
+                             JOIN customer c ON o.o_custkey=c.c_custkey"
+drift(){
+  local same
+  same=$(sql "WITH truth AS ($DRIFT_TRUTH)
+    SELECT CASE WHEN (SELECT count(*) FROM truth) = (SELECT count(*) FROM lineitem_denorm)
+                 AND (SELECT sum(hashtext(t::text)::bigint) FROM truth t)
+                   = (SELECT sum(hashtext(d::text)::bigint) FROM lineitem_denorm d)
+                THEN 1 ELSE 0 END")
+  [ "$same" = "1" ] && { echo 0; return; }
+  sql "WITH truth AS ($DRIFT_TRUTH)
+       SELECT (SELECT count(*) FROM (SELECT * FROM truth EXCEPT SELECT * FROM lineitem_denorm) x)
+            + (SELECT count(*) FROM (SELECT * FROM lineitem_denorm EXCEPT SELECT * FROM truth) y)"
+}
 
 # pgbench 워크로드
 cat > /tmp/t9_concurrent.sql <<'EOF'

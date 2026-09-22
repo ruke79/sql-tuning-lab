@@ -84,6 +84,12 @@ pg_stage() {
   docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
   printf %s "/tmp/$(basename "$1")"
 }
+
+# ── 규모 가드 ── (sql 정의 뒤여야 한다 — 앞에 뒀다가 "sql: command not found" 를 냈다)
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
+# NLI 는 아래(130행)에서 정해지므로 여기서 직접 센다 — 앞에서 쓰면 unbound 다.
+scale_guard "$(q "SELECT count(*) FROM lineitem")" 1 "$0"
+
 pg_precheck
 
 # -f 로 주는 파일은 컨테이너 경로에서 컨테이너 안에 있어야 한다 — pg_stage 가 옮긴다.

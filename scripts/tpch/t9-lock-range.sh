@@ -85,9 +85,14 @@ pg_stage() {
   docker cp "$1" "$CONTAINER:/tmp/$(basename "$1")" >/dev/null 2>&1
   printf %s "/tmp/$(basename "$1")"
 }
+
+
 pg_precheck
 
 sql(){ PSQL -tAc "$1"; }
+# ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
+scale_guard "$(sql "SELECT count(*) FROM lineitem")" 4 "$0"
 # timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
 #   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
 # **래퍼를 거쳐야 한다.** 여기만 psql 을 직접 불렀다가, 호스트에 클라이언트가 없는

@@ -56,6 +56,10 @@ fi
 sql()  { PSQL -tAc "$1"; }
 sqlv() { PSQL -c "$1"; }
 
+# ── 규모 가드 ──────────────────────────────────────────────────────────
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
+scale_guard "$(sql "SELECT count(*) FROM lineitem")" 2 "$0"
+
 echo "§T-9 트리거 동기화 — ${ROUNDS}라운드"
 echo
 
