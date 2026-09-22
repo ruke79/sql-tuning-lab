@@ -225,9 +225,29 @@ else
 fi
 echo
 # 대기 이벤트는 추론이 아니라 직접 증거다. WAL 계열이 on 쪽에만 있으면 그게 답이다.
-echo "  · 대기 이벤트(직접 증거): on 쪽에 WALWrite/WALSync 가 찍히고 off 쪽에 없으면"
-echo "    위 해석이 추론이 아니라 관측이 된다. IO.DataFileRead 가 크면 그 조건은 아직"
-echo "    캐시가 덜 찬 것이므로 예열을 늘려라(WARM)."
+# **대기 이벤트를 읽어서 결론을 만든다.** 이걸 찍어 놓고 해석에 안 쓰면 그냥 장식이다.
+# 위의 off/on 비는 '얼마나 손해인가'를 말하고, 이 열은 '무엇을 기다렸나'를 말한다.
+WON="${W_ON[$LAST]:-}"; WOFF="${W_OFF[$LAST]:-}"
+echo "  · 대기 이벤트가 말하는 것 (clients=${LAST}) —"
+echo "    on : ${WON:-?}"
+echo "    off: ${WOFF:-?}"
+if printf %s "$WON" | grep -qE "WALSync|WALWrite"; then
+  if printf %s "$WOFF" | grep -qvE "WALSync|WALWrite"; then
+    echo "    ★ **on 쪽 최상위 대기가 WAL flush 고 off 쪽에는 없다 — 추론이 아니라 관측이다.**"
+    echo "      위 처리량 차이의 원인이 fsync 라는 것이 여기서 확정된다."
+  fi
+  if printf %s "$WOFF" | grep -qE "^Lock\."; then
+    echo "    ★ 그리고 off 쪽 최상위는 **${WOFF%% *}** 다 — fsync 를 치우니 **다음 병목이 드러난 것**이다."
+    echo "      병목은 없어지는 게 아니라 옮겨 간다. synchronous_commit 을 꺼서 얻을 수 있는"
+    echo "      상한이 그 다음 병목이 정하는 값이라는 뜻이기도 하다."
+  fi
+elif printf %s "$WON" | grep -q "DataFileRead"; then
+  echo "    ※ on 쪽 최상위가 IO.DataFileRead 다 — **아직 캐시가 덜 찼다.** 이 측정은 WAL 이"
+  echo "      아니라 읽기를 재고 있다. WARM 을 늘려 다시 재라(지금 ${WARM}초)."
+else
+  echo "    ※ WAL 계열 대기가 최상위에 안 잡혔다. 위 해석은 처리량 차이에 근거한 추론이지"
+  echo "      관측이 아니다 — 라운드를 늘리거나 SECS 를 늘려 샘플을 더 모아 보라."
+fi
 echo "  · 처리량 쪽도 같이 보라. off 가 on 보다 빠른 폭이 클라이언트가 늘수록 **줄어들면**"
 echo "    그것도 분할상환의 증거다 — 동시성이 높을수록 fsync 를 덜 기다리기 때문이다."
 for c in $FIRST $SECOND $(echo $CLIST | awk '{print $NF}'); do

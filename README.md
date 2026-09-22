@@ -349,7 +349,8 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 > |---|---|
 > | HOT / fillfactor | ✅ `monitor` 의 `n_tup_hot_upd` + `t8-dml-cost.sh` 의 통제 실험 |
 > | 인덱스의 쓰기 비용 | ✅ `t8-dml-cost.sh` (§T-8 후반) |
-> | WAL / 체크포인트 | ⚠️ 카운터와 UPDATE당 WAL 은 재지만 `synchronous_commit` 실험은 **없다** |
+> | WAL flush | ✅ `t-wal-flush.sh` 가 `synchronous_commit` on/off 를 교차 측정한다(아래) |
+> | 체크포인트 | ⚠️ `monitor` 가 카운터를 찍는다. 조건을 바꿔 비교하는 실험은 없다 |
 > | shared_buffers | ✅ `t-shared-buffers.sh` 가 값을 바꿔 가며 교차 측정한다(아래) |
 > | 버퍼 적중률 | ⚠️ `monitor` 의 값은 DB 전체 **누적**이라 한 실행의 측정치가 아니다(`reset-stats` 후에 보라) |
 > | B-Tree 페이지 분할 | ❌ **코드가 없다.** `pageinspect` / `bt_page_stats` 를 쓰는 곳이 한 군데도 없다 |
@@ -365,7 +366,29 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
 
 ./scripts/pgbench/t-shared-buffers.sh           # shared_buffers 는 무엇을 빠르게 하는가
+./scripts/pgbench/t-wal-flush.sh                # 커밋이 fsync 를 기다리는 값은 얼마인가
 ```
+
+> **`synchronous_commit` 은 무엇을 사고 무엇을 파는가.** 클라이언트 수마다 on/off 를 붙여서
+> 교차 측정하고, **측정 중 다른 세션에서 `pg_stat_activity` 를 100ms 마다 샘플링**해
+> 무엇을 기다렸는지 같이 남긴다. 세션 단위 `SET` 이라 서버 설정도 재시작도 건드리지 않는다.
+> scale=10 실측:
+>
+> | clients | on tps | off tps | off/on | on 쪽 최상위 대기 | off 쪽 최상위 대기 |
+> |---|---|---|---|---|---|
+> | 1 | 820 | 1,186 | 1.45배 | `IO.WALSync` 40% | `Client.ClientRead` 13% |
+> | 8 | 2,746 | 4,486 | 1.63배 | `IO.WALSync` 19% | `Lock.transactionid` 20% |
+>
+> **`IO.WALSync` 가 `on` 쪽에만 있다 — 추론이 아니라 관측이다.** 처리량 차이의 원인이
+> fsync 라는 것이 여기서 확정된다. 그리고 `off` 쪽 8 클라이언트에서 `Lock.transactionid` 가
+> 올라온다 — **fsync 를 치우니 다음 병목(행 락)이 드러난 것**이다. 병목은 없어지지 않고
+> 옮겨 가며, `off` 로 얻을 수 있는 상한도 그 다음 병목이 정한다.
+>
+> ⚠️ `off` 는 공짜가 아니다. 크래시 시 **마지막 몇 백 ms 의 커밋이 사라진다**(데이터가 깨지는
+> 것은 아니다 — 원자성은 유지된다). "커밋했다고 응답했는데 없어도 되는가"를 업무로 판단할
+> 설정이지 성능만 보고 켜는 것이 아니다.
+>
+> 자바 러너로도 한 조건만 돌릴 수 있다: `run --sync-commit=off --clients=8`.
 
 > **`shared_buffers` 를 올리면 빨라지나 — 패턴마다 답이 다르다.** 스크립트가 값을 바꿔 가며
 > (ALTER SYSTEM + 재시작, 끝나면 원복) 두 패턴을 따로 잰다. scale=10 실측:
