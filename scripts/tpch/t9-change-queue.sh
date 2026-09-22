@@ -499,7 +499,26 @@ echo "  · 총 일의 양은 줄지 않는다. 옮겨졌을 뿐이다 — 임계
 echo "  · 팬아웃 자체가 감당 불가면 큐도 못 구한다. 지연이 무한정 늘 뿐이다."
 echo "  → 선택 기준은 '정합성이 중요한가'가 아니라 '읽는 쪽의 지연 예산이 얼마인가'다."
 echo
-echo "정리 (이 스크립트는 orders/customer/lineitem 을 변형한다 — 재적재 권장):"
-echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
-echo "  ./gradlew :tpch:bootRun --args=\"load   --db=postgres\""
-echo "  ./gradlew :tpch:bootRun --args=\"index  --db=postgres\""
+
+# ── 정리 ──────────────────────────────────────────────────────────────
+# 명령을 찍기만 하면 안 된다 — 트리거는 원본의 모든 쓰기에 발화하고, 남은 큐/denorm
+# 테이블은 다음 실습의 숫자를 조용히 바꾼다. 되돌릴 수 있는 것은 되돌리고,
+# 못 되돌리는 것은 무엇이 남았는지 정확히 말한다.
+echo "정리:"
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "  KEEP=1 — 남겨 둔다. ⚠️ 트리거가 남으면 이후 모든 쓰기에 발화한다."
+else
+  sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
+       WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1
+  sql "DELETE FROM lineitem WHERE l_linenumber >= 90;" >/dev/null 2>&1
+  sql "DROP TRIGGER IF EXISTS t_sync_cust ON customer;
+        DROP TRIGGER IF EXISTS t_sync_ord ON orders;
+        DROP TRIGGER IF EXISTS t_sync_li ON lineitem;
+        DROP TABLE IF EXISTS lineitem_denorm, denorm_queue, denorm_stat, orders_cust_bak;" >/dev/null 2>&1
+  LT=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\\_sync%' OR tgname LIKE 't\\_enq%'")
+  LR=$(sql "SELECT count(*) FROM lineitem WHERE l_linenumber >= 90")
+  echo "  트리거·실험 테이블·합성 행을 지우고 orders.o_custkey 를 되돌렸다."
+  echo "  남은 트리거 ${LT} / 합성 lineitem 행 ${LR}   (둘 다 0 이어야 한다)"
+  echo "  ※ customer.c_mktsegment 는 측정 중 바뀐 채다. 문서 실측과 맞추려면"
+  echo "    ./scripts/restore-lab.sh --force-tpch 로 재적재한다."
+fi

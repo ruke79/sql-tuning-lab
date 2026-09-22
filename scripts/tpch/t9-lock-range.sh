@@ -112,6 +112,12 @@ sql "CREATE TABLE lineitem_denorm (
        o_orderdate DATE NOT NULL, o_shippriority INTEGER NOT NULL,
        CONSTRAINT pk_ld PRIMARY KEY (l_orderkey, l_linenumber));" >/dev/null 2>&1
 sql "CREATE INDEX ix_ld_ord ON lineitem_denorm(l_orderkey);" >/dev/null 2>&1
+# setsize() 가 orders.o_custkey 를 통째로 재배치한다 — 되돌리려면 원본이 있어야 한다.
+# (t9-change-queue·t9-queue-tuning 은 이 백업을 갖고 있었는데 여기만 없어서,
+#  이 스크립트를 돌리면 재적재 말고는 복구할 방법이 없었다.)
+sql "DROP TABLE IF EXISTS orders_cust_bak;
+     CREATE TABLE orders_cust_bak AS SELECT o_orderkey, o_custkey FROM orders;
+     ALTER TABLE orders_cust_bak ADD PRIMARY KEY (o_orderkey);" >/dev/null 2>&1
 
 PSQL >/dev/null 2>&1 <<'EOSQL'
 CREATE OR REPLACE FUNCTION sync_cust_naive() RETURNS trigger AS $$
@@ -216,7 +222,27 @@ echo "     이건 스키마가 아니라 워크로드를 봐야 안다."
 echo "  → 대형 계정에 쓰기가 몰리는 시스템이라면 행 락 대신 변경 큐 + 비동기 전파 +"
 echo "     정합성 배치를 검토하거나, 애초에 그 컬럼을 반정규화하지 않는 쪽을 봐야 한다."
 echo
-echo "정리 (이 스크립트는 orders.o_custkey 를 바꾼다 — 재적재 권장):"
-echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
-echo "  ./gradlew :tpch:bootRun --args=\"load   --db=postgres\""
-echo "  ./gradlew :tpch:bootRun --args=\"index  --db=postgres\""
+
+# ── 정리 ──────────────────────────────────────────────────────────────
+# **명령을 찍기만 하면 안 된다.** 이 스크립트가 다는 트리거는 원본 테이블의 모든 쓰기에
+# 발화하고, 남은 denorm/큐 테이블은 다음 실습의 숫자를 조용히 바꾼다. 실제로
+# t9-preaggregation 이 남긴 매트뷰 때문에 재적재가 통째로 막힌 적이 있다.
+# 되돌릴 수 있는 것은 되돌리고, 못 되돌리는 것은 **무엇이 남았는지 정확히 말한다.**
+echo "정리:"
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "  KEEP=1 — 남겨 둔다. ⚠️ t_sync_cust 는 customer 의 모든 UPDATE 에 발화하고,"
+  echo "     orders.o_custkey 는 인위적 분포 그대로다. 다음 측정 전에 지울 것."
+else
+  sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
+       WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1
+  sql "DROP TRIGGER IF EXISTS t_sync_cust ON customer;
+       DROP TABLE IF EXISTS lineitem_denorm;
+       DROP TABLE IF EXISTS orders_cust_bak;
+       DROP SEQUENCE IF EXISTS seg_seq;" >/dev/null 2>&1
+  LT=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\\_sync%'")
+  LD=$(sql "SELECT count(*) FROM pg_tables WHERE tablename IN ('lineitem_denorm','orders_cust_bak')")
+  echo "  트리거·denorm·백업을 지우고 orders.o_custkey 를 원래 분포로 되돌렸다."
+  echo "  남은 t_sync% ${LT} / 실험 테이블 ${LD}   (둘 다 0 이어야 한다)"
+  echo "  ※ customer.c_mktsegment 는 측정 중 바뀐 채다(값만 다르고 행수는 그대로)."
+  echo "    문서 실측과 맞춰야 하면 ./scripts/restore-lab.sh --force-tpch 로 재적재한다."
+fi

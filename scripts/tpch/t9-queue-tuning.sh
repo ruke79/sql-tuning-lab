@@ -422,7 +422,22 @@ echo "  ※ 비교는 **같은 스윕 안에서만** 유효하다. ①의 (워�
 echo "     309ms 로 2.5배 차이가 났다 — 라운드 교차는 스윕 내부의 드리프트만 지운다."
 echo "     스윕끼리의 절대값 비교는 하지 말 것."
 echo
-echo "정리 (이 스크립트는 orders/customer/lineitem 을 변형한다 — 재적재 권장):"
-echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
-echo "  ./gradlew :tpch:bootRun --args=\"load   --db=postgres\""
-echo "  ./gradlew :tpch:bootRun --args=\"index  --db=postgres\""
+# 명령을 찍기만 하면 안 된다 — 트리거는 원본의 모든 쓰기에 발화한다. 직접 되돌린다.
+echo "정리:"
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "  KEEP=1 — 남겨 둔다. ⚠️ t_enq% 트리거가 남으면 이후 모든 쓰기에 발화한다."
+else
+  sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
+       WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1
+  sql "DELETE FROM lineitem WHERE l_linenumber >= 90;" >/dev/null 2>&1
+  sql "DROP TRIGGER IF EXISTS t_enq_cust ON customer;
+       DROP TRIGGER IF EXISTS t_enq_ord ON orders;
+       DROP TRIGGER IF EXISTS t_enq_li ON lineitem;
+       DROP TABLE IF EXISTS lineitem_denorm, denorm_queue, denorm_stat, orders_cust_bak;" >/dev/null 2>&1
+  LT=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\\_sync%' OR tgname LIKE 't\\_enq%'")
+  LR=$(sql "SELECT count(*) FROM lineitem WHERE l_linenumber >= 90")
+  echo "  트리거·큐/denorm 테이블·합성 행을 지우고 orders.o_custkey 를 되돌렸다."
+  echo "  남은 트리거 ${LT} / 합성 lineitem 행 ${LR}   (둘 다 0 이어야 한다)"
+  echo "  ※ customer.c_mktsegment 는 측정 중 바뀐 채다. 문서 실측과 맞추려면"
+  echo "    ./scripts/restore-lab.sh --force-tpch 로 재적재한다."
+fi

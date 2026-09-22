@@ -450,7 +450,19 @@ echo "  더 나쁜 것은 무작위 부하로는 그 사실이 드러나지도 �
 echo "  → 정합성 결함은 부하 테스트가 아니라 트랜잭션 겹침을 손으로 따져서 찾아야 한다."
 echo "  → 반정규화 비용에 '설계 난이도'가 하나 더 붙는다."
 echo
-echo "주의: 이 스크립트는 원본 테이블을 커밋 변경한다. 끝나면 재적재를 권한다:"
+# 트리거만이라도 반드시 지운다 — 남으면 이후 모든 쓰기에 발화한다. 다만 pgbench
+# 워크로드가 무작위로 바꾼 customer/orders/lineitem 은 **되돌릴 수 없다**(백업이 없다).
+# 그래서 여기서는 '지운 것'과 '못 되돌린 것'을 나눠서 말한다.
+if [ "${KEEP:-0}" != "1" ]; then
+  sql "DROP TRIGGER IF EXISTS t_sync_li ON lineitem;
+       DROP TRIGGER IF EXISTS t_sync_ord ON orders;
+       DROP TRIGGER IF EXISTS t_sync_cust ON customer;
+       DROP TABLE IF EXISTS lineitem_denorm;" >/dev/null 2>&1
+  LT=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\\_sync%'")
+  echo "정리: 트리거 3종과 lineitem_denorm 을 지웠다 (남은 t_sync% ${LT} — 0 이어야 한다)."
+  echo
+fi
+echo "주의: 이 스크립트는 원본 테이블을 커밋 변경한다. **그 변경은 되돌릴 수 없다** — 재적재한다:"
 echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"load --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"index --db=postgres\"   ← 빼먹지 말 것"
