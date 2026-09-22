@@ -39,10 +39,17 @@ public class TpcbWorkload {
 
     private final DataSource dataSource;
     private final int scale;
+    /** null 이면 서버 기본값을 그대로 쓴다. 실험 때만 세션에 건다. */
+    private final Boolean syncCommit;
 
     public TpcbWorkload(DataSource dataSource, int scale) {
+        this(dataSource, scale, null);
+    }
+
+    public TpcbWorkload(DataSource dataSource, int scale, Boolean syncCommit) {
         this.dataSource = dataSource;
         this.scale = scale;
+        this.syncCommit = syncCommit;
     }
 
     public void run(int clients, int seconds) throws InterruptedException {
@@ -55,6 +62,13 @@ public class TpcbWorkload {
         for (int c = 0; c < clients; c++) {
             pool.submit(() -> {
                 try (Connection conn = dataSource.getConnection()) {
+                    // 세션 단위로만 건다 — 서버 설정을 바꾸지 않으므로 재시작도 원복도 없다.
+                    // (shared_buffers 와 달리 synchronous_commit 은 세션에서 바꿀 수 있다.)
+                    if (syncCommit != null) {
+                        try (var st = conn.createStatement()) {
+                            st.execute("SET synchronous_commit = " + (syncCommit ? "on" : "off"));
+                        }
+                    }
                     conn.setAutoCommit(false);
                     while (!stop.get()) {
                         long start = System.nanoTime();
@@ -85,7 +99,8 @@ public class TpcbWorkload {
         List<Long> lat = new ArrayList<>(latenciesMicro);
         lat.sort(Long::compareTo);
         log.info("========== TPC-B RESULT ==========");
-        log.info("clients={}, duration={}s, scale={}", clients, seconds, scale);
+        log.info("clients={}, duration={}s, scale={}, synchronous_commit={}", clients, seconds, scale,
+                syncCommit == null ? "(서버 기본값)" : (syncCommit ? "on" : "off"));
         log.info("committed={}, errors={}, TPS={}", committed.get(), errors.get(),
                 String.format("%.1f", committed.get() / elapsed));
         if (!lat.isEmpty()) {

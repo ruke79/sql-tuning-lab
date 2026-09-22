@@ -64,7 +64,11 @@ public class PgbenchApplication implements CommandLineRunner {
                     // --scale 은 **적재 규모가 아니라 키를 뽑는 범위**다. 적재된 것과 다르면
                     // 에러 없이 다른 것을 재게 되므로, 다르면 여기서 멈추고 뜻을 물어본다.
                     if (checkScale(jdbc, scale, args.getInt("force", 0) == 1)) {
-                        new TpcbWorkload(ds, scale)
+                        // --sync-commit=on|off 를 주면 그 값으로 세션에 건다(안 주면 서버 기본값).
+                        // 서버 설정은 건드리지 않으므로 재시작도 원복도 필요 없다.
+                        String sc = args.get("sync-commit", null);
+                        Boolean syncCommit = (sc == null) ? null : sc.equalsIgnoreCase("on");
+                        new TpcbWorkload(ds, scale, syncCommit)
                                 .run(args.getInt("clients", 8), args.getInt("seconds", 30));
                     }
                 }
@@ -83,6 +87,8 @@ public class PgbenchApplication implements CommandLineRunner {
                         Commands:
                           init        --scale=10                pgbench 스키마 생성 + 데이터 적재 (scale x 10만 accounts)
                           run         --clients=8 --seconds=30 --scale=10   TPC-B 트랜잭션 부하 실행
+                                      --sync-commit=on|off   세션 단위 synchronous_commit (WAL flush 실험)
+                                      --force=1              --scale 이 적재 규모와 달라도 강행
                           monitor                               buffer hit/HOT/checkpoint/락 대기 지표 출력
                           reset-stats                           통계 초기화 (실험 전 실행 권장)
                         """);
