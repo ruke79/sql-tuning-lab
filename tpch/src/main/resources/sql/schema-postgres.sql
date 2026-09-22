@@ -2,14 +2,20 @@
 -- 인덱스 없이 생성된다. 인덱스는 index 명령(sql/indexes-postgres.sql)으로 추가하여
 -- "인덱스 전/후" 실행계획 차이를 비교하는 것이 이 실습의 핵심이다.
 
-DROP TABLE IF EXISTS lineitem;
-DROP TABLE IF EXISTS orders;
-DROP TABLE IF EXISTS partsupp;
-DROP TABLE IF EXISTS part;
-DROP TABLE IF EXISTS customer;
-DROP TABLE IF EXISTS supplier;
-DROP TABLE IF EXISTS nation;
-DROP TABLE IF EXISTS region;
+-- CASCADE 를 붙이는 이유: 실습 스크립트가 만든 **매트뷰·뷰가 원본 테이블에 의존한다.**
+-- 실제로 t9-preaggregation 이 남긴 mv_q03 때문에 재적재가 통째로 막혔다:
+--   ERROR: cannot drop table lineitem because other objects depend on it
+--   Detail: materialized view mv_q03 depends on table lineitem
+-- 그리고 schema 가 실패한 줄 모르고 load 를 이어 돌리면 '중복 키' 라는 엉뚱한 에러가 난다.
+-- 여기서 CASCADE 로 지우는 것은 실습 잔여물이므로 없어져야 맞다.
+DROP TABLE IF EXISTS lineitem CASCADE;
+DROP TABLE IF EXISTS orders CASCADE;
+DROP TABLE IF EXISTS partsupp CASCADE;
+DROP TABLE IF EXISTS part CASCADE;
+DROP TABLE IF EXISTS customer CASCADE;
+DROP TABLE IF EXISTS supplier CASCADE;
+DROP TABLE IF EXISTS nation CASCADE;
+DROP TABLE IF EXISTS region CASCADE;
 
 CREATE TABLE region (
     r_regionkey  INTEGER       NOT NULL,

@@ -225,4 +225,11 @@ echo "  ③을 쓰려면 REFRESH 주기를 정해야 하고, 그 주기가 곧 �
 echo "  그리고 ③은 원본 그대로의 상세 조회에 못 쓴다. 무엇을 포기하는지 알고 골라야 한다."
 echo
 echo "정리:"
-echo "  psql -d tpcds -c 'DROP MATERIALIZED VIEW IF EXISTS mv_brand_month, mv_baked; DROP TABLE IF EXISTS ss_denorm;'"
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "  KEEP=1 — 남겨 둔다. ⚠️ 매트뷰가 남으면 schema 재적재가 막힌다:"
+  echo "     psql -d tpcds -c 'DROP MATERIALIZED VIEW IF EXISTS mv_brand_month, mv_baked; DROP TABLE IF EXISTS ss_denorm;'"
+else
+  sql "DROP MATERIALIZED VIEW IF EXISTS mv_brand_month, mv_baked; DROP TABLE IF EXISTS ss_denorm;" >/dev/null 2>&1
+  LMV=$(sql "SELECT count(*) FROM pg_matviews WHERE matviewname IN ('mv_brand_month','mv_baked')")
+  echo "  매트뷰 2종·ss_denorm 을 지웠다.  남은 매트뷰 ${LMV}   (0 이어야 한다)"
+fi

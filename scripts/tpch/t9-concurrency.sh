@@ -290,6 +290,10 @@ hazard_suite(){   # $1 = 라벨
   PSQL -c "SELECT '$1 / H3' AS 시나리오, d.o_orderdate::text AS denorm, o.o_orderdate::text AS 실제,
     (d.o_orderdate IS DISTINCT FROM o.o_orderdate) AS 드리프트 FROM lineitem_denorm d
     JOIN orders o ON d.l_orderkey=o.o_orderkey WHERE d.l_orderkey=1 AND d.l_linenumber=80;"
+  # H3 가 재현됐는지는 **환경에 따라 다르다**(아래 주석 참고). 표를 찍는 것과 별도로
+  # 값을 잡아 둬서, 해설을 측정에 맞춰 쓸 수 있게 한다.
+  H3_DRIFT=$(sql "SELECT (d.o_orderdate IS DISTINCT FROM o.o_orderdate)::text FROM lineitem_denorm d
+    JOIN orders o ON d.l_orderkey=o.o_orderkey WHERE d.l_orderkey=1 AND d.l_linenumber=80;" | tr -d ' ')
   reset
 }
 
@@ -324,8 +328,11 @@ ON CONFLICT DO NOTHING;
 END;
 EOF
 
-bench(){ PGBENCH -f "$(pg_stage /tmp/t9_concurrent.sql)" \
-           -c "$CLIENTS" -j 4 -T "$SECS" -n tpch 2>&1 | grep -E "^tps|latency average"; }
+bench(){ local out
+  out=$(PGBENCH -f "$(pg_stage /tmp/t9_concurrent.sql)" \
+          -c "$CLIENTS" -j 4 -T "$SECS" -n tpch 2>&1)
+  TPS_LAST=$(printf %s "$out" | awk '/^tps/{print $3}')
+  printf %s "$out" | grep -E "^tps|latency average"; }
 
 echo "§T-9 동시성 — ${CLIENTS} clients / ${SECS}초"
 echo
@@ -333,9 +340,13 @@ rebuild_denorm; install_naive; install_common
 
 # ── 1) 처리량 비교 ────────────────────────────────────────────────────
 DL0=$(sql "SELECT deadlocks FROM pg_stat_database WHERE datname='tpch'")
-echo "── [A] 트리거 OFF (기준선) ──"; trg off; bench
+# **첫 실행은 버린다.** 예전에는 [A] 가 맨 처음 돌아서 캐시가 차가운 채로 기준선이 됐고,
+# 그 결과 "트리거를 켰더니 더 빨라졌다"(A 927 → B 1018 tps)가 실제로 찍혔다.
+# 물리적으로 불가능한 값이고, 순서가 만든 것이다(§T-0 원칙 6).
+echo "  (워밍업 1회 — 버리는 값)"; trg off; bench >/dev/null 2>&1
+echo "── [A] 트리거 OFF (기준선) ──"; trg off; bench; TPS_A="$TPS_LAST"
 rebuild_denorm
-echo; echo "── [B] 트리거 ON (소박한 구현) ──"; trg on; bench
+echo; echo "── [B] 트리거 ON (소박한 구현) ──"; trg on; bench; TPS_B="$TPS_LAST"
 echo "  워크로드 후 드리프트: $(drift)"
 DL1=$(sql "SELECT deadlocks FROM pg_stat_database WHERE datname='tpch'")
 echo "  데드락: $((DL1-DL0))"
@@ -386,16 +397,28 @@ echo "  H2' 주문 이동을 먼저 열고 등급변경이 나중 커밋   → �
 echo "  H3  주문 날짜변경(미커밋) ∥ 그 주문에 INSERT     → 상위를 안 잠그고 읽는다"
 echo "  (같은 행을 만져 행 락이 직렬화해 줄 H4·H5 는 제외)"
 echo
-echo "  ※ H3 는 이 하네스에서 재현되지 않는다(아래 결과가 drift=f 로 나온다)."
-echo "    수동으로는 3/3 재현된다 — 두 세션을 psql 창 두 개로 직접 띄우면 확인된다:"
-echo "      창1: BEGIN; UPDATE orders SET o_orderdate=DATE '2001-09-09' WHERE o_orderkey=1;"
-echo "      창2: INSERT INTO lineitem (... l_orderkey=1, l_linenumber=80 ...);"
-echo "      창1: COMMIT;   → denorm 은 옛 날짜, orders 는 새 날짜"
-echo "    스크립트에서는 A 의 준비 시점을 잡는 신호와 B 의 실행 사이 간격이 좁아 묻힌다."
-echo "    (B 가 A 의 UPDATE 보다 먼저 들어가면 A 의 전파가 B 의 새 행까지 덮어 드리프트가 사라진다)"
+echo "  ※ H3 는 **환경에 따라 재현되기도, 안 되기도 한다.** 경합 창이 얼마나 벌어지느냐에"
+echo "    달렸고, 그건 클라이언트 왕복 시간이 결정한다. 결과를 보고 아래에서 다시 말한다."
 echo
 install_naive; install_common; trg on
 hazard_suite "소박한 구현"
+H3_NAIVE="$H3_DRIFT"
+# 예전에는 여기 위에 "H3 는 이 하네스에서 재현되지 않는다(drift=f 로 나온다)"가 **단언으로**
+# 박혀 있었다. 그런데 사용자가 docker exec 경로로 돌리자 drift=t 가 나왔다 — 매 호출이
+# 프로세스를 하나 더 띄우는 만큼 A 의 준비와 B 의 실행 사이가 벌어져 경합 창이 넓어진 것이다.
+# **느린 클라이언트가 결과를 바꾼 것이고, 박아 둔 문장은 그걸 부정했다.** 재서 쓴다.
+if [ "$H3_NAIVE" = "t" ]; then
+  echo "  ※ H3 가 이 실행에서는 **재현됐다**(drift=t). A 의 준비와 B 의 실행 사이가"
+  echo "    충분히 벌어졌다는 뜻이다 — docker exec 처럼 왕복이 느린 경로에서 잘 나온다."
+else
+  echo "  ※ H3 가 이 실행에서는 **묻혔다**(drift=f). A 의 준비 신호와 B 의 실행 사이 간격이"
+  echo "    좁아 경합 창이 안 생긴 것이지, 위험이 없다는 뜻이 아니다."
+  echo "    (B 가 A 의 UPDATE 보다 먼저 들어가면 A 의 전파가 B 의 새 행까지 덮어 드리프트가 사라진다)"
+  echo "    두 세션을 psql 창 두 개로 직접 띄우면 손으로는 3/3 재현된다:"
+  echo "      창1: BEGIN; UPDATE orders SET o_orderdate=DATE '2001-09-09' WHERE o_orderkey=1;"
+  echo "      창2: INSERT INTO lineitem (... l_orderkey=1, l_linenumber=80 ...);"
+  echo "      창1: COMMIT;   → denorm 은 옛 날짜, orders 는 새 날짜"
+fi
 echo
 install_fixed
 hazard_suite "3경로 수정본"
@@ -404,10 +427,22 @@ hazard_suite "3경로 수정본"
 echo
 rebuild_denorm
 DL2=$(sql "SELECT deadlocks FROM pg_stat_database WHERE datname='tpch'")
-echo "── [C] 트리거 ON + FOR SHARE ──"; bench
+echo "── [C] 트리거 ON + FOR SHARE ──"; bench; TPS_C="$TPS_LAST"
 echo "  워크로드 후 드리프트: $(drift)"
 DL3=$(sql "SELECT deadlocks FROM pg_stat_database WHERE datname='tpch'")
 echo "  데드락: $((DL3-DL2))"
+echo
+# 세 조건은 **고정 순서**로 잰다(각 20초짜리라 교차로 돌리면 시간이 배가 된다).
+# 그래서 순서 편향이 남을 수 있고, 남았는지를 **판정 가능한 형태로** 찍는다 —
+# 트리거를 켠 쪽이 끈 쪽보다 빠르게 나오면 그건 전략이 아니라 측정이 만든 값이다.
+printf "처리량: A(OFF) %s / B(ON) %s / C(FOR SHARE) %s tps\n" \
+  "${TPS_A:-?}" "${TPS_B:-?}" "${TPS_C:-?}"
+if [ -n "${TPS_A:-}" ] && [ -n "${TPS_B:-}" ] \
+   && awk -v a="$TPS_A" -v b="$TPS_B" 'BEGIN{exit !(b>=a)}'; then
+  echo "  ⚠️ B(트리거 ON)가 A(OFF)보다 빠르게 나왔다 — **물리적으로 불가능하다.**"
+  echo "     고정 순서 측정이 남긴 편향이다. 이 실행의 A·B 차이는 주장하지 말 것."
+  echo "     (워밍업을 넣었는데도 나온다면 SECS 를 늘려 본다: ./t9-concurrency.sh $CLIENTS 60)"
+fi
 echo
 echo "해석:"
 echo "  소박한 트리거는 단일 세션에서 완벽했지만 동시성에서는 조용히 어긋난다."

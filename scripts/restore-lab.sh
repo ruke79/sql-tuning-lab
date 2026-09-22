@@ -273,13 +273,23 @@ LEFT2=$(t_sql tpcds "SELECT count(*) FROM pg_class WHERE relname LIKE 'mt\_%' OR
 # (에러가 없으니 다음 사람은 자기가 다른 것을 재고 있다는 걸 모른다).
 LEFT3=$(t_sql tpch "SELECT count(*) FROM pg_indexes WHERE indexname IN
           ('idx_li_orderkey_shipdate','idx_li_cover','idx_ord_custkey_orderdate')")
+# **매트뷰는 잔여물 중에서도 특히 나쁘다.** 원본 테이블에 의존하므로 남아 있으면
+# schema 재적재가 통째로 막힌다(DROP TABLE lineitem 이 거절당한다). 그리고 그 뒤에
+# load 를 이어 돌리면 '중복 키'라는 엉뚱한 에러로 나와 원인을 찾기 어렵다.
+# 실제로 그렇게 막혔는데 이 검사가 없어서 "잔여물 없음"이 찍혔다.
+LEFT6=$(t_sql tpch  "SELECT count(*) FROM pg_matviews WHERE matviewname IN ('mv_q03')")
+LEFT7=$(t_sql tpcds "SELECT count(*) FROM pg_matviews WHERE matviewname IN ('mv_brand_month','mv_baked')")
 LEFT4=$(t_sql tpcds "SELECT count(*) FROM pg_indexes WHERE indexname IN
           ('idx_ss_item_solddate','idx_ss_cover','mt_shared_date')")
 if [ "${LEFT:-0}" = "0" ] && [ "${LEFT2:-0}" = "0" ] && [ "${LEFT3:-0}" = "0" ] && [ "${LEFT4:-0}" = "0" ] \
-   && [ "${LEFT5:-0}" = "0" ]; then
+   && [ "${LEFT5:-0}" = "0" ] && [ "${LEFT6:-0}" = "0" ] && [ "${LEFT7:-0}" = "0" ]; then
   ok "실습 잔여물 없음"
 else
-  warn "실습 잔여물 — tpch 트리거 ${LEFT:-0} / tpcds 임시테이블 ${LEFT2:-0} / 실험 인덱스 tpch ${LEFT3:-0}·tpcds ${LEFT4:-0} / 실험 lineitem 행 ${LEFT5:-0}"
+  warn "실습 잔여물 — tpch 트리거 ${LEFT:-0} / tpcds 임시테이블 ${LEFT2:-0} / 실험 인덱스 tpch ${LEFT3:-0}·tpcds ${LEFT4:-0} / 실험 lineitem 행 ${LEFT5:-0} / 매트뷰 tpch ${LEFT6:-0}·tpcds ${LEFT7:-0}"
+  [ "${LEFT6:-0}" != "0" ] || [ "${LEFT7:-0}" != "0" ] && \
+    say "     **매트뷰가 남아 있으면 schema 재적재가 막힌다** — 먼저 지울 것:"
+  [ "${LEFT6:-0}" != "0" ] && say "       psql -d tpch  -c \"DROP MATERIALIZED VIEW IF EXISTS mv_q03;\""
+  [ "${LEFT7:-0}" != "0" ] && say "       psql -d tpcds -c \"DROP MATERIALIZED VIEW IF EXISTS mv_brand_month, mv_baked;\""
   say  "     남으면 다음 측정이 **에러 없이** 달라진다. 지우려면:"
   say  "       psql -d tpch  -c \"DROP TRIGGER IF EXISTS t_sync_li ON lineitem;\" \\"
   say  "                     -c \"DROP TRIGGER IF EXISTS t_sync_ord ON orders;\" \\"

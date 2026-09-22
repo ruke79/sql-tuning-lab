@@ -156,5 +156,16 @@ echo "  다만 순서를 지켜야 한다 — 인덱스로 되는 것을 반정�
 echo "  쓰기 비용 몇 배를 내고 몇 밀리초를 사는 나쁜 거래가 된다."
 echo "  Tow 가 반정규화를 책 맨 마지막에 '다른 방법이 없을 때만'으로 못박은 이유다."
 echo
+# **직접 지운다.** 매트뷰는 원본 테이블에 의존하므로 남으면 schema 재적재가 통째로 막힌다
+# (DROP TABLE lineitem 이 거절당하고, 모르고 load 를 이어 돌리면 '중복 키'라는 엉뚱한
+#  에러로 나온다). 실제로 그렇게 막혔다 — 명령을 찍어 두는 것만으로는 부족했다.
 echo "정리:"
-echo "  psql -d tpch -c 'DROP MATERIALIZED VIEW IF EXISTS mv_q03; DROP TABLE IF EXISTS lineitem_denorm;'"
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "  KEEP=1 — mv_q03 / lineitem_denorm 을 남겨 둔다."
+  echo "  ⚠️ 매트뷰가 남으면 schema 재적재가 막힌다. 다음 재적재 전에 지울 것:"
+  echo "     psql -d tpch -c 'DROP MATERIALIZED VIEW IF EXISTS mv_q03; DROP TABLE IF EXISTS lineitem_denorm;'"
+else
+  sql "DROP MATERIALIZED VIEW IF EXISTS mv_q03; DROP TABLE IF EXISTS lineitem_denorm;" >/dev/null 2>&1
+  LMV=$(sql "SELECT count(*) FROM pg_matviews WHERE matviewname='mv_q03'")
+  echo "  mv_q03 / lineitem_denorm 을 지웠다.  남은 매트뷰 ${LMV}   (0 이어야 한다)"
+fi

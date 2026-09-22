@@ -2,15 +2,21 @@
 -- 전체 24+ 테이블 공식 DDL은 tpcds-kit(tools/tpcds.sql) 참고.
 -- 인덱스는 index 명령(sql/indexes-postgres.sql)으로 추가한다.
 
-DROP TABLE IF EXISTS store_sales;
-DROP TABLE IF EXISTS promotion;
-DROP TABLE IF EXISTS customer;
-DROP TABLE IF EXISTS customer_demographics;
-DROP TABLE IF EXISTS household_demographics;
-DROP TABLE IF EXISTS customer_address;
-DROP TABLE IF EXISTS store;
-DROP TABLE IF EXISTS item;
-DROP TABLE IF EXISTS date_dim;
+-- CASCADE 를 붙이는 이유: 실습 스크립트가 만든 **매트뷰·뷰가 원본 테이블에 의존한다.**
+-- 실제로 t9-preaggregation 이 남긴 mv_q03 때문에 재적재가 통째로 막혔다:
+--   ERROR: cannot drop table lineitem because other objects depend on it
+--   Detail: materialized view mv_q03 depends on table lineitem
+-- 그리고 schema 가 실패한 줄 모르고 load 를 이어 돌리면 '중복 키' 라는 엉뚱한 에러가 난다.
+-- 여기서 CASCADE 로 지우는 것은 실습 잔여물이므로 없어져야 맞다.
+DROP TABLE IF EXISTS store_sales CASCADE;
+DROP TABLE IF EXISTS promotion CASCADE;
+DROP TABLE IF EXISTS customer CASCADE;
+DROP TABLE IF EXISTS customer_demographics CASCADE;
+DROP TABLE IF EXISTS household_demographics CASCADE;
+DROP TABLE IF EXISTS customer_address CASCADE;
+DROP TABLE IF EXISTS store CASCADE;
+DROP TABLE IF EXISTS item CASCADE;
+DROP TABLE IF EXISTS date_dim CASCADE;
 
 CREATE TABLE date_dim (
     d_date_sk           INTEGER      NOT NULL,
