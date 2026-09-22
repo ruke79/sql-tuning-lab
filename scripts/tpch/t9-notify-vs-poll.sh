@@ -426,7 +426,13 @@ LO_Q20=$(vlat qdepth:20);   TO_Q20=$(vtrip qdepth:20)
 echo "  → 폴링 간격이 지연 바닥을 그대로 정한다. 큐가 비어 있는 시간이 대부분이라"
 echo "     '언제 깨느냐'가 곧 '언제 반영되느냐'다."
 IFS='|' read -r BL BV <<<"$(pick lat min "${MODES[@]}")"
-if [ "$BL" = "NOTIFY" ]; then
+IFS='|' read -r WL WV <<<"$(pick lat max "${MODES[@]}")"
+# **순위를 매기기 전에 구분이 되는지부터 본다.** 여섯 값이 16~24ms 안에 들어오고
+# 범위끼리 겹치는 실행에서 "최저는 큐깊이 5ms"라고 쓰면 노이즈를 발견으로 읽는 것이다.
+if awk -v a="$WV" -v b="$BV" 'BEGIN{exit !(b+0>0 && (a+0) < (b+0)*1.5+3)}'; then
+  echo "  ※ 이 부하에서는 **지연으로 방식을 구분할 수 없다** — 최저 ${BV}ms, 최고 ${WV}ms 로"
+  echo "     범위끼리 겹친다. 순위를 매기지 마라. ①의 신호는 지연이 아니라 오른쪽 두 열이다."
+elif [ "$BL" = "NOTIFY" ]; then
   echo "  ★ NOTIFY 가 지연 최저다(${LO_NOT}ms) — 기다리는 창이 아예 없으니 바닥도 없다."
 else
   echo "  ※ 이번 실행의 지연 최저는 NOTIFY(${LO_NOT}ms)가 아니라 ${BL}(${BV}ms)다."
@@ -464,8 +470,19 @@ MD_D20=$(vlat debounce:20); TD_D20=$(vtrip debounce:20)
 MD_A5=$(vlat adaptive:5);   TD_A5=$(vtrip adaptive:5);    PD_A5=$(vper adaptive:5)
 MD_A20=$(vlat adaptive:20); TD_A20=$(vtrip adaptive:20);  ED_A20=$(vemp adaptive:20); PD_A20=$(vper adaptive:20)
 MD_Q20=$(vlat qdepth:20);   TD_Q20=$(vtrip qdepth:20);    PD_Q20=$(vper qdepth:20)
-echo "  → 지연 순서는 그대로다 — 깨우는 간격은 한산할 때만이 아니라 **건강한 구간 전체에서**"
-echo "     지연을 지배한다. 워커가 따라잡는 한 큐는 자주 비기 때문이다."
+# ①의 순위를 그대로 물려받아 "순서는 그대로다"라고 쓰던 자리. 실제로는 ①에서 3위였던
+# NOTIFY 가 ②에서 꼴찌로 내려간 실행이 나왔다. 순위가 바뀌는 것 자체가 이 절의 발견이므로
+# 물려받지 말고 **여기서 다시 세운다.**
+IFS='|' read -r WL WV <<<"$(pick lat max "${MODES[@]}")"
+IFS='|' read -r BL BV <<<"$(pick lat min "${MODES[@]}")"
+echo "  → 부하가 오르자 지연이 갈라진다 — 최저 ${BL}(${BV}ms), 최고 ${WL}(${WV}ms) 로 $(rat "$WV" "$BV")배 차다."
+if [ -n "${LO_NOT:-}" ] && lt "$LO_NOT" "$LO_D20" && [ "$WL" = "NOTIFY" ]; then
+  echo "  ★ **순위가 뒤집혔다.** ①(저부하)에서 NOTIFY 는 고정 창보다 지연이 낮았는데"
+  echo "     (${LO_NOT} vs ${LO_D20}ms), 여기서는 NOTIFY 가 가장 높다(${MD_NOT}ms)."
+  echo "     커밋마다 깨어나느라 **모을 기회를 못 얻기 때문이다** — 배치당 항목을 보라."
+else
+  echo "     워커가 따라잡는 한 큐는 자주 비므로, 여기서도 '언제 깨느냐'가 지연을 지배한다."
+fi
 # 예전에는 "NOTIFY 가 7,078 로 압도적"이라고 박아 뒀다. 실측은 986 대 922 였다 —
 # **1.07배를 '압도적'이라고 쓴 것이다.** 그래서 최대·최소를 찾아서 말하고, 격차도 같이 찍는다.
 IFS='|' read -r TL TV <<<"$(pick trip max "${MODES[@]}")"
@@ -616,8 +633,15 @@ fi
 if want 5; then
 echo "── ⑤ NOTIFY 퇴화의 경계는 어디인가 · 쓰기율을 훑는다 (1라운드) ──"
 echo
-echo "  ①은 -R 50 에서 NOTIFY 가 최선이라 했고, ②는 -R 800 에서 NOTIFY 의 왕복이"
-echo "  제일 많다고 했다. **그 사이 어디서 뒤집히는가**를 찾는다."
+# 앞 절의 결론을 물려받아 "②는 NOTIFY 의 왕복이 제일 많다고 했다"라고 써 뒀었다.
+# 그런데 ②에서 왕복 최대가 고정창 20ms 로 나오는 실행이 있다 — **앞 절이 실제로
+# 무엇을 찍었는지 받아서** 말한다. 물려받은 전제는 조용히 틀린다.
+if [ -n "${TD_NOT:-}" ]; then
+  echo "  ①(-R 50)에서 NOTIFY 의 왕복은 ${TO_NOT:-?}, ②(-R 800)에서는 ${TD_NOT} 였다."
+  echo "  커밋이 늘면 NOTIFY 의 왕복도 같이 는다. **어디서 폴링을 넘어서는가**를 찾는다."
+else
+  echo "  NOTIFY 의 왕복은 커밋 수를 따라간다. **어디서 폴링을 넘어서는가**를 찾는다."
+fi
 echo "  비교 상대는 폴링 1ms 다 — 지연 바닥이 가장 낮은, 즉 가장 공격적인 폴링이다."
 echo "  적응형 5ms 도 같이 둔다(②에서 그 퇴화를 고친 방식)."
 echo
@@ -784,7 +808,18 @@ echo "   그 한 문장이 drain 시간에서 차지하는 비중은 **${SHARE}%
 echo "   (적응형5ms 기준 cust합 ${B_CM[adaptive:5]:-?}ms / 전체 ${B_TOT[adaptive:5]:-?}ms)."
 echo "   claim / ord / line / depth 를 다 합친 것이 나머지다."
 echo
-echo "   그리고 세 방식의 'cust배치'와 'cust합ms' 가 거의 같다 — 즉 **세 방식이 같은 일을 한다.**"
+# "세 방식의 cust배치·cust합ms 가 거의 같다"고 박아 뒀었다. 실측은 47/79/88 과
+# 2887/4790/5629 — 1.9배 차다. 총량이 다른 이유는 **달성tps 가 다르기 때문**이고,
+# 방식이 같은 일을 한다는 증거는 총량이 아니라 **회당 비용**에 있다.
+echo "   세 방식의 회당 비용을 나란히 보면(cust합ms ÷ cust배치):"
+for m in "${MODES6[@]}"; do
+  printf "     %-12s %s회 · %sms → 회당 %sms  (달성 %s tps)\n" "$(lbl $m)" \
+    "${B_CB[$m]:-?}" "${B_CM[$m]:-?}" \
+    "$(awk -v a="${B_CM[$m]:-0}" -v b="${B_CB[$m]:-0}" 'BEGIN{if(b>0)printf "%.0f",a/b;else printf "?"}')" \
+    "${B_T[$m]:-?}"
+done
+echo "   **회당 비용이 방식과 무관하게 같다** — 즉 세 방식이 같은 일을 한다."
+echo "   총량(cust배치·cust합ms)이 갈리는 것은 달성tps 가 갈려서지 방식 때문이 아니다."
 # 포화인지 아닌지를 말로 때우지 않는다. 측정 시간 대비 몇 %를 비싼 문장에 썼는지로 가른다.
 BUSY=$(awk -v a="${B_CM[adaptive:5]:-0}" -v s="${SECS:-0}" \
        'BEGIN{ if(s+0>0) printf "%.0f", a*100/(s*1000); else printf "?" }')
