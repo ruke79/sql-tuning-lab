@@ -208,17 +208,25 @@ BEGIN;
 UPDATE orders SET o_shippriority = :r % 7 WHERE o_orderkey = :ord;
 END;
 EOF
+# **표본 크기를 같이 본다.** 12초 고정이라 tps 가 낮은 조건(=적중률 100%)에서는
+# 트랜잭션이 1,000건도 안 돼 비율이 크게 흔들린다. 실제로 같은 조건 5회에서 100% 열이
+# 0.50~2.47 로 4.9배 벌어졌다(1% 열은 0.94~1.01 로 안정). 그래서 tps 뿐 아니라
+# '이 값이 몇 건에서 나왔는지'를 기억해 두고, 적으면 그렇게 말한다.
+SECS_T=12
 run(){ PGBENCH -f "$(pg_stage /tmp/t9_skew.sql)" \
-        -c 8 -j 4 -T 12 -n tpch 2>&1 | grep -oP 'tps = \K[0-9.]+' | head -1; }
+         -c 8 -j 4 -T "$SECS_T" -n tpch 2>&1 | grep -oP 'tps = \K[0-9.]+' | head -1; }
+# 표본 크기는 **부모 셸에서** 센다. run() 안에서 변수에 담으면 $(run) 이 서브셸이라
+# 값이 부모로 안 넘어오고, set -u 아래에서 unbound variable 로 죽는다(실제로 그랬다).
+tx_of(){ awk -v t="${1:-0}" -v s="$SECS_T" 'BEGIN{printf "%.0f", t*s}'; }
 printf "  %-10s %-9s %13s %13s %8s\n" "주문수" "적중률" "naive tps" "FOR SHARE" "손해"
-declare -A LOSS NAIVE
+declare -A LOSS NAIVE TX
 for N in 50 500 5000; do
   setsize $N
   for T in sync_cust_naive sync_cust_fs; do
     usetrg $T; r=$(run); [ "$T" = "sync_cust_naive" ] && A=$r || B=$r
   done
   LOSS[$N]=$(awk -v x="$A" -v y="$B" 'BEGIN{ if (y+0>0) printf "%.2f", x/y; else print "0" }')
-  NAIVE[$N]="$A"
+  NAIVE[$N]="$A"; TX[$N]="$(tx_of "$A")"
   printf "  %-10s %-9s %13s %13s %7s배\n" "$N" "$(awk -v n=$N 'BEGIN{printf "%.0f%%",n/5000*100}')" \
          "$A" "$B" "${LOSS[$N]}"
 done
@@ -228,19 +236,18 @@ echo
 # 100% 에서는 naive 도 FOR SHARE 도 같은 지점에서 직렬화돼(팬아웃 자체가 병목) 락이
 # 더 보탤 것이 없기 때문이다. 그런데도 옛 문장이 그대로 찍혀 표와 어긋났다.
 echo "해석:"
-if awk -v a="${LOSS[5000]}" -v b="${LOSS[50]}" 'BEGIN{exit !(a>b*1.2)}'; then
-  echo "  적중률이 낮으면 FOR SHARE 는 사실상 공짜이고(${LOSS[50]}배), 겹치면 비싸진다(${LOSS[5000]}배)."
-elif awk -v a="${LOSS[5000]}" -v b="${LOSS[50]}" 'BEGIN{exit !(b>a*1.2)}'; then
-  echo "  **이 실행에서는 방향이 반대다** — 적중률 1% 에서 ${LOSS[50]}배, 100% 에서 ${LOSS[5000]}배."
-  echo "  100% 에서는 naive 도 FOR SHARE 도 같은 지점에서 직렬화되므로(팬아웃 자체가 병목)"
-  echo "  락이 더 보탤 것이 없다. 락 손해가 보이려면 **경합이 부분적이어야** 한다."
-  echo "  naive 절대값을 같이 볼 것: 1% ${NAIVE[50]} → 10% ${NAIVE[500]} → 100% ${NAIVE[5000]} tps."
-else
-  echo "  적중률에 따른 손해 변화가 뚜렷하지 않다(1% ${LOSS[50]}배 / 10% ${LOSS[500]}배 / 100% ${LOSS[5000]}배)."
-  echo "  naive 절대값을 같이 볼 것: ${NAIVE[50]} → ${NAIVE[500]} → ${NAIVE[5000]} tps."
+echo "  이번 실행의 손해: 1% ${LOSS[50]}배 / 10% ${LOSS[500]}배 / 100% ${LOSS[5000]}배"
+# 100% 조건은 tps 가 낮아 12초에 담기는 트랜잭션이 적다 — 비율을 단정하면 안 된다.
+if [ "${TX[5000]:-0}" -lt 2000 ]; then
+  echo "  ⚠️ **100% 열의 배수는 믿지 말 것.** 이 조건은 ${SECS_T}초에 약 ${TX[5000]}건밖에"
+  echo "     못 돌아(1% 조건은 약 ${TX[50]}건) 표본이 작다. 같은 조건 5회 반복에서 이 열이"
+  echo "     **0.50~2.47배로 4.9배 벌어졌다** — 1% 열은 0.94~1.01 로 안정적이었다."
+  echo "     더 재려면 시간을 늘린다: SECS_T 를 키우거나 여러 번 돌려 중앙값을 본다."
 fi
-echo "  → 어느 방향이든 **naive 열의 절대값이 더 중요하다** — 락을 아예 안 써도 편중이"
-echo "     생기면 처리량이 무너진다. 주된 피해는 락이 아니라 팬아웃 자체다."
+echo "  안정적으로 재현되는 것은 손해 배수가 아니라 **naive 열의 절대값**이다:"
+echo "     1% ${NAIVE[50]} → 10% ${NAIVE[500]} → 100% ${NAIVE[5000]} tps."
+echo "  **락을 아예 안 써도** 편중이 생기면 처리량이 무너진다 — 주된 피해는 락이 아니라"
+echo "  팬아웃 자체(등급 1건 변경 = denorm 2만 행 갱신)다. 락을 빼는 것은 해법이 아니다."
 echo "  → 정합성 락의 비용은 '무엇을 잠그느냐'가 아니라 '누가 그걸 건드리느냐'다."
 echo "  → 판단 기준은 락 범위의 크기가 아니라 그 범위가 쓰기 트래픽과 겹치는 비율이며,"
 echo "     이건 스키마가 아니라 워크로드를 봐야 안다."
