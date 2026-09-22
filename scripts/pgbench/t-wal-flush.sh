@@ -194,21 +194,34 @@ echo "해석:"
 LAST=$(echo $CLIST | awk '{print $NF}')
 R1=$(awk -v a="$(med "${T_OFF[$FIRST]}")" -v b="$(med "${T_ON[$FIRST]}")" 'BEGIN{printf "%.2f",(b>0)?a/b:0}')
 RN=$(awk -v a="$(med "${T_OFF[$LAST]}")"  -v b="$(med "${T_ON[$LAST]}")"  'BEGIN{printf "%.2f",(b>0)?a/b:0}')
+# WAL 이 최상위였던 구간을 먼저 추린다 — 아래 두 단락이 모두 이걸 쓴다.
+WALC=""; LOCKC=""
+for c in $CLIST; do
+  printf %s "${W_ON[$c]:-}"  | grep -qE "WALSync|WALWrite" && WALC="$WALC $c"
+  printf %s "${W_ON[$c]:-}${W_OFF[$c]:-}" | grep -qE "Lock\\." && LOCKC="$LOCKC $c"
+done
 echo "  · fsync 는 비싼가 — off/on 처리량 비: clients=${FIRST} 에서 **${R1}배**, clients=${LAST} 에서 **${RN}배**."
 # **분할상환 판정은 처리량 비가 아니라 WAL 대기 점유율로 한다.**
 # 처음에 비로 판정했다가 "분할상환이 안 되고 있다"고 썼는데, 같은 출력의 대기 점유율은
 # 51% → 29% → 20% 로 분명히 줄고 있었다 — 두 문장이 서로 모순됐다.
 # 비가 안 줄어드는 것은 분할상환이 없어서가 아니라, on 이 WAL 천장에 닿는 동안
 # off 는 계속 확장해서 격차가 유지되기 때문이다. 둘은 다른 얘기다.
+# **WAL 이 최상위가 아닌 조건의 숫자를 'WAL 점유율'이라 부르면 안 된다.**
+# 처음에 최상위 이벤트의 숫자를 무조건 뽑았다가, clients=8 의 Lock.transactionid 25% 를
+# "WAL 점유율이 25% 로 줄었다"고 썼다. 다른 것의 점유율이다.
 pct() { printf %s "${1:-}" | grep -oE '[0-9]+%' | head -1 | tr -d '%'; }
-SH1=$(pct "${W_ON[$FIRST]:-}"); SHN=$(pct "${W_ON[$LAST]:-}")
+WF=$(echo $WALC | awk '{print $1}'); WL=$(echo $WALC | awk '{print $NF}')
+SH1=""; SHN=""
+if [ -n "${WF:-}" ] && [ "$WF" != "$WL" ]; then
+  SH1=$(pct "${W_ON[$WF]:-}"); SHN=$(pct "${W_ON[$WL]:-}")
+fi
 if awk -v r="$R1" 'BEGIN{exit !(r+0<=1.2)}'; then
   echo "    ★ 가장 낮은 동시성에서도 차이가 없다 — **이 장비의 fsync 는 싸다**(쓰기 캐시·NVMe)."
   echo "      여기서는 synchronous_commit 으로 얻을 것이 없다."
 else
   echo "    ★ **fsync 는 비싸다.** 가장 낮은 동시성에서 이미 ${R1}배 차다."
   if [ -n "${SH1:-}" ] && [ -n "${SHN:-}" ] && [ "$SHN" -lt "$SH1" ]; then
-    echo "      그리고 WAL 대기 점유율이 clients=${FIRST} 의 ${SH1}% 에서 clients=${LAST} 의 ${SHN}% 로"
+    echo "      그리고 WAL 대기 점유율이 clients=${WF} 의 ${SH1}% 에서 clients=${WL} 의 ${SHN}% 로"
     echo "      **줄어든다 — 그룹 커밋이 돌고 있다.** 여럿이 커밋하면 한 번의 flush 가 여러 커밋을"
     echo "      함께 실어 나르므로, 커밋 하나가 무는 fsync 비용이 동시성으로 갚아진다."
   fi
@@ -247,11 +260,6 @@ echo
 # 높은 동시성에서는 행 락에 밀려 회차마다 최상위가 뒤집힌다(실측: c=8 에서 한 번은
 # IO.WALSync 19%, 다음 실행은 Lock.transactionid 23%). LAST 만 보면 그 회차에
 # 어떤 게 올라왔느냐로 결론이 흔들린다.
-WALC=""; LOCKC=""
-for c in $CLIST; do
-  printf %s "${W_ON[$c]:-}"  | grep -qE "WALSync|WALWrite" && WALC="$WALC $c"
-  printf %s "${W_ON[$c]:-}${W_OFF[$c]:-}" | grep -qE "Lock\." && LOCKC="$LOCKC $c"
-done
 echo "  · 대기 이벤트가 말하는 것 —"
 for c in $CLIST; do
   printf "    clients=%-3s on: %-30s off: %s\n" "$c" "${W_ON[$c]:-?}" "${W_OFF[$c]:-?}"
@@ -272,13 +280,6 @@ else
   echo "    ※ 어느 조건에서도 WAL 계열이 최상위에 안 잡혔다. 위 해석은 처리량 차이에 근거한"
   echo "      추론이지 관측이 아니다 — ROUNDS 나 SECS 를 늘려 샘플을 더 모아 보라."
 fi
-echo
-echo "  · 처리량 쪽도 같이 보라. off 가 on 보다 빠른 폭이 클라이언트가 늘수록 **줄어들면**"
-echo "    그것도 분할상환의 증거다 — 동시성이 높을수록 fsync 를 덜 기다리기 때문이다."
-for c in $FIRST $SECOND $(echo $CLIST | awk '{print $NF}'); do
-  echo "    clients=$c: off/on 처리량 $(awk -v a="$(med "${T_OFF[$c]}")" -v b="$(med "${T_ON[$c]}")" \
-       'BEGIN{printf "%.2f", (b>0)?a/b:0}')배"
-done
 echo
 echo "  ⚠️ synchronous_commit=off 는 공짜가 아니다 — 크래시 시 **마지막 몇 백 ms 의 커밋이 사라진다.**"
 echo "     데이터가 깨지지는 않는다(원자성은 유지). '커밋했다고 응답했는데 없어도 되는가'를"
