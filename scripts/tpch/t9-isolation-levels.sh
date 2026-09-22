@@ -314,9 +314,10 @@ EOF
 echo "  워크로드 절반은 고객 등급 변경(sync_cust), 절반은 lineitem 삽입(sync_li 의 FOR SHARE)."
 echo "  고객 ${NCUST}명으로 좁혀 경합을 만든다. lineitem 은 넣고 바로 지워 순변화가 없다."
 echo
-printf "  %s%s %10s %10s %10s\n" "$(padr 격리수준 18)" "$(padr 재시도 20)" "$(padl TPS 10)" "$(padl 실패 10)" "$(padl 재시도수 10)"
+printf "  %s%s %10s %8s %8s %9s\n" "$(padr 격리수준 18)" "$(padr 재시도 20)" \
+  "$(padl TPS 10)" "$(padl 실패 8)" "$(padl 실패율 8)" "$(padl 재시도수 9)"
 printf "  %s\n" "-------------------------------------------------------------------------"
-declare -A T1 FAIL1 NTX1
+declare -A T1 FAIL1 NTX1 T10 FAIL10
 for e in "${LEVELS[@]}"; do
   LVL="${e%%:*}"; LBL="${e#*:}"
   for MT in 1 10; do
@@ -338,21 +339,52 @@ for e in "${LEVELS[@]}"; do
     fi
     FAIL=$(echo "$R" | grep -oE "number of failed transactions: [0-9]+" | grep -oE "[0-9]+" | head -1)
     RETR=$(echo "$R" | grep -oE "number of transactions retried: [0-9]+" | grep -oE "[0-9]+" | head -1)
+    # 실패율 — **TPS 열만 보면 정반대로 읽는다.** 실패한 트랜잭션은 일찍 죽으므로 싸고,
+    # 그래서 '많이 실패하는 설정'이 '빠른 설정'으로 보인다. 실제로 SERIALIZABLE·재시도없음이
+    # 2065 tps 로 표에서 제일 빨랐는데, 그 중 1647건이 실패였다. 비율을 같이 찍는다.
+    FRATE=$(awk -v f="${FAIL:-0}" -v t="${TPS:-0}" -v s="$SECS" \
+            'BEGIN{ d=t*s+f; if(d>0) printf "%.1f%%", f*100/d; else printf "?" }')
     if [ "$MT" = 1 ]; then
       T1["$LBL"]="$TPS"; FAIL1["$LBL"]="${FAIL:-0}"
       # 표본 크기 = tps × 초. 실패 '건수'는 이것에 비례하므로, 건수만 보고
       # 배수를 말하면 규모가 다른 실행끼리 비교가 안 된다 — 비율로 바꿔 둔다.
       NTX1["$LBL"]=$(awk -v t="${TPS:-0}" -v s="$SECS" 'BEGIN{printf "%.0f", t*s}')
       RL="없음 (max-tries=1)"
-    else RL="있음 (max-tries=10)"; fi
-    printf "  %s%s %10s %10s %10s\n" "$(padr "$LBL" 18)" "$(padr "$RL" 20)" \
-      "$(printf '%.0f' "${TPS:-0}")" "${FAIL:-?}" "${RETR:-0}"
+    else
+      RL="있음 (max-tries=10)"; T10["$LBL"]="$TPS"; FAIL10["$LBL"]="${FAIL:-0}"
+    fi
+    printf "  %s%s %10s %8s %8s %9s\n" "$(padr "$LBL" 18)" "$(padr "$RL" 20)" \
+      "$(printf '%.0f' "${TPS:-0}")" "${FAIL:-?}" "$FRATE" "${RETR:-0}"
   done
 done
 echo
-echo "  읽는 법 — **실패 열이 이 절의 핵심이다.**"
+echo "  읽는 법 — **TPS 열을 생산성으로 읽지 마라. 실패율 열과 같이 봐야 한다.**"
+echo "   실패한 트랜잭션은 일찍 죽으므로 싸다. 그래서 많이 실패하는 설정이 표에서 빨라 보인다."
+# RC 가 느린 것은 못 해서가 아니라 **기다려서**다. RR/SER 은 안 기다리고 죽어서 빠르다.
+# 이 대비를 숫자로 보여 주지 않으면 표가 정확히 반대로 읽힌다.
+if [ -n "${T1[READ COMMITTED]:-}" ] && [ -n "${T1[SERIALIZABLE]:-}" ]; then
+  RCX=$(printf '%.0f' "${T1[READ COMMITTED]}"); SEX=$(printf '%.0f' "${T1[SERIALIZABLE]}")
+  if awk -v a="$SEX" -v b="$RCX" 'BEGIN{exit !(a+0>b+0)}'; then
+    echo "   · 재시도 없음 기준, SERIALIZABLE(${SEX} tps)이 READ COMMITTED(${RCX} tps)보다 빠르다."
+    echo "     **더 많이 한 게 아니라 더 빨리 포기한 것이다** — 실패 ${FAIL1[SERIALIZABLE]:-?} vs ${FAIL1[READ COMMITTED]:-?} 건."
+    echo "     RC 는 FOR SHARE 가 앞 트랜잭션의 커밋을 **기다려서** 느리고,"
+    echo "     RR/SER 은 스냅숏이 고정돼 있어 기다리지 않고 **죽어서** 빠르다."
+  fi
+fi
 echo "   · READ COMMITTED 는 실패가 0 이다. FOR SHARE 가 기다렸다 읽으므로 재시도할 일이 없다."
-echo "   · REPEATABLE READ 는 실패가 생기지만 적고, 재시도하면 전부 복구되며 TPS 도 거의 안 준다."
+# "재시도해도 TPS 가 거의 안 준다"고 박아 뒀었다. 실측은 1223 → 398 로 67% 감소였다.
+if [ -n "${T1[REPEATABLE READ]:-}" ] && [ -n "${T10[REPEATABLE READ]:-}" ]; then
+  RR1=$(printf '%.0f' "${T1[REPEATABLE READ]}"); RRA=$(printf '%.0f' "${T10[REPEATABLE READ]}")
+  echo "   · REPEATABLE READ 는 실패가 생기고(${FAIL1[REPEATABLE READ]:-?}건), 재시도하면 거의 전부 복구된다"
+  echo "     (남은 실패 ${FAIL10[REPEATABLE READ]:-?}건). 대신 TPS 는 ${RR1} → ${RRA} 로 바뀐다 —"
+  if awk -v a="$RRA" -v b="$RR1" 'BEGIN{exit !(a+0 < b+0*0.8)}'; then
+    echo "     $(awk -v a="$RR1" -v b="$RRA" 'BEGIN{printf "%.0f%%", (a-b)*100/a}') 줄었다. 재시도는 공짜가 아니다:"
+    echo "     실패하던 트랜잭션이 이제 **끝까지 가므로**(기다림 포함) 한 건당 시간이 길어진다."
+    echo "     즉 재시도 없음의 높은 TPS 는 잃은 일을 세지 않은 값이었다."
+  else
+    echo "     거의 줄지 않았다 — 이 워크로드에서 재시도의 대가가 작다는 뜻이다."
+  fi
+fi
 # 배수를 박아 두지 않는다 — 재서 쓴다. 참고로 두 규모에서 8배 안팎으로 일관됐다
 # (SF=0.5: 151/19 = 7.9배, SF=10: 17/2 = 8.5배). 그래도 '10배'라고 고정하지는 않는다.
 # 키는 **표시용 라벨**이다(LEVELS 의 'serializable:SERIALIZABLE' 에서 오른쪽).
