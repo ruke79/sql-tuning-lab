@@ -59,6 +59,7 @@ sqlv() { PSQL -c "$1"; }
 # ── 규모 가드 ──────────────────────────────────────────────────────────
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
 scale_guard "$(sql "SELECT count(*) FROM lineitem")" 2 "$0"
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_abort-trap.inc"
 
 echo "§T-9 트리거 동기화 — ${ROUNDS}라운드"
 echo
@@ -277,3 +278,6 @@ else
   echo "  ※ 드리프트 검사의 UPDATE·DELETE 는 커밋됐다 — l_orderkey 300~320 의 lineitem 행은"
   echo "    지워진 채다. 원본 상태가 필요하면 ./scripts/restore-lab.sh --force-tpch 로 재적재한다."
 fi
+
+# 여기까지 왔으면 본문의 정리가 끝났다 — EXIT 트랩이 같은 일을 다시 하지 않게 한다.
+LAB_DONE=1

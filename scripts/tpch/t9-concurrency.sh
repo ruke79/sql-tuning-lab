@@ -98,6 +98,7 @@ sql(){ PSQL -tAc "$1"; }
 # ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
 scale_guard "$(sql "SELECT count(*) FROM lineitem")" 4 "$0"
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_abort-trap.inc"
 
 # ── 선행 조건 점검 ────────────────────────────────────────────────────
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
@@ -483,3 +484,6 @@ echo "주의: 이 스크립트는 원본 테이블을 커밋 변경한다. **그
 echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"load --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"index --db=postgres\"   ← 빼먹지 말 것"
+
+# 여기까지 왔으면 본문의 정리가 끝났다 — EXIT 트랩이 같은 일을 다시 하지 않게 한다.
+LAB_DONE=1

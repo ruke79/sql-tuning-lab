@@ -93,6 +93,7 @@ sql(){ PSQL -tAc "$1"; }
 # ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
 scale_guard "$(sql "SELECT count(*) FROM lineitem")" 4 "$0"
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_abort-trap.inc"
 # timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
 #   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
 # **래퍼를 거쳐야 한다.** 여기만 psql 을 직접 불렀다가, 호스트에 클라이언트가 없는
@@ -286,3 +287,6 @@ else
   echo "  ※ customer.c_mktsegment 는 측정 중 바뀐 채다(값만 다르고 행수는 그대로)."
   echo "    문서 실측과 맞춰야 하면 ./scripts/restore-lab.sh --force-tpch 로 재적재한다."
 fi
+
+# 여기까지 왔으면 본문의 정리가 끝났다 — EXIT 트랩이 같은 일을 다시 하지 않게 한다.
+LAB_DONE=1

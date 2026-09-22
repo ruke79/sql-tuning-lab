@@ -12,7 +12,8 @@
 #      그렇다면 **디바운스**(첫 알림 후 창 동안 더 모았다가 한 번에 처리)가 그걸 되돌리는가?
 #      고정 창은 한산할 때 순손해였다 — **적응형 창**(대기 시간을 그때그때 계산)이 그걸 없애는가?
 #      적응형은 시간만 보므로 일이 쌓여 있어도 기다린다 — **큐 깊이 신호**가 그걸 없애는가?
-#   ③ NOTIFY 는 공짜인가?                          → 아니다. 쓰기 경로에 1.6배가 붙는다
+#   ③ NOTIFY 는 공짜인가?                          → 아니다. 쓰기 경로에 몇 배가 붙는다
+#      (배수는 장비·부하마다 다르다. 이 랩에서 1.6배와 3.97배를 다 봤다 — ③이 그때그때 잰다)
 #
 # 다섯 방식이 겨루는 지점
 #   폴링      : 지연 하한 = 간격/2. 간격을 줄이면 지연은 주지만 헛왕복이 폭증한다
@@ -123,6 +124,7 @@ sql(){ PSQL -tAc "$1"; }
 # ── 규모 가드 ── (sql/q 정의 **뒤**여야 한다 — 앞에 뒀다가 "sql: command not found")
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_scale-guard.inc"
 scale_guard "$(sql "SELECT count(*) FROM lineitem")" 4 "$0"
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/_abort-trap.inc"
 
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
 [ "${NIDX:-0}" -lt 2 ] && { echo "  [중단] index 를 먼저 실행하세요."; exit 1; }
@@ -383,6 +385,30 @@ lbl(){ case $1 in poll:200) echo "폴링 200ms";; poll:20) echo "폴링 20ms";;
                   qdepth:5) echo "큐깊이 5ms";; qdepth:20) echo "큐깊이 20ms";;
                   poll:20) echo "폴링 20ms";; adaptive:5) echo "적응형 5ms";; esac; }
 
+# ── 해석문이 쓸 값을 꺼내는 헬퍼 ──────────────────────────────────────
+# sweep 이 ACC 를 통째로 덮어쓴다. 그래서 **각 절이 끝나는 자리에서** 값을 변수로
+# 빼 둬야 한다. 이걸 안 해서 이 스크립트의 해석문이 오래 전 실행의 숫자를 그대로
+# 들고 있었다 — 표에는 986 이 찍히는데 문장은 "NOTIFY 가 7,078 로 압도적"이라고 했다.
+# 표와 문장이 다르면 읽는 사람은 문장을 믿는다. 그래서 문장을 표에서 만든다.
+vlat(){  med "$(col "$1" 2)"; }   # 지연 중앙값(ms)
+vtrip(){ med "$(col "$1" 8)"; }   # 왕복 = 처리배치 + 빈폴링
+vemp(){  med "$(col "$1" 5)"; }   # 빈 폴링
+vper(){  med "$(col "$1" 9)"; }   # 배치당 항목
+# 빈 값을 0 으로 읽어 '이겼다'가 되면 안 된다 — 둘 다 값이 있을 때만 비교한다.
+lt(){ [ -n "${1:-}" ] && [ -n "${2:-}" ] && awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0<b+0)}'; }
+rat(){ awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{if(b+0==0)print "?";else printf "%.2f",a/b}'; }
+# 두 값이 15% 안이면 '사실상 같다'로 본다. 노이즈를 발견으로 읽지 않기 위해서다.
+near(){ [ -n "${1:-}" ] && [ -n "${2:-}" ] && \
+        awk -v a="$1" -v b="$2" 'BEGIN{exit !(b+0>0 && (a+0)<(b+0)*1.15 && (a+0)>(b+0)*0.85)}'; }
+# 주어진 모드들 중 $1 열의 최대/최소인 모드의 라벨과 값을 "라벨|값" 으로 준다.
+pick(){ local want="$1" cmp="$2"; shift 2
+        local bl="" bv="" m v
+        for m in "$@"; do v=$(vtrip "$m"); [ "$want" = lat ] && v=$(vlat "$m")
+          [ -z "$v" ] && continue
+          if [ -z "$bv" ] || awk -v a="$v" -v b="$bv" -v c="$cmp" \
+               'BEGIN{exit !(c=="max" ? a+0>b+0 : a+0<b+0)}'; then bv=$v; bl=$(lbl $m); fi
+        done; echo "$bl|$bv"; }
+
 if want 1; then
 # ── ① 아주 낮은 부하 ──────────────────────────────────────────────────
 echo "── ① 저부하(-R 50) · 자연 분포 · 배치 2000 (${ROUNDS}라운드 중앙값) ──"
@@ -391,13 +417,39 @@ sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
 full_refill; trg notify
 sweep 50 "$ROUNDS" /tmp/t9n_nat.sql "${MODES[@]}"
 hdr; for m in "${MODES[@]}"; do show "$m" "$(lbl $m)"; done
+# 값을 지금 꺼내 둔다 — 다음 sweep 이 ACC 를 덮어쓴다.
+LO_NOT=$(vlat notify);      TO_NOT=$(vtrip notify);      EO_NOT=$(vemp notify)
+LO_D20=$(vlat debounce:20); TO_D20=$(vtrip debounce:20); EO_D20=$(vemp debounce:20)
+LO_A20=$(vlat adaptive:20); TO_A20=$(vtrip adaptive:20); EO_A20=$(vemp adaptive:20)
+LO_A5=$(vlat adaptive:5);   TO_A5=$(vtrip adaptive:5)
+LO_Q20=$(vlat qdepth:20);   TO_Q20=$(vtrip qdepth:20)
 echo "  → 폴링 간격이 지연 바닥을 그대로 정한다. 큐가 비어 있는 시간이 대부분이라"
-echo "     '언제 깨느냐'가 곧 '언제 반영되느냐'다. NOTIFY 는 그 바닥을 없앤다."
-echo "  ※ 고정 창은 여기서 손해다. 한산할 때는 창 안에 모일 것이 없어 창이 그냥 기다림이 된다"
-echo "     (지연이 창의 약 절반으로 붙는다: 5→6, 20→15ms)."
-echo "  ★ 적응형 창은 그 손해를 없앤다. **같은 파라미터에서 고정 창을 두 축 모두 이긴다** —"
-echo "     5ms: 지연 6→3ms, 왕복 920→871 / 20ms: 지연 15→12ms, 왕복 640→498."
-echo "     기다릴 시간을 계산하므로, 직전 drain 이후 이미 지난 만큼은 안 기다리기 때문이다."
+echo "     '언제 깨느냐'가 곧 '언제 반영되느냐'다."
+IFS='|' read -r BL BV <<<"$(pick lat min "${MODES[@]}")"
+if [ "$BL" = "NOTIFY" ]; then
+  echo "  ★ NOTIFY 가 지연 최저다(${LO_NOT}ms) — 기다리는 창이 아예 없으니 바닥도 없다."
+else
+  echo "  ※ 이번 실행의 지연 최저는 NOTIFY(${LO_NOT}ms)가 아니라 ${BL}(${BV}ms)다."
+fi
+IFS='|' read -r TL TV <<<"$(pick trip max "${MODES[@]}")"
+echo "     대신 왕복은 ${TL} 가 가장 많다(${TV}) — 커밋마다 깨어나는 대가다."
+echo "  ※ 여기서는 빈 폴링의 차이가 크게 벌어진다: NOTIFY ${EO_NOT} / 고정창20 ${EO_D20} / 적응형20 ${EO_A20}."
+echo "     큐가 비어 있는 시간이 길어 '깨어났는데 할 일이 없는' 왕복이 그대로 쌓이기 때문이다."
+if lt "$LO_NOT" "$LO_D20"; then
+  echo "  ※ 고정 창은 여기서 손해다. 한산할 때는 창 안에 모일 것이 없어 창이 그냥 기다림이 된다"
+  echo "     — 고정창 20ms 의 지연 ${LO_D20}ms 가 NOTIFY(${LO_NOT}ms)보다 높다."
+else
+  echo "  ※ 이번 실행에서는 고정창 20ms(${LO_D20}ms)가 NOTIFY(${LO_NOT}ms)보다 낮았다 —"
+  echo "     '한산하면 창이 손해'가 재현되지 않았다."
+fi
+if lt "$LO_A20" "$LO_D20" && lt "$TO_A20" "$TO_D20"; then
+  echo "  ★ 적응형 창은 그 손해를 줄인다. **같은 20ms 에서 고정 창을 두 축 모두 이긴다** —"
+  echo "     지연 ${LO_D20}→${LO_A20}ms, 왕복 ${TO_D20}→${TO_A20}."
+  echo "     기다릴 시간을 계산하므로, 직전 drain 이후 이미 지난 만큼은 안 기다리기 때문이다."
+else
+  echo "  ※ 이번 실행에서 적응형은 고정 창을 두 축 모두 이기지는 못했다"
+  echo "     (지연 ${LO_D20}→${LO_A20}ms / 왕복 ${TO_D20}→${TO_A20})."
+fi
 echo
 
 fi
@@ -407,18 +459,43 @@ if want 2; then
 echo "── ② 중부하(-R 800) · 자연 분포 · 배치 2000 (${ROUNDS}라운드 중앙값) ──"
 sweep 800 "$ROUNDS" /tmp/t9n_nat.sql "${MODES[@]}"
 hdr; for m in "${MODES[@]}"; do show "$m" "$(lbl $m)"; done
+MD_NOT=$(vlat notify);      TD_NOT=$(vtrip notify);      ED_NOT=$(vemp notify);      PD_NOT=$(vper notify)
+MD_D20=$(vlat debounce:20); TD_D20=$(vtrip debounce:20)
+MD_A5=$(vlat adaptive:5);   TD_A5=$(vtrip adaptive:5);    PD_A5=$(vper adaptive:5)
+MD_A20=$(vlat adaptive:20); TD_A20=$(vtrip adaptive:20);  ED_A20=$(vemp adaptive:20); PD_A20=$(vper adaptive:20)
+MD_Q20=$(vlat qdepth:20);   TD_Q20=$(vtrip qdepth:20);    PD_Q20=$(vper qdepth:20)
 echo "  → 지연 순서는 그대로다 — 깨우는 간격은 한산할 때만이 아니라 **건강한 구간 전체에서**"
 echo "     지연을 지배한다. 워커가 따라잡는 한 큐는 자주 비기 때문이다."
-echo "  ★ 그런데 왕복 열에서 판이 뒤집힌다. **NOTIFY 가 7,078 로 압도적으로 많다.**"
-echo "     트랜잭션마다 알림이 하나씩 나가므로 알림 기반이 사실상"
-echo "     **트랜잭션 속도의 바쁜 폴링으로 퇴화**한 것이다(배치당 4.4항목 — 잘게 쪼개 일한다)."
-echo "  ★ 창이 그 지점을 고친다. 고정 5ms 는 지연 2→3ms 에 왕복 7,078→4,213."
-echo "  ★ 적응형은 한 발 더 간다. **빈 폴링이 4 와 2 로 사실상 0 이다**(고정창은 737/365)."
-echo "     페이싱 덕에 깨어날 때는 이미 일이 쌓여 있어 헛왕복 자체가 사라진다."
-echo "     배치당 항목이 4.4 → 16.2 → 51.7 로 커지는 것이 그 기전이다."
-echo "  ★ 곡선으로 보면 **적응형 5ms(6ms/1,380)가 고정창 20ms(9ms/1,988)와 폴링 20ms(9ms/2,066)를"
-echo "     두 축 모두에서 이긴다.** 같은 파라미터끼리 비교하면 적응형이 더 공격적으로 모을 뿐이다"
-echo "     (5ms 기준 지연 3→6ms, 왕복 4,213→1,380)."
+# 예전에는 "NOTIFY 가 7,078 로 압도적"이라고 박아 뒀다. 실측은 986 대 922 였다 —
+# **1.07배를 '압도적'이라고 쓴 것이다.** 그래서 최대·최소를 찾아서 말하고, 격차도 같이 찍는다.
+IFS='|' read -r TL TV <<<"$(pick trip max "${MODES[@]}")"
+IFS='|' read -r NL NV <<<"$(pick trip min "${MODES[@]}")"
+echo "  ★ 왕복 열에서는 순서가 달라진다 — 가장 많은 쪽이 **${TL}(${TV})**, 가장 적은 쪽이 ${NL}(${NV}) 다."
+if [ "$TL" = "NOTIFY" ]; then
+  echo "     NOTIFY 가 맨 위로 온 것은 트랜잭션마다 알림이 하나씩 나가기 때문이다 —"
+  echo "     알림 기반이 **트랜잭션 속도의 폴링으로 퇴화**하는 방향이다."
+  echo "     다만 이 실행의 격차는 $(rat "$TV" "$NV")배다. '압도적'인지 '이제 막 앞선'인지는"
+  echo "     그 배수로 판단해라 — 경계 자체는 ⑤에서 쓰기율을 훑어 찾는다."
+else
+  echo "     이번 실행에서 NOTIFY(${TD_NOT})는 왕복 최대가 아니다 — 이 부하에서는 퇴화가 아직 안 보인다."
+fi
+if lt "$ED_NOT" 20 && lt "$ED_A20" 20; then
+  echo "  ※ 빈 폴링은 여기서 어느 방식이든 사실상 0 이다(NOTIFY ${ED_NOT} / 적응형20 ${ED_A20})."
+  echo "     큐가 늘 차 있어 헛왕복이 생길 틈이 없다. **빈 폴링의 차이는 ①(저부하)에서만 보인다.**"
+else
+  echo "  ★ 적응형은 빈 폴링을 줄인다(NOTIFY ${ED_NOT} → 적응형20 ${ED_A20})."
+  echo "     페이싱 덕에 깨어날 때는 이미 일이 쌓여 있어 헛왕복이 사라지기 때문이다."
+fi
+echo "  ★ 실제로 달라지는 것은 **한 번에 얼마나 모아 가느냐**다 —"
+echo "     배치당 항목이 NOTIFY ${PD_NOT} → 적응형5ms ${PD_A5} → 적응형20ms ${PD_A20} 로 커진다."
+echo "     같은 일을 잘게 나눠 여러 번 가느냐, 모아서 몇 번 가느냐의 차이다."
+if lt "$MD_A5" "$MD_D20" && lt "$TD_A5" "$TD_D20"; then
+  echo "  ★ 적응형 5ms(${MD_A5}ms/${TD_A5})가 고정창 20ms(${MD_D20}ms/${TD_D20})를 두 축 모두에서 이긴다"
+  echo "     — 더 짧은 파라미터로 더 적게 찌르면서 더 빨리 반영한다."
+else
+  echo "  ※ 적응형 5ms(${MD_A5}ms/${TD_A5})와 고정창 20ms(${MD_D20}ms/${TD_D20}) 사이에"
+  echo "     두 축 모두를 이기는 쪽은 이번 실행에 없었다."
+fi
 echo
 
 fi
@@ -426,6 +503,7 @@ fi
 if want 4; then
 # ── ④ 버스트 소진: 큐 깊이 신호가 발화하는 유일한 구간 ─────────────────
 echo "── ④ 버스트 소진 · 워커 정지 중 2만 건 적체 → 기동 후 소진 시간 (3회) ──"
+declare -A BURST
 trg notify
 for MODE in adaptive qdepth; do
   T=""
@@ -440,10 +518,19 @@ for MODE in adaptive qdepth; do
     kill $WP 2>/dev/null; wait $WP 2>/dev/null
     T="$T $(( (e-s)/1000000 ))"
   done
-  printf "  %-14s 소진: %s ms (중앙 %s)\n" "$(lbl ${MODE}:20 2>/dev/null || echo $MODE)" "$T" "$(med "$T")"
+  BURST[$MODE]=$(med "$T")
+  printf "  %-14s 소진: %s ms (중앙 %s)\n" "$(lbl ${MODE}:20 2>/dev/null || echo $MODE)" "$T" "${BURST[$MODE]}"
 done
-echo "  → 이론상 큐깊이가 페이싱(20ms × 배치 9회 ≈ 180ms)을 아껴야 하는 구간인데,"
-echo "     실측에서는 그 절약이 배치 작업 시간(1.5~1.9초)에 묻혀 구분되지 않았다."
+BA="${BURST[adaptive]:-}"; BQ="${BURST[qdepth]:-}"
+echo "  → 이론상 큐깊이가 페이싱(20ms × 배치 10회 ≈ 200ms)을 아껴야 하는 구간이다."
+if lt "$BQ" "$BA"; then
+  echo "     실측에서도 큐깊이가 빨랐다 — ${BQ} vs ${BA}ms (차 $((BA-BQ))ms)."
+  echo "     다만 이 차이가 페이싱 절약분과 같은 크기인지는 이 측정만으로 못 가른다."
+else
+  echo "     그런데 실측은 그 반대다 — 큐깊이 ${BQ}ms / 적응형 ${BA}ms."
+  echo "     아껴야 할 200ms 가 소진 시간 자체(${BA}~${BQ}ms)에 묻혀 구분되지 않는다."
+  echo "     **이론상의 이득이 실측에서 안 보이면, 안 보이는 쪽이 답이다.**"
+fi
 echo
 
 fi
@@ -463,7 +550,8 @@ done
 P=$(med "$PLTPS"); N=$(med "$NOTPS")
 printf "  %-22s %10s tps  (범위 %s)\n" "큐 INSERT 만" "$P" "$(rng "$PLTPS")"
 printf "  %-22s %10s tps  (범위 %s)\n" "큐 INSERT + NOTIFY" "$N" "$(rng "$NOTPS")"
-printf "  %-22s %10s\n" "쓰기 경로 비용" "$(awk -v a=$P -v b=$N 'BEGIN{printf "%.2f배",a/b}')"
+W3=$(awk -v a=$P -v b=$N 'BEGIN{printf "%.2f",a/b}')
+printf "  %-22s %10s\n" "쓰기 경로 비용" "${W3}배"
 echo "  ※ payload 를 비워 두면 한 트랜잭션의 동일 알림이 하나로 합쳐지므로,"
 echo "     행 단위 트리거에서 세 번 불러도 실제로 나가는 알림은 트랜잭션당 1건이다."
 echo
@@ -476,27 +564,47 @@ echo "  · 이 실습들을 합치면 지연창의 지배 요인이 구간별로
 echo "      - 따라잡는 구간(건강)  → **깨우는 간격**이 지배. 배치·워커는 거의 무관"
 echo "      - 적체 구간(불건강)    → **처리 용량**이 지배 (t9-queue-tuning.sh ⑤)"
 echo "    즉 두 손잡이는 경쟁 관계가 아니라 **서로 다른 구간의 손잡이**다."
-echo "  · 고정 창은 부하 구간마다 답이 갈린다 — 한산하면 손해, 바쁘면 이득."
-echo "    그래서 **한 값으로 두 구간을 다 감당하지 못한다.** 부하가 오르내리는 시스템에서는"
-echo "    어느 값을 골라도 한쪽 구간에서 틀린 값이 된다."
+if [ -n "${LO_D20:-}" ] && [ -n "${MD_D20:-}" ]; then
+  if lt "$LO_NOT" "$LO_D20" && lt "$MD_D20" "$MD_NOT"; then
+    echo "  · 고정 창은 부하 구간마다 답이 갈린다 — 한산하면 손해(①: 고정창 ${LO_D20} vs NOTIFY ${LO_NOT}ms),"
+    echo "    바쁘면 이득(②: ${MD_D20} vs ${MD_NOT}ms). 그래서 **한 값으로 두 구간을 다 감당하지 못한다.**"
+    echo "    부하가 오르내리는 시스템에서는 어느 값을 골라도 한쪽 구간에서 틀린 값이 된다."
+  else
+    echo "  · 고정 창은 이번 실행에서 **두 구간 모두 NOTIFY 보다 손해였다**"
+    echo "    (①: ${LO_D20} vs ${LO_NOT}ms / ②: ${MD_D20} vs ${MD_NOT}ms)."
+    echo "    '바쁘면 고정 창이 이득'은 이 장비·이 부하 범위에서는 재현되지 않았다 —"
+    echo "    그러려면 커밋률이 창 주기를 넘어야 하는데 여기서는 거기까지 못 갔다(⑤의 달성tps 를 보라)."
+  fi
+fi
 echo "  · 적응형은 그 딜레마를 없앤다. 대기 시간을 **계산**하므로 한산하면 거의 안 기다리고"
 echo "    (저부하에서 고정 창을 두 축 모두 이긴다) 바빠지면 자동으로 모은다"
 echo "    (고부하에서 빈 폴링이 0 에 수렴한다). 파라미터의 의미도 더 정직하다 —"
 echo "    '얼마나 기다릴까'가 아니라 **'초당 몇 번까지 DB 를 찌를까'** 다."
-echo "  · 다만 적응형도 공짜는 아니다. 부하가 높으면 페이싱이 곧 지연이 되므로"
-echo "    (5ms → 6ms, 20ms → 15ms) 값은 **허용 지연**을 보고 정해야 한다."
-echo "  · **큐 깊이 신호는 잰 어떤 구간에서도 이득이 없었다.**"
-echo "      - 정상 구간: 페이싱 간격(5~20ms) 동안 쌓이는 항목이 임계치(500)에 한참 못 미쳐"
-echo "        신호가 발화하지 않는다 — 적응형과 수치가 동일하다"
-echo "      - 버스트 소진(④): 발화하지만 절약분이 배치 작업 시간에 묻힌다"
+echo "  · 다만 적응형도 공짜는 아니다. 부하가 높으면 페이싱이 곧 지연이 된다 —"
+if [ -n "${LO_A5:-}" ] && [ -n "${MD_A5:-}" ]; then
+  echo "    ①→② 에서 적응형 5ms 의 지연이 ${LO_A5}→${MD_A5}ms, 20ms 가 ${LO_A20}→${MD_A20}ms 로 오른다."
+fi
+echo "    그래서 값은 **허용 지연**을 보고 정해야 한다."
+if near "${MD_Q20:-}" "${MD_A20:-}"; then
+  echo "  · **큐 깊이 신호는 잰 어떤 구간에서도 이득이 없었다.**"
+  echo "      - 정상 구간: 페이싱 간격(5~20ms) 동안 쌓이는 항목이 임계치(500)에 한참 못 미쳐"
+  echo "        신호가 발화하지 않는다 — 적응형과 수치가 사실상 같다(②: ${MD_Q20} vs ${MD_A20}ms)"
+else
+  echo "  · 큐 깊이 신호는 ②에서 적응형과 값이 갈렸다(${MD_Q20} vs ${MD_A20}ms)."
+  echo "      - 임계치(500)가 실제로 발화했는지 배치당항목 열로 확인해라"
+  echo "        (${PD_Q20:-?} vs ${PD_A20:-?}) — 비슷하면 발화하지 않은 것이다"
+fi
+echo "      - 버스트 소진(④): 발화하지만 절약분이 소진 시간에 묻힌다(④의 두 값을 보라)"
 echo "    '페이싱이 곧 지연'을 깊이 신호로 피하려면 임계치를 페이싱당 도착량(~4건)까지"
 echo "    낮춰야 하는데, 그건 NOTIFY 로 돌아가는 것이다. **합침은 기다림 그 자체다 —**"
 echo "    **기다림을 건너뛰면 합침도 같이 사라진다.** 신호를 늘릴 게 아니라 허용 지연으로"
 echo "    페이싱 값을 정하는 것이 맞다."
 echo "  · 부하가 높으면 '창을 두고 모으는 것'과 '주기적으로 훑는 것'이 같은 동작으로 수렴한다 —"
-echo "    고정창 20ms(9ms/1,988)와 폴링 20ms(9ms/2,066)가 거의 겹치는 것이 그 증거다."
+echo "    창이 차기 전에 이미 일이 쌓여 있으면 창은 그냥 주기가 되기 때문이다."
+echo "    (②의 표에 폴링 20ms 열은 없다. 직접 대 보려면 MODES 에 poll:20 을 넣어야 한다 —"
+echo "     **없는 열을 근거로 든 문장이 오래 남아 있었다.**)"
 echo "  · 그래서 NOTIFY 는 처리량 대책이 아니라 **응답성 대책**이고, 심지어 처리량을 깎는다."
-echo "    쓰기 경로에 1.6배가 붙으므로(③), 적체가 문제인 상황에 붙이면 오히려 악화된다."
+echo "    쓰기 경로에 ${W3:-?}배가 붙으므로(③), 적체가 문제인 상황에 붙이면 오히려 악화된다."
 echo "  → 실무 조합: NOTIFY 로 깨우되 **타임아웃 폴링을 안전장치로 함께** 둔다."
 echo "     NOTIFY 는 저장되지 않는다 — 워커가 죽어 있는 동안 발행된 알림은 사라진다."
 echo "     알림만 믿으면 재시작 직후 남은 큐를 영영 못 집는다. 큐 테이블이 진실이고"
@@ -533,7 +641,7 @@ fi
 # -R 900 이고, 그러면 거기서 찾은 경계는 그 rate 의 경계가 아니다.
 printf "  %-8s %8s | %-22s | %-22s | %-22s %s\n" "목표" "달성tps" "NOTIFY (지연ms/왕복)" "폴링1ms (지연ms/왕복)" "적응형5ms (지연ms/왕복)" "잔량"
 printf "  %s\n" "------------------------------------------------------------------------------------------------------------"
-CROSS=""
+CROSS=""; FLIP=""; BACK=0; ABOVE=0   # set -u 대비 — 루프 안에서 처음 쓰면 죽는다
 for R in 50 100 200 400 800 1600 3200; do
   N=$(run_case notify   "$R" /tmp/t9n_nat.sql)
   P=$(run_case poll:1   "$R" /tmp/t9n_nat.sql)
@@ -553,18 +661,36 @@ for R in 50 100 200 400 800 1600 3200; do
   if [ -z "$CROSS" ] && awk -v a="${NT:-0}" -v b="${PT:-0}" 'BEGIN{exit !(a > b*0.95)}'; then
     CROSS="$R"
     awk -v a="${NT:-0}" -v b="${PT:-0}" 'BEGIN{exit !(a > b*1.05)}' \
-      && MARK="  ← NOTIFY 가 더 많아진다" || MARK="  ← 대등해지는 지점"
+      && { MARK="  ← NOTIFY 가 더 많아진다"; FLIP="$R"; } || MARK="  ← 대등해지는 지점"
   fi
+  # **경계는 '한 줄'이 아니라 '그 위로도 유지되느냐'다.** 예전에는 한 줄만 보고
+  # "-R 400 에서 퇴화했다"고 단정했는데, 그 위 세 줄에서 NOTIFY 가 다시 왕복이 적었다.
+  # 한 줄짜리 교차는 노이즈다. 그래서 교차 이후 되돌아간 줄을 센다.
+  if [ -n "$CROSS" ] && [ "$R" != "$CROSS" ] \
+     && awk -v a="${NT:-0}" -v b="${PT:-0}" 'BEGIN{exit !(a < b*0.95)}'; then
+    BACK=$((BACK+1))
+  fi
+  [ -n "$CROSS" ] && [ "$R" != "$CROSS" ] && ABOVE=$((ABOVE+1))
   # 잔량(부하 종료 직후 큐에 남은 항목) = 워커가 따라잡고 있었는가. 0 이 아니면 적체 구간이다.
   printf "  %-8s %8s | %9s / %-10s | %9s / %-10s | %9s / %-10s %6s%s\n" \
     "-R $R" "$(echo "$N"|awk '{print $1}')" "$NL" "$NT" "$PL" "$PT" "$AL" "$AT" \
     "$(echo "$N"|awk '{print $7}')" "$MARK"
 done
 echo
-if [ -n "$CROSS" ]; then
-  echo "  → **경계는 -R ${CROSS} 부근이다.** 그 아래에서는 NOTIFY 가 왕복도 적고 지연도 낮다."
-  echo "    그 위로는 트랜잭션마다 알림이 나가 **NOTIFY 가 1ms 폴링보다 더 자주 깨어난다** —"
-  echo "    알림 기반이 '가장 공격적인 폴링보다도 바쁜 폴링'으로 퇴화한 지점이다."
+if [ -n "$CROSS" ] && [ -n "$FLIP" ] && [ "$BACK" -eq 0 ]; then
+  echo "  → **경계는 -R ${CROSS} 부근이다.** 그 아래에서는 NOTIFY 의 왕복이 더 적다."
+  echo "    그 위로는 트랜잭션마다 알림이 나가 **NOTIFY 가 1ms 폴링보다 더 자주 깨어나고,**"
+  echo "    **그 상태가 위쪽 ${ABOVE}줄에서 유지된다** — 알림 기반이 '가장 공격적인 폴링보다도"
+  echo "    바쁜 폴링'으로 퇴화한 것이다."
+elif [ -n "$CROSS" ]; then
+  # 교차가 한 줄만 나타났다가 위쪽에서 되돌아가는 경우. 이걸 '경계'라고 쓰면
+  # 노이즈를 발견으로 읽는 것이다 — 실제로 표가 '대등'이라고 찍는 동안
+  # 문장만 "퇴화한 지점이다"라고 단정하던 버그가 있었다.
+  echo "  → **경계에 닿지 않았다.** -R ${CROSS} 에서 한 번 대등해지지만,"
+  echo "    그 위 ${ABOVE}줄 중 ${BACK}줄에서 NOTIFY 의 왕복이 다시 더 적어진다."
+  [ -z "$FLIP" ] && echo "    5% 를 넘는 역전은 어느 줄에서도 없었다."
+  echo "    **한 줄짜리 교차는 경계가 아니다.** 경계라면 그 위로 유지되어야 한다."
+  echo "    달성tps 열을 보라 — 목표 rate 를 못 따라가고 있다면 더 올려도 소용없다."
 else
   echo "  → 이 구간에서는 뒤집히지 않았다. **달성tps 열을 보라** — 목표 rate 를 못 따라가고 있다면"
   echo "    더 올려도 소용없다. 그 장비에서는 NOTIFY 가 1ms 폴링을 넘어설 만큼 커밋을 못 하는 것이고,"
@@ -616,7 +742,7 @@ echo
 # 45~57ms 로 **구분되지 않는다** — 순서가 만든 값이었다(§T-0 원칙 6, 이 랩이 이미 한 번 겪은 실수).
 printf "  %s\n" "  깨우는 방식      달성tps  지연중앙  최대지연      왕복      잔량 | cust배치  cust합ms"
 printf "  %s\n" "  -------------------------------------------------------------------------------------"
-declare -A B_T B_L B_M B_R B_Q B_CB B_CM
+declare -A B_T B_L B_M B_R B_Q B_CB B_CM B_TOT
 MODES6=("notify" "poll:20" "adaptive:5")
 for m in "${MODES6[@]}"; do B_L[$m]=""; done
 for r in $(seq 1 "$ROUNDS"); do
@@ -627,11 +753,12 @@ for r in $(seq 1 "$ROUNDS"); do
     G=$(sql "WITH g AS (SELECT cust_items, EXTRACT(epoch FROM t - lag(t) OVER (ORDER BY t))*1000 AS gap
                           FROM denorm_stat)
              SELECT count(*) FILTER (WHERE cust_items>0) || '|' ||
-                    coalesce(round(sum(gap) FILTER (WHERE cust_items>0))::text,'-') FROM g")
+                    coalesce(round(sum(gap) FILTER (WHERE cust_items>0))::text,'-') || '|' ||
+                    coalesce(round(sum(gap))::text,'-') FROM g")
     B_L[$m]="${B_L[$m]} $(echo "$R"|awk '{print $2}')"
     B_T[$m]="$(echo "$R"|awk '{print $1}')"; B_M[$m]="$(echo "$R"|awk '{print $3}')"
     B_R[$m]="$(echo "$R"|awk '{print $8}')"; B_Q[$m]="$(echo "$R"|awk '{print $7}')"
-    B_CB[$m]="${G%%|*}"; B_CM[$m]="${G##*|}"
+    B_CB[$m]="${G%%|*}"; B_CM[$m]="$(echo "$G"|cut -d'|' -f2)"; B_TOT[$m]="${G##*|}"
   done
 done
 for m in "${MODES6[@]}"; do
@@ -647,16 +774,39 @@ echo "   이 워크로드에서 비싼 일은 단 하나, '고객1 등급 전파
 echo "   파생 ${FAN}행을 갱신하고, 위 표에서 계산하면 **회당 약 ${PERC}ms** 다(cust합ms ÷ cust배치)."
 echo "   drain 은 한 배치 안의 같은 고객을 **DISTINCT 로 접어** UPDATE 를 한 번만 한다."
 echo "   그래서 총 비용 = **(cust 항목이 들어 있던 배치 수) × 회당 비용** 이고, 배치 안에 그 고객이"
-echo "   1건 있든 10건 있든 값이 같다. 문장 단위로 계측해 보면 **drain 시간의 약 97% 가 이 한 문장**이다."
-echo "   (claim / ord / line / depth 를 다 합쳐도 나머지 3% 다.)"
+echo "   1건 있든 10건 있든 값이 같다."
+# 예전에는 "drain 시간의 약 97%"라고 박아 뒀다. 그 값은 이 표 어디에도 없었다 —
+# 다른 실행에서 따로 계측한 숫자였고, 그래서 표와 맞는지 아무도 확인할 수 없었다.
+# 이제 같은 denorm_stat 에서 전체 drain 시간도 같이 받아 **여기서 계산한다.**
+SHARE=$(awk -v a="${B_CM[adaptive:5]:-0}" -v b="${B_TOT[adaptive:5]:-0}" \
+        'BEGIN{ if(b+0>0) printf "%.0f", a*100/b; else printf "?" }')
+echo "   그 한 문장이 drain 시간에서 차지하는 비중은 **${SHARE}%** 다"
+echo "   (적응형5ms 기준 cust합 ${B_CM[adaptive:5]:-?}ms / 전체 ${B_TOT[adaptive:5]:-?}ms)."
+echo "   claim / ord / line / depth 를 다 합친 것이 나머지다."
 echo
 echo "   그리고 세 방식의 'cust배치'와 'cust합ms' 가 거의 같다 — 즉 **세 방식이 같은 일을 한다.**"
-echo "   합계가 측정 시간(10초)에 육박하면 워커는 100% 포화 상태이고, 그때 잔량은 깨우는 방식이"
-echo "   아니라 **비싼 항목의 도착률 × 항목당 비용**이 정한다. 깨우기로는 손댈 수 없는 값이다."
+# 포화인지 아닌지를 말로 때우지 않는다. 측정 시간 대비 몇 %를 비싼 문장에 썼는지로 가른다.
+BUSY=$(awk -v a="${B_CM[adaptive:5]:-0}" -v s="${SECS:-0}" \
+       'BEGIN{ if(s+0>0) printf "%.0f", a*100/(s*1000); else printf "?" }')
+echo "   비싼 문장에 쓴 시간은 측정 시간 ${SECS}초의 **${BUSY}%** 다."
+# 잔량이 실제로 붙었는가 — 이게 '적체 구간을 만들었는가'의 유일한 증거다.
+QMAX=0; for m in "${MODES6[@]}"; do [ "${B_Q[$m]:-0}" -gt "$QMAX" ] && QMAX="${B_Q[$m]}"; done
 echo
-echo "  → **처음 가설이 맞았다: 적체 구간에서는 깨우는 방식이 의미를 잃는다.**"
-echo "    중간에 \"아니다, NOTIFY 가 최악이다\" 로 한 번 뒤집어 적었는데, 그게 틀렸다."
-echo "    고정 순서 1회 측정이 만든 값이었고 교차 측정에서 사라졌다."
+if [ "$QMAX" -gt 100 ] || awk -v b="${BUSY:-0}" 'BEGIN{exit !(b+0>=80)}'; then
+  echo "  → **적체 구간을 만들었고, 거기서는 깨우는 방식이 의미를 잃는다.**"
+  echo "    워커가 포화면 잔량은 깨우는 방식이 아니라 **비싼 항목의 도착률 × 항목당 비용**이"
+  echo "    정한다. 깨우기로는 손댈 수 없는 값이다."
+else
+  echo "  → **주의: 이번 실행은 적체 구간까지 가지 않았다.** 잔량 최대 ${QMAX}, 워커 점유 ${BUSY}%."
+  echo "    항목 하나를 ${FAN}행짜리로 비싸게 만들었는데도 워커가 따라잡았다는 뜻이다."
+  echo "    그래도 **세 방식의 cust배치·cust합ms 가 같다**는 사실은 그대로다 —"
+  echo "    비싼 항목이 지배하기 시작하면 깨우는 방식의 차이가 묻힌다는 방향은 보인다."
+  echo "    다만 '적체 구간에서 의미를 잃는다'를 이 실행으로 단정하지는 마라."
+  echo "    단정하려면 잔량이 계속 쌓이는 조건(고객1 주문 수를 더 늘리거나 -R 을 올려)이 필요하다."
+fi
+echo
+echo "  ※ 이 절은 예전에 \"NOTIFY 가 최악이다\"로 한 번 뒤집어 적혔다가 틀린 것으로 밝혀졌다."
+echo "    고정 순서 1회 측정이 만든 값이었고 ${ROUNDS}라운드 교차에서 사라졌다."
 echo "    **이 랩이 §T-0 에 적어 둔 원칙을 스스로 어겨서 생긴 오답이다.**"
 echo
 echo "  → 실무 규칙: 밀리기 시작하면 **깨우는 방식을 바꾸는 것은 답이 아니다.**"
@@ -708,3 +858,6 @@ echo "   원래 값이 필요하면 재적재한다:"
 echo "  ./gradlew :tpch:bootRun --args=\"schema --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"load   --db=postgres\""
 echo "  ./gradlew :tpch:bootRun --args=\"index  --db=postgres\""
+
+# 여기까지 왔으면 본문의 정리가 끝났다 — EXIT 트랩이 같은 일을 다시 하지 않게 한다.
+LAB_DONE=1
