@@ -45,6 +45,10 @@ PGUSER_="${PGUSER:-tuner}"
 DB=pgbench_lab
 
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
+# 두 비율이 '사실상 같은가' — 절대차 2%p 안이면 같다고 본다.
+# (HOT 비율은 0.1 과 0.2 처럼 작은 값도, 68 과 70 처럼 큰 값도 오므로 상대비는 안 맞는다.)
+near2() { [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$1" != "?" ] && [ "$2" != "?" ] && \
+          awk -v a="$1" -v b="$2" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d<=2)}'; }
 
 # pgbench 는 컨테이너 경로에서도 쓸 수 있다(postgres 이미지에 들어 있다) — 아래 pg_precheck 이 본다.
 # 클라이언트가 호스트에 있을 수도, 컨테이너 안에만 있을 수도 있다. 없다고 그냥 두면
@@ -116,6 +120,43 @@ if [ "$NACC" -lt 1000 ]; then
   NACC=$(q "SELECT count(*) FROM pgbench_accounts")
 fi
 
+# ── 규모 가드 ─────────────────────────────────────────────────────────
+# **이 스크립트의 비용은 벤치마크가 아니라 VACUUM FULL 이 정한다.**
+# measure() 가 매번 테이블을 통째로 다시 쓴다(fillfactor 를 적용하려면 재작성이 필요하다).
+# 호출 횟수는 ① ROUNDS×4 + ② ROUNDS×3 + ③ ROUNDS×4×2 = ROUNDS×15 이다.
+# ROUNDS=2 면 30회. 테이블이 크면 이게 그대로 시간이 된다.
+#
+# 실측: pgbench_accounts 152MB(scale=10) VACUUM FULL 2,457ms → 약 61 MB/s.
+# 이 값으로 scale=2000(총 약 30GB)을 외삽하면 회당 503초 = 8.4분이고,
+# 실제로 그 규모를 돌린 사용자의 ①②(14회)가 2시간 걸렸다 — 외삽이 맞았다.
+VF_RATE=60                                  # MB/s, 보수적으로 낮춰 잡는다
+NPER=0
+want 1 && NPER=$(( NPER + 4 ))      # ① 조건 4개
+want 2 && NPER=$(( NPER + 3 ))      # ② fillfactor 3개
+want 3 && NPER=$(( NPER + 8 ))      # ③ 클라이언트 4단계 × 조건 2개
+NMEAS=$(( ROUNDS * NPER ))
+TOTMB=$(q "SELECT round(pg_total_relation_size('pgbench_accounts')/1048576.0)" 2>/dev/null)
+case "$TOTMB" in ''|*[!0-9]*) TOTMB=0;; esac
+if [ "$TOTMB" -gt 0 ] && [ "${NMEAS:-0}" -gt 0 ]; then
+  EST=$(( TOTMB * NMEAS / VF_RATE ))        # 초
+  if [ "$EST" -gt 1800 ] && [ "${FORCE:-0}" != "1" ]; then
+    echo "  [중단] pgbench_accounts 가 ${TOTMB}MB 다(행 ${NACC})."
+    echo "         이 스크립트는 measure() 마다 **VACUUM FULL** 로 테이블을 통째로 다시 쓴다."
+    echo "         지금 설정(ROUNDS=$ROUNDS, ONLY=$ONLY)이면 **${NMEAS}회** 재작성한다."
+    echo "         실측 ${VF_RATE}MB/s 로 잡으면 **약 $(( EST / 60 ))분** 걸린다 — 벤치마크(${SECS}초×${NMEAS})는 그중 일부일 뿐이다."
+    echo
+    echo "         그리고 큰 규모에서는 **측정 자체가 무너진다.** 행이 많아 갱신이 흩어지면"
+    echo "         UPDATE 마다 새 페이지를 건드려 WAL 이 거의 전부 FPI 가 되고,"
+    echo "         'FPI 제외' 열이 큰 두 수의 차가 되어 신호를 못 담는다(음수까지 나온다)."
+    echo
+    echo "         작은 규모에서 재라 — 이 실습이 보이려는 것(HOT, fillfactor, WAL)은"
+    echo "         규모가 아니라 **갱신 컬럼과 페이지 여유**가 정한다:"
+    echo "           dropdb pgbench_lab && SCALE=10 $0      # 100만 행, 수 분"
+    echo "         지금 규모 그대로 강행하려면: FORCE=1 $0"
+    exit 1
+  fi
+fi
+
 # 실험용 인덱스만 지운다(기본키는 남긴다).
 clean_idx() {
   for i in $(q "SELECT indexname FROM pg_indexes
@@ -164,10 +205,20 @@ measure() {
   # 싣는다. 위에서 CHECKPOINT 를 고정했으므로 그 몫이 모든 조건에 **똑같이** 크게 붙어
   # (여기서는 WAL 의 약 90%) 정작 보려는 인덱스 유지 비용을 덮어 버린다.
   # 빼고 남는 것이 "이 UPDATE 가 실제로 기록한 변경량"이다.
+  #
+  # **이 뺄셈에는 한계가 있다.** wal_fpi 는 '몇 장'이고 바이트가 아니다. PostgreSQL 은
+  # FPI 를 쓸 때 페이지 가운데 빈 공간(hole)을 떼고 싣는다. 그래서 wal_fpi*8192 는
+  # 실제 FPI 바이트의 **상한**이고 항상 조금 과대평가다.
+  # 평소엔 무해한데, FPI 비중이 100% 에 가까워지면 '거의 같은 두 수의 차'가 되어
+  # 과대평가분이 신호보다 커진다 — **실제로 음수가 찍혔다**(전체 16084B / 제외 -338B).
+  # 그 조건은 규모가 크고 갱신이 흩어질 때 온다: 매 UPDATE 가 새 힙 페이지 + 새 인덱스
+  # 리프를 건드려 둘 다 FPI 가 되므로 UPDATE 당 FPI 2장(16384B)이 그대로 전체 WAL 이 된다.
+  # 그래서 FPI 비중을 같이 돌려주고, 아래 표가 그걸 보고 판단한다.
   q "SELECT round(${tps:-0}::numeric,0) || '|' ||
             coalesce(round(100.0*t.n_tup_hot_upd/NULLIF(t.n_tup_upd,0),1)::text,'?') || '|' ||
             coalesce(round(w.wal_bytes / NULLIF(t.n_tup_upd,0))::text,'?') || '|' ||
-            coalesce(round((w.wal_bytes - w.wal_fpi::bigint*8192) / NULLIF(t.n_tup_upd,0))::text,'?')
+            coalesce(round((w.wal_bytes - w.wal_fpi::bigint*8192) / NULLIF(t.n_tup_upd,0))::text,'?') || '|' ||
+            coalesce(round(100.0*w.wal_fpi::bigint*8192 / NULLIF(w.wal_bytes,0),1)::text,'?')
        FROM pg_stat_user_tables t, pg_stat_wal w WHERE t.relname='pgbench_accounts'"
 }
 
@@ -179,7 +230,7 @@ padl()  { local n; n=$(dispw "$1"); while [ "$n" -lt "$2" ]; do printf " "; n=$(
 
 # 여러 라운드의 최대 TPS(=간섭이 가장 적었던 회)와, 그 회의 HOT/WAL 을 같이 남긴다.
 # 평균이 아니라 최대를 쓰는 이유는 §T-0 과 같다 — 느린 쪽은 잡음이 섞인 쪽이다.
-declare -A BEST_T BEST_H BEST_W BEST_F
+declare -A BEST_T BEST_H BEST_W BEST_F BEST_P
 
 echo "§T-8 후반 — 인덱스의 쓰기 비용 (HOT 이 깨지는 지점)"
 echo "  pgbench_accounts ${NACC}행 / 클라이언트 ${CLIENTS} / 조건당 ${SECS}초 × ${ROUNDS}라운드 (교차)"
@@ -202,16 +253,16 @@ for r in $(seq 1 "$ROUNDS"); do
     L="${c%%|*}"; DDL="${c#*|}"
     clean_idx
     [ -n "$DDL" ] && q "$DDL" >/dev/null
-    R=$(measure); IFS='|' read -r T H W F <<<"$R"
+    R=$(measure); IFS='|' read -r T H W F P <<<"$R"
     prev="${BEST_T[$L]:-0}"
     if awk -v a="$T" -v b="$prev" 'BEGIN{exit !(a>b)}'; then
-      BEST_T[$L]="$T"; BEST_H[$L]="$H"; BEST_W[$L]="$W"; BEST_F[$L]="$F"
+      BEST_T[$L]="$T"; BEST_H[$L]="$H"; BEST_W[$L]="$W"; BEST_F[$L]="$F"; BEST_P[$L]="$P"
     fi
     printf "."
   done
 done
 echo; echo
-printf "  %s%10s %10s %14s %14s %10s\n" "$(padr 조건 38)" "$(padl TPS 10)" "$(padl HOT비율 10)" "$(padl "UPDATE당 WAL" 14)" "$(padl "FPI 제외" 14)" "$(padl 인덱스 10)"
+printf "  %s%10s %9s %13s %13s %8s %9s\n" "$(padr 조건 38)" "$(padl TPS 10)" "$(padl HOT비율 9)" "$(padl "UPDATE당 WAL" 13)" "$(padl "FPI 제외" 13)" "$(padl "FPI몫" 8)" "$(padl 인덱스 9)"
 printf "  %s\n" "--------------------------------------------------------------------------------------------------"
 BASE=""
 for c in "${CONDS[@]}"; do
@@ -220,22 +271,55 @@ for c in "${CONDS[@]}"; do
   SZ=$(idx_size)
   [ -z "$BASE" ] && BASE="${BEST_T[$L]}"
   REL=$(awk -v a="${BEST_T[$L]:-0}" -v b="$BASE" 'BEGIN{ if(b>0) printf "%.2fx", a/b }')
-  printf "  %s%10s %9s%% %12s B %12s B %10s  %s\n" "$(padr "$L" 38)" \
-     "${BEST_T[$L]:-?}" "${BEST_H[$L]:-?}" "${BEST_W[$L]:-?}" "${BEST_F[$L]:-?}" "$SZ" "$REL"
+  printf "  %s%10s %8s%% %11s B %11s B %7s%% %9s  %s\n" "$(padr "$L" 38)" \
+     "${BEST_T[$L]:-?}" "${BEST_H[$L]:-?}" "${BEST_W[$L]:-?}" "${BEST_F[$L]:-?}" "${BEST_P[$L]:-?}" "$SZ" "$REL"
 done
 clean_idx
 echo
+L1="① 기준 (기본키만)"; L2="② + (filler) — 갱신 안 되는 컬럼"
+L3="③ + (abalance) — 갱신되는 컬럼"; L4="④ 문서의 3개 전부"
+H1="${BEST_H[$L1]:-?}"; H2="${BEST_H[$L2]:-?}"; H3="${BEST_H[$L3]:-?}"
+P1="${BEST_P[$L1]:-0}"; F1="${BEST_F[$L1]:-0}"; F2="${BEST_F[$L2]:-0}"
 echo "  읽는 법 —"
-echo "   · ②는 인덱스를 하나 늘렸는데 **HOT 비율이 안 움직인다.** UPDATE 가 filler 를 안 건드려"
-echo "     HOT 을 깨지 않기 때문이다. '인덱스 개수'만으로는 설명되지 않는다."
-echo "     다만 공짜는 아니다 — 기준선에서 이미 HOT 이 아니었던 몫(약 1/3)에 대해서는"
-echo "     이 인덱스도 갱신 대상이라, FPI 제외 WAL 이 조금 는다. **깨뜨리는 것과 얹히는 것은 다르다.**"
-echo "   · ③은 인덱스 수가 ②와 같은데 HOT 이 **0% 로 무너진다.** abalance 가 갱신 컬럼이라서다."
+# "기준선에서 이미 HOT 이 아니던 몫(약 1/3)" 이라고 박아 뒀었다. 그건 작은 scale 의 값이고,
+# 2억 행에서는 기준선 HOT 이 0.1% 였다 — 1/3 이 아니라 거의 전부가 이미 HOT 이 아니었다.
+# 기준선 HOT 을 재서 말한다.
+NONHOT=$(awk -v h="$H1" 'BEGIN{ if(h=="?") print "?"; else printf "%.0f", 100-h }')
+echo "   · 기준선(①)의 HOT 은 **${H1}%** 다 — 즉 UPDATE 의 ${NONHOT}% 가 이미 HOT 이 아니다."
+echo "     이 값이 아래 두 항목의 전제다(②에서 fillfactor 로 이걸 움직인다)."
+if [ "$H2" = "$H1" ] || near2 "$H2" "$H1"; then
+  echo "   · ②는 인덱스를 하나 늘렸는데 **HOT 비율이 안 움직인다**(${H1}% → ${H2}%)."
+  echo "     UPDATE 가 filler 를 안 건드려 HOT 을 깨지 않기 때문이다."
+  echo "     '인덱스 개수'만으로는 설명되지 않는다."
+else
+  echo "   · ②에서 HOT 이 ${H1}% → ${H2}% 로 움직였다 — filler 는 갱신 컬럼이 아닌데도 그렇다면"
+  echo "     인덱스 때문이 아니라 페이지 여유가 달라진 것이다(②절을 보라)."
+fi
+echo "     다만 공짜는 아니다 — 이미 HOT 이 아니던 ${NONHOT}% 의 UPDATE 에 대해서는 이 인덱스도"
+echo "     갱신 대상이다. **깨뜨리는 것과 얹히는 것은 다르다.**"
+echo "   · ③은 인덱스 수가 ②와 같은데 HOT 이 **${H3}% 로 무너진다.** abalance 가 갱신 컬럼이라서다."
 echo "   · ④는 ③에 두 개를 더 얹은 것이다. 한 번 HOT 이 깨지면 **그 행의 모든 인덱스**가"
 echo "     새 엔트리를 받으므로, ②에서 조금이던 (filler) 의 몫이 여기서는 온전히 붙는다."
-echo "   · **FPI 제외 열이 이 실습의 신호다.** 전체 WAL 은 체크포인트 직후의 전체 페이지 이미지가"
-echo "     90% 가까이 차지해 조건 차이를 덮는다. 빼고 나면 인덱스 유지 비용이 그대로 드러난다."
-echo "     (TPS 하락은 결과고, 인덱스 갱신이 WAL 에 실리는 것이 원인이다 — 원인 지표가 먼저 움직인다.)"
+# **FPI 몫이 100% 에 가까우면 'FPI 제외' 열은 신호를 못 담는다.**
+# wal_fpi 는 장수이고 바이트가 아니다. PostgreSQL 은 FPI 에서 페이지의 빈 공간을 떼고 싣기
+# 때문에 wal_fpi*8192 는 상한이다. 거의 같은 두 수를 빼면 그 과대평가분만 남고, 실제로
+# 음수가 찍혔다. 그때는 열을 신호라고 말하지 않는다.
+if awk -v p="$P1" 'BEGIN{exit !(p+0>=95)}'; then
+  echo "   · ⚠️ **'FPI 제외' 열을 믿지 마라 — 이 실행에서는 WAL 의 ${P1}% 가 FPI 다.**"
+  echo "     wal_fpi 는 장수이지 바이트가 아니고, PostgreSQL 은 FPI 에서 페이지의 빈 공간을"
+  echo "     떼고 싣는다. 그래서 wal_fpi×8192 는 **상한**이고 항상 조금 과대평가다."
+  echo "     FPI 가 거의 전부면 뺄셈이 '거의 같은 두 수의 차'가 되어 그 오차만 남는다"
+  echo "     (기준선 ${F1}B — 음수면 그게 증거다)."
+  echo "     왜 이렇게 되나: 행이 많아 갱신이 흩어지면 UPDATE 마다 새 힙 페이지 + 새 인덱스"
+  echo "     리프를 건드리고, CHECKPOINT 직후라 둘 다 첫 변경이라 둘 다 FPI 가 된다."
+  echo "     → **작은 규모에서 다시 재라.** 같은 갱신이 좁은 페이지 집합을 반복해서 치면"
+  echo "       FPI 비중이 내려가고 이 열이 의미를 갖는다. 이 실행에서는 HOT 비율만 보라."
+else
+  echo "   · **FPI 제외 열이 이 실습의 신호다**(FPI 몫 ${P1}%). 전체 WAL 은 체크포인트 직후의"
+  echo "     전체 페이지 이미지가 상당 부분을 차지해 조건 차이를 덮는다. 빼고 나면 인덱스"
+  echo "     유지 비용이 드러난다 — 기준 ${F1}B 대 ② ${F2}B."
+  echo "     (TPS 하락은 결과고, 인덱스 갱신이 WAL 에 실리는 것이 원인이다 — 원인 지표가 먼저 움직인다.)"
+fi
 echo
 echo "  → §T-8 본편의 결론을 이렇게 다듬는다: **인덱스를 더 만들지 말라가 아니라,"
 echo "     갱신되는 컬럼을 인덱스에 넣을 때만 쓰기 비용을 따로 계산하라.**"
@@ -258,10 +342,11 @@ for ff in 100 90 70; do
   q "ALTER TABLE pgbench_accounts SET (fillfactor=$ff)" >/dev/null
   BT=0; BH="?"; BW="?"
   for r in $(seq 1 "$ROUNDS"); do
-    R=$(measure); IFS='|' read -r T H W F <<<"$R"
+    R=$(measure); IFS='|' read -r T H W F P <<<"$R"
     awk -v a="$T" -v b="$BT" 'BEGIN{exit !(a>b)}' && { BT="$T"; BH="$H"; BW="$W"; }
   done
   printf "  %s%10s %9s%% %11s B\n" "$(padr "fillfactor=$ff (인덱스 없음)" 40)" "$BT" "$BH" "$BW"
+  [ "$ff" = 100 ] && FF100_H="$BH"
 done
 q "ALTER TABLE pgbench_accounts SET (fillfactor=${FF_ORIG:-100})" >/dev/null
 echo
@@ -269,9 +354,15 @@ echo "  fillfactor 를 낮추면 테이블이 커지는 대신 HOT 이 살아난
 echo "  그리고 이 축은 ①과 달리 **포화가 있다.** 100→90 에서 HOT 이 다 올라가면 70 까지 더 낮춰도"
 echo "  남는 이득이 없다. 공간을 두 배로 더 내주고 사 올 것이 없다는 뜻이다."
 echo
-echo "  이 절은 ①의 기준선도 설명한다 — ①의 HOT 이 100% 가 아니라 ~68% 였던 것은"
-echo "  pgbench 기본값 fillfactor=100 때문이다. 그래서 ②의 (filler) 인덱스가 완전히 공짜가"
-echo "  아니었다: 이미 HOT 이 아니던 1/3 의 UPDATE 가 그 인덱스를 갱신해야 했다."
+# "①의 HOT 이 ~68% 였다 / 1/3 이 이미 HOT 이 아니었다"고 박아 뒀었다.
+# 2억 행 실행에서는 기준선 HOT 이 0.1% 였다 — 1/3 이 아니라 거의 전부다.
+# ①이 돌았으면 그 값을, 안 돌았으면 ②의 fillfactor=100 행을 쓴다.
+BH100="${BEST_H[① 기준 (기본키만)]:-${FF100_H:-?}}"
+echo "  이 절은 ①의 기준선도 설명한다 — ①의 HOT 이 100% 가 아닌 것은"
+echo "  pgbench 기본값 fillfactor=100 때문이다(이 실행의 기준선 HOT: ${BH100}%)."
+echo "  그래서 ②의 (filler) 인덱스가 완전히 공짜가 아니었다:"
+echo "  **이미 HOT 이 아니던 UPDATE 는 그 인덱스도 갱신해야 한다.**"
+echo "  그 몫은 규모에 따라 크게 달라진다 — 행이 많아 갱신이 흩어질수록 100% 에 가까워진다."
 echo "  **fillfactor 를 먼저 고치면 ②의 비용도 같이 사라진다** — 두 축이 독립이 아니다."
 echo
 fi
