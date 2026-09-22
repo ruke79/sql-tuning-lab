@@ -308,7 +308,8 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 > | HOT / fillfactor | ✅ `monitor` 의 `n_tup_hot_upd` + `t8-dml-cost.sh` 의 통제 실험 |
 > | 인덱스의 쓰기 비용 | ✅ `t8-dml-cost.sh` (§T-8 후반) |
 > | WAL / 체크포인트 | ⚠️ 카운터와 UPDATE당 WAL 은 재지만 `synchronous_commit` 실험은 **없다** |
-> | 버퍼 적중률 | ⚠️ 찍기만 한다. `shared_buffers` 를 바꿔 보는 코드는 **없고**, 그 값은 DB 전체 **누적**이라 한 실행의 측정치가 아니다(`reset-stats` 후에 보라) |
+> | shared_buffers | ✅ `t-shared-buffers.sh` 가 값을 바꿔 가며 교차 측정한다(아래) |
+> | 버퍼 적중률 | ⚠️ `monitor` 의 값은 DB 전체 **누적**이라 한 실행의 측정치가 아니다(`reset-stats` 후에 보라) |
 > | B-Tree 페이지 분할 | ❌ **코드가 없다.** `pageinspect` / `bt_page_stats` 를 쓰는 곳이 한 군데도 없다 |
 >
 > `TpcbWorkload` 주석이 "튜닝 관찰 포인트"로 세 가지를 적어 뒀는데 자동화된 것은 fillfactor 하나다.
@@ -320,7 +321,34 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 ```bash
 ./scripts/pgbench/t8-dml-cost.sh                # 전부 (scale=10 에서 약 20분)
 ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
+
+./scripts/pgbench/t-shared-buffers.sh           # shared_buffers 는 무엇을 빠르게 하는가
 ```
+
+> **`shared_buffers` 를 올리면 빨라지나 — 패턴마다 답이 다르다.** 스크립트가 값을 바꿔 가며
+> (ALTER SYSTEM + 재시작, 끝나면 원복) 두 패턴을 따로 잰다. scale=10 실측:
+>
+> | 패턴 | 18MB → 302MB |
+> |---|---|
+> | 무작위 점조회 | 95,034 → 107,353 tps (**1.13배**). 읽은 블록은 875,352 → 2 |
+> | 전체 스캔 2회차 | 어느 값에서도 16,589 중 **16,461 블록을 다시 읽는다** |
+>
+> 두 줄 다 상식과 어긋나 보이는데, 둘 다 기전이 있다.
+>
+> **점조회** — 적중률이 61% → 100% 로 올랐는데 tps 는 1.13배뿐이다. 아낀 시간을 줄어든
+> 블록 수로 나누면 **블록당 0.79µs** 다. RAM 은 ~0.1µs, NVMe 는 ~10µs, 디스크는 100µs 이상이니
+> 그 읽기는 디스크가 아니라 **OS 페이지 캐시**에서 왔다. `shared_buffers` 는 2차 캐시다 —
+> **'적중률이 올랐다'와 '빨라졌다'는 다른 얘기다.** 적중률을 KPI 로 잡으면 이득 없는 튜닝을
+> 성공이라고 보고하게 된다. 스크립트가 이 µs 를 계산해서 찍는다.
+>
+> **전체 스캔** — 표가 `shared_buffers` 의 1/4 을 넘으면 PostgreSQL 은 256KB 짜리 **링 버퍼**만
+> 내준다. 큰 스캔이 캐시를 통째로 밀어내지 못하게 막는 장치다. 그래서 첫 스캔이 캐시에
+> 아무것도 안 남기고, 129MB 표가 넉넉히 들어갈 302MB 에서도 2회차가 그대로 다시 읽는다.
+> **큰 스캔은 `shared_buffers` 로 못 고친다** — 손댈 곳은 버퍼가 아니라 스캔량이다.
+>
+> ⚠️ 서버 설정을 바꾸고 재시작하므로 **공유 서버에서 돌리지 말 것.** 중단해도 원복한다.
+> `postgresql.conf` 를 고쳐도 `ALTER SYSTEM` 이 써 둔 `postgresql.auto.conf` 가 이긴다 —
+> 스크립트가 설정이 실제로 먹었는지 확인하고, 안 먹었으면 `sourcefile` 을 찍고 멈춘다.
 
 > **"인덱스를 늘리면 TPS 가 떨어진다"는 절반만 맞다.** 같은 개수를 늘려도 `(filler)` 는 HOT 을
 > 안 깨고 `(abalance)` 는 0% 로 무너뜨린다 — 갱신되는 컬럼인가가 먼저다. 그리고 그 비용은
