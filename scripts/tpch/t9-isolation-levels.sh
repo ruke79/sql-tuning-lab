@@ -365,7 +365,9 @@ LEFT=$(q "SELECT count(*) FROM lineitem WHERE l_comment='t9iso'")
 TOTF=$(( ${FAIL1[REPEATABLE READ]:-0} + ${FAIL1[SERIALIZABLE]:-0} ))
 echo "  ②에서 직렬화 실패를 ${TOTF}건 낸 뒤의 상태:"
 if [ "${NTX1[SERIALIZABLE]:-0}" -lt 300 ]; then
-  echo "  ※ 이번 실행은 조건당 약 ${NTX1[SERIALIZABLE]}건밖에 못 돌았다(${SECS}초 × ${T1[SERIALIZABLE]:-0} tps)."
+  echo "  ※ 이번 실행은 조건당 약 ${NTX1[SERIALIZABLE]}건밖에 못 돌았다(${SECS}초 × $(printf '%.0f' "${T1[SERIALIZABLE]:-0}") tps)."
+  # SECS·CLIENTS 는 위치 인자가 아니라 환경변수다(스크립트 머리말 참고).
+  echo "    시간을 늘리면 표본이 커진다: SECS=$(( SECS * 4 )) $0"
   echo "    실패 **건수**는 그만큼 작게 나온다 — 규모가 다른 실행과는 건수가 아니라"
   echo "    **비율**로 비교할 것(이번 SER 실패율 $(awk -v f="${FAIL1[SERIALIZABLE]:-0}" -v n="${NTX1[SERIALIZABLE]:-1}" 'BEGIN{printf "%.0f%%", f*100/n}'))."
 fi
