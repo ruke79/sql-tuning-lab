@@ -95,7 +95,13 @@ pg_precheck
 
 # 준비 단계용 — 실패를 삼키지 않는다. 조용히 안 돈 준비 단계는 측정을 통째로 무의미하게 만든다.
 qx() { local o; o=$(q "$1"); case "$o" in *ERROR*) echo "  [중단] 준비 단계 실패: $1"; echo "         $o"; exit 1;; esac; }
-qp() { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d postgres -X -q -tAc "$1" 2>&1; }
+# postgres DB 로 붙는 별도 헬퍼도 래퍼를 타야 한다 — 여기만 직접 부르면 클라이언트가
+# 없는 환경에서 조용히 빈 값을 돌려준다.
+if [ "$PG_VIA" = host ]; then
+  qp() { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d postgres -X -q -tAc "$1" 2>&1; }
+else
+  qp() { docker exec -i -e PGPASSWORD=tuner "$CONTAINER" psql -U "$PGUSER_" -d postgres -X -q -tAc "$1" 2>&1; }
+fi
 
 # 준비 — 없으면 만든다. 있으면 건드리지 않는다.
 if [ "$(qp "SELECT count(*) FROM pg_database WHERE datname='$DB'")" != "1" ]; then

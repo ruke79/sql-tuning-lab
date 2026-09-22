@@ -103,7 +103,13 @@ pg_precheck
 sql(){ PSQL -tAc "$1"; }
 # timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
 #   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
-tsql(){ timeout "$1" psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q -tAc "$2"; }
+# **래퍼를 거쳐야 한다.** 여기만 psql 을 직접 불렀다가, 호스트에 클라이언트가 없는
+# 환경에서 `psql: command not found` 로 즉시 끝났다. 2>&1 >/dev/null 로 삼켜져서
+# ②의 경합 측정이 "3ms / 2ms — 안 막혔다"로 찍혔다. **실행이 안 된 것을 결과로 읽을 뻔했다.**
+# 바깥 `timeout` 대신 **서버의 statement_timeout** 을 쓴다. 함수는 bash -c 하위 셸에
+# 안 보이므로 timeout 과 래퍼를 같이 쓸 수 없고, 어차피 여기서 재려는 것은
+# '락을 얼마나 기다리는가'라 서버 쪽에서 끊는 게 맞다(전송 경로와 무관해진다).
+tsql(){ PSQL -tAc "SET statement_timeout='$1s'; $2" 2>/dev/null; }
 
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
 [ "${NIDX:-0}" -lt 2 ] && { echo "  [중단] index 를 먼저 실행하세요."; exit 1; }

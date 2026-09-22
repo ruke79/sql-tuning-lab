@@ -86,7 +86,12 @@ pg_stage() {
 }
 pg_precheck
 
-qf() { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -f "$1" 2>&1; }
+# -f 로 주는 파일은 컨테이너 경로에서 컨테이너 안에 있어야 한다 — pg_stage 가 옮긴다.
+if [ "$PG_VIA" = host ]; then
+  qf() { psql -h "$PGHOST_" -p "$PGPORT_" -U "$PGUSER_" -d "$DB" -X -q -f "$1" 2>&1; }
+else
+  qf() { docker exec -i -e PGPASSWORD=tuner "$CONTAINER" psql -U "$PGUSER_" -d "$DB" -X -q -f "$(pg_stage "$1")" 2>&1; }
+fi
 qx() { local o; o=$(q "$1"); case "$o" in *ERROR*) echo "  [중단] 준비 실패: $1"; echo "  $o"; exit 1;; esac; }
 
 dispw() { local b k; b=$(printf %s "$1" | wc -c); k=$(printf %s "$1" | LC_ALL=C tr -dc '\200-\277' | wc -c)

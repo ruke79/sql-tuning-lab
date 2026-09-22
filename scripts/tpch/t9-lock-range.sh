@@ -90,7 +90,13 @@ pg_precheck
 sql(){ PSQL -tAc "$1"; }
 # timeout 은 외부 바이너리라 **셸 함수를 실행할 수 없다.**
 #   timeout 20 sql "..."  →  "failed to run command 'sql'" 로 즉시 실패한다(정정 목록 10번).
-tsql(){ timeout "$1" psql -h "$PGHOST_" -p "$PGPORT_" -U tuner -d tpch -X -q -tAc "$2"; }
+# **래퍼를 거쳐야 한다.** 여기만 psql 을 직접 불렀다가, 호스트에 클라이언트가 없는
+# 환경에서 `psql: command not found` 로 즉시 끝났다. 2>&1 >/dev/null 로 삼켜져서
+# ②의 경합 측정이 "3ms / 2ms — 안 막혔다"로 찍혔다. **실행이 안 된 것을 결과로 읽을 뻔했다.**
+# 바깥 `timeout` 대신 **서버의 statement_timeout** 을 쓴다. 함수는 bash -c 하위 셸에
+# 안 보이므로 timeout 과 래퍼를 같이 쓸 수 없고, 어차피 여기서 재려는 것은
+# '락을 얼마나 기다리는가'라 서버 쪽에서 끊는 게 맞다(전송 경로와 무관해진다).
+tsql(){ PSQL -tAc "SET statement_timeout='$1s'; $2" 2>/dev/null; }
 
 NIDX=$(sql "SELECT count(*) FROM pg_indexes WHERE tablename='lineitem'")
 [ "${NIDX:-0}" -lt 2 ] && { echo "  [중단] index 를 먼저 실행하세요."; exit 1; }
@@ -205,17 +211,36 @@ EOF
 run(){ PGBENCH -f "$(pg_stage /tmp/t9_skew.sql)" \
         -c 8 -j 4 -T 12 -n tpch 2>&1 | grep -oP 'tps = \K[0-9.]+' | head -1; }
 printf "  %-10s %-9s %13s %13s %8s\n" "주문수" "적중률" "naive tps" "FOR SHARE" "손해"
+declare -A LOSS NAIVE
 for N in 50 500 5000; do
   setsize $N
   for T in sync_cust_naive sync_cust_fs; do
     usetrg $T; r=$(run); [ "$T" = "sync_cust_naive" ] && A=$r || B=$r
   done
-  printf "  %-10s %-9s %13s %13s %8s\n" "$N" "$(awk -v n=$N 'BEGIN{printf "%.0f%%",n/5000*100}')" \
-         "$A" "$B" "$(awk -v x=$A -v y=$B 'BEGIN{printf "%.2f배",x/y}')"
+  LOSS[$N]=$(awk -v x="$A" -v y="$B" 'BEGIN{ if (y+0>0) printf "%.2f", x/y; else print "0" }')
+  NAIVE[$N]="$A"
+  printf "  %-10s %-9s %13s %13s %7s배\n" "$N" "$(awk -v n=$N 'BEGIN{printf "%.0f%%",n/5000*100}')" \
+         "$A" "$B" "${LOSS[$N]}"
 done
 echo
+# **해석을 박아 두지 않는다.** 문서 실측(SF=0.5)에서는 손해가 1% 0.95배 → 100% 2.47배로
+# 적중률을 따라 올랐다. 그런데 SF=10 에서는 1% 1.23배 → 100% 0.99배로 **방향이 뒤집혔다.**
+# 100% 에서는 naive 도 FOR SHARE 도 같은 지점에서 직렬화돼(팬아웃 자체가 병목) 락이
+# 더 보탤 것이 없기 때문이다. 그런데도 옛 문장이 그대로 찍혀 표와 어긋났다.
 echo "해석:"
-echo "  적중률이 낮으면 FOR SHARE 는 사실상 공짜이고, 겹치기 시작하면 급격히 비싸진다."
+if awk -v a="${LOSS[5000]}" -v b="${LOSS[50]}" 'BEGIN{exit !(a>b*1.2)}'; then
+  echo "  적중률이 낮으면 FOR SHARE 는 사실상 공짜이고(${LOSS[50]}배), 겹치면 비싸진다(${LOSS[5000]}배)."
+elif awk -v a="${LOSS[5000]}" -v b="${LOSS[50]}" 'BEGIN{exit !(b>a*1.2)}'; then
+  echo "  **이 실행에서는 방향이 반대다** — 적중률 1% 에서 ${LOSS[50]}배, 100% 에서 ${LOSS[5000]}배."
+  echo "  100% 에서는 naive 도 FOR SHARE 도 같은 지점에서 직렬화되므로(팬아웃 자체가 병목)"
+  echo "  락이 더 보탤 것이 없다. 락 손해가 보이려면 **경합이 부분적이어야** 한다."
+  echo "  naive 절대값을 같이 볼 것: 1% ${NAIVE[50]} → 10% ${NAIVE[500]} → 100% ${NAIVE[5000]} tps."
+else
+  echo "  적중률에 따른 손해 변화가 뚜렷하지 않다(1% ${LOSS[50]}배 / 10% ${LOSS[500]}배 / 100% ${LOSS[5000]}배)."
+  echo "  naive 절대값을 같이 볼 것: ${NAIVE[50]} → ${NAIVE[500]} → ${NAIVE[5000]} tps."
+fi
+echo "  → 어느 방향이든 **naive 열의 절대값이 더 중요하다** — 락을 아예 안 써도 편중이"
+echo "     생기면 처리량이 무너진다. 주된 피해는 락이 아니라 팬아웃 자체다."
 echo "  → 정합성 락의 비용은 '무엇을 잠그느냐'가 아니라 '누가 그걸 건드리느냐'다."
 echo "  → 판단 기준은 락 범위의 크기가 아니라 그 범위가 쓰기 트래픽과 겹치는 비율이며,"
 echo "     이건 스키마가 아니라 워크로드를 봐야 안다."
