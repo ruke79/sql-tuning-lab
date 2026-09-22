@@ -36,7 +36,28 @@ for arg in "$@"; do
   esac
 done
 export PGPASSWORD=tuner
-PSQL="psql -h localhost -U tuner -d tpch -v ON_ERROR_STOP=1"
+# 호스트에 psql 이 없으면 컨테이너 안의 것을 쓴다. 이 스크립트는 원래부터 파일을
+# **STDIN 으로 흘려보내므로**(\copy ... FROM STDIN) docker exec -i 로 그대로 이어진다 —
+# 7GB 짜리를 컨테이너로 복사할 필요가 없다.
+PGCON="${PGCON:-tuninglab-postgres}"
+if command -v psql >/dev/null 2>&1; then
+  PSQL_VIA=host
+  psql_() { psql -h localhost -U tuner -d tpch -v ON_ERROR_STOP=1 "$@"; }
+elif command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$PGCON"; then
+  PSQL_VIA=docker
+  psql_() { docker exec -i -e PGPASSWORD=tuner "$PGCON" psql -U tuner -d tpch -v ON_ERROR_STOP=1 "$@"; }
+else
+  echo "  psql 도 $PGCON 컨테이너도 없습니다. 둘 중 하나:" >&2
+  echo "    sudo apt install postgresql-client" >&2
+  echo "    docker compose -f docker/docker-compose.yml up -d postgres" >&2
+  exit 1
+fi
+PSQL=psql_
+
+# **적재 세션에만** 거는 설정. 서버 전역을 안 건드리므로 되돌릴 것이 없다(오늘 여러 번
+# 덴 부분이다). synchronous_commit=off 는 COPY 커밋의 fsync 대기를 없앤다 —
+# 적재 중 서버가 죽으면 마지막 커밋이 날아갈 수 있지만, 어차피 다시 적재하면 되는 데이터다.
+COPYOPT="SET synchronous_commit=off; SET maintenance_work_mem='1GB';"
 
 TABLES="region nation supplier customer part partsupp orders lineitem"
 
@@ -69,7 +90,7 @@ for t in $TABLES; do
     echo "loading $t <- $(basename "$f")"
     # dbgen 은 라인 끝에 '|' 를 하나 더 붙이므로 제거한 뒤 COPY.
     # QUOTE 를 백스페이스로 지정해 따옴표를 일반 문자로 취급 (데이터에 " 가 있어도 안전).
-    sed 's/|$//' "$f" | $PSQL -c "\\copy $t FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE E'\b')"
+    sed 's/|$//' "$f" | $PSQL -c "$COPYOPT" -c "\\copy $t FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE E'\b')"
   done
 done
 

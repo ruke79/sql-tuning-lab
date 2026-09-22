@@ -229,6 +229,19 @@ fi
 # (gradle bootRun 의 작업 디렉터리가 tpch/ 라서 실제 경로는 tpch/data/tpch 다).
 # generate 와 load 가 같은 상대 경로를 쓰므로 동작에는 문제가 없지만,
 # COPY 스크립트를 직접 부를 때는 tpch/data/tpch 를 줘야 한다.
+# **적재는 COPY 로 한다 — JDBC 배치보다 7배 빠르다.** SF=0.5(300만 행) 실측으로
+# gradlew load 가 120초, scripts/tpch/load-postgres-copy.sh 가 17초였다. SF=10 이면
+# 이 차이가 수십 분이 된다. COPY 스크립트는 파일을 STDIN 으로 흘려보내므로
+# 호스트에 psql 이 없어도 docker exec -i 로 이어진다(그 분기는 스크립트 안에 있다).
+load_tpch() {
+  if [ -x "$HERE/scripts/tpch/load-postgres-copy.sh" ]; then
+    say "     ./scripts/tpch/load-postgres-copy.sh ./tpch/data/tpch   (COPY — JDBC 보다 7배 빠르다)"
+    "$HERE/scripts/tpch/load-postgres-copy.sh" "$HERE/tpch/data/tpch" 2>&1 | tail -3 | sed 's/^/       /'
+  else
+    gen tpch "load --db=postgres --dir=./data/tpch"
+  fi
+}
+
 gen() {  # $1 = 모듈, $2.. = args
   local m="$1"; shift
   for a in "$@"; do
@@ -269,11 +282,12 @@ else
     if [ -s "$HERE/tpch/data/tpch/lineitem.tbl" ] && [ -z "$SF_GIVEN" ]; then
       act "tpch 재적재 — 기존 데이터 파일을 그대로 쓴다 (lineitem.tbl $(du -h "$HERE/tpch/data/tpch/lineitem.tbl" | cut -f1))"
       say "     다른 스케일로 **다시 만들려면** 스케일을 명시한다: SF=10 $0 --force-tpch"
-      gen tpch "schema --db=postgres" "load --db=postgres --dir=./data/tpch" "index --db=postgres"
+      gen tpch "schema --db=postgres"; load_tpch; gen tpch "index --db=postgres"
     else
       act "tpch 재적재 (SF=$SF — 데이터 파일부터 새로 만든다)"
-      gen tpch "generate --sf=$SF --dir=./data/tpch" "schema --db=postgres" \
-               "load --db=postgres --dir=./data/tpch" "index --db=postgres"
+      gen tpch "generate --sf=$SF --dir=./data/tpch" "schema --db=postgres"
+      load_tpch
+      gen tpch "index --db=postgres"
     fi
     ok "tpch lineitem $(t_sql tpch "SELECT count(*) FROM lineitem") 행"; CHANGED=1
   fi
