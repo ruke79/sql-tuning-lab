@@ -437,7 +437,7 @@ else
   sql "DELETE FROM lineitem WHERE l_linenumber >= 90;" >/dev/null 2>&1
   sql "DROP TRIGGER IF EXISTS t_enq_cust ON customer;
        DROP TRIGGER IF EXISTS t_enq_ord ON orders;
-       DROP TRIGGER IF EXISTS t_enq_li ON lineitem;
+       DROP TRIGGER IF EXISTS t_enq_line ON lineitem;   # 이름을 t_enq_li 로 잘못 적어 안 지워지고 있었다
        DROP TABLE IF EXISTS lineitem_denorm, denorm_queue, denorm_stat, orders_cust_bak;" >/dev/null 2>&1
   LT=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\\_sync%' OR tgname LIKE 't\\_enq%'")
   LR=$(sql "SELECT count(*) FROM lineitem WHERE l_linenumber >= 90")

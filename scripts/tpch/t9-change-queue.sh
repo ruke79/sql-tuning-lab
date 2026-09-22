@@ -390,6 +390,12 @@ label(){ case $1 in off) echo "A. 트리거 없음";; naive) echo "B. 동기 nai
                      fs) echo "C. 동기 FOR SHARE";; queue) echo "D. 큐 (워커 OFF)";;
                      queue_w) echo "E. 큐 (워커 ON)";; esac; }
 throughput(){   # $1 = 워크로드 파일
+  # **첫 구성을 버리는 워밍업이 필요하다.** 루프 첫 번째가 A(트리거 없음)인데,
+  # 그게 차가운 채로 기준선이 되어 "대비" 열 전체가 밀렸다. 증거:
+  #   ③-a  A 610 tps vs D(큐+트리거) 690 → D 가 1.13배 빠르다
+  #   ③-b  A 524 tps vs D             697 → D 가 1.33배 빠르다
+  # 트리거를 **더** 다는 구성이 트리거 없는 것보다 빠를 수는 없다. 순서가 만든 값이다.
+  clean_synth; refill; mode off; bench "$1" >/dev/null 2>&1
   printf "  %-20s %12s %8s %10s %10s\n" "구성" "tps" "대비" "큐잔량" "드리프트"
   for M in off naive fs queue queue_w; do
     clean_synth; refill
@@ -408,6 +414,16 @@ throughput(){   # $1 = 워크로드 파일
     Q=$(sql "SELECT count(*) FROM denorm_queue")
     printf "  %-20s %12s %8s %10s %10s\n" "$(label $M)" "$T" \
       "$(awk -v a=${TPS[off]} -v b=$T 'BEGIN{printf "%.2f배",a/b}')" "$Q" "$(drift)"
+  done
+  # 트리거를 더 다는 구성이 기준선보다 빠르면 물리적으로 불가능하다 — 남은 편향을 말한다.
+  for M in naive fs queue queue_w; do
+    if awk -v a="${TPS[off]}" -v b="${TPS[$M]}" 'BEGIN{exit !(b>a*1.05)}'; then
+      echo "  ⚠️ $(label $M) 가 '트리거 없음'보다 빠르게 나왔다 — **불가능한 값이다.**"
+      echo "     워밍업을 넣었는데도 남은 순서 편향이거나 노이즈다."
+      echo "     **이 표에서 A 와의 비교는 주장하지 말 것.** B·C 의 붕괴처럼 한 자릿수 배를"
+      echo "     넘는 차이만 읽는다(편중 실행에서 B 10배 · C 16배가 그 예다)."
+      break
+    fi
   done
 }
 
@@ -541,9 +557,15 @@ else
   sql "UPDATE orders o SET o_custkey=b.o_custkey FROM orders_cust_bak b
        WHERE o.o_orderkey=b.o_orderkey AND o.o_custkey IS DISTINCT FROM b.o_custkey;" >/dev/null 2>&1
   sql "DELETE FROM lineitem WHERE l_linenumber >= 90;" >/dev/null 2>&1
+  # **t_enq_* 도 지운다.** 이 스크립트는 동기 트리거(t_sync_*)와 큐 트리거(t_enq_*)를
+  # 둘 다 만드는데 정리는 t_sync_* 만 지우고 있었다. 큐 모드로 끝나면 t_enq_* 3개가
+  # 남았고, 바로 아래 검사가 "남은 트리거 3" 으로 잡아냈다 — 검사는 맞고 정리가 틀렸다.
   sql "DROP TRIGGER IF EXISTS t_sync_cust ON customer;
         DROP TRIGGER IF EXISTS t_sync_ord ON orders;
         DROP TRIGGER IF EXISTS t_sync_li ON lineitem;
+        DROP TRIGGER IF EXISTS t_enq_cust ON customer;
+        DROP TRIGGER IF EXISTS t_enq_ord ON orders;
+        DROP TRIGGER IF EXISTS t_enq_line ON lineitem;
         DROP TABLE IF EXISTS lineitem_denorm, denorm_queue, denorm_stat, orders_cust_bak;" >/dev/null 2>&1
   LT=$(sql "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 't\\_sync%' OR tgname LIKE 't\\_enq%'")
   LR=$(sql "SELECT count(*) FROM lineitem WHERE l_linenumber >= 90")
