@@ -130,10 +130,16 @@ fi
 # 호출 횟수는 ① ROUNDS×4 + ② ROUNDS×3 + ③ ROUNDS×4×2 = ROUNDS×15 이다.
 # ROUNDS=2 면 30회. 테이블이 크면 이게 그대로 시간이 된다.
 #
-# 실측: pgbench_accounts 152MB(scale=10) VACUUM FULL 2,457ms → 약 61 MB/s.
-# 이 값으로 scale=2000(총 약 30GB)을 외삽하면 회당 503초 = 8.4분이고,
-# 실제로 그 규모를 돌린 사용자의 ①②(14회)가 2시간 걸렸다 — 외삽이 맞았다.
-VF_RATE=60                                  # MB/s, 보수적으로 낮춰 잡는다
+# 재작성 속도는 장비마다 3배쯤 차이 난다. 두 실측을 갖고 있다:
+#   · 152MB(scale=10) / 2,457ms                        →  61 MB/s
+#   · 약 30GB(scale=2000) / 167초 (pg_stat_statements) → 180 MB/s
+# 그래서 하나의 숫자가 아니라 **범위**로 말한다. 한 값만 찍으면 틀린 숫자를 찍게 된다.
+#
+# 그리고 VACUUM FULL 이 measure() 의 전부는 아니다 — scale=2000 실행에서 회당 약 8.5분 중
+# VACUUM FULL 이 2.8분(약 40%)이었고 나머지는 인덱스 빌드·벤치마크·ANALYZE 다.
+# 아래 추정은 VACUUM FULL 몫만 잡으므로 **하한**으로 읽어야 한다.
+VF_FAST=180                                 # MB/s, 빠른 장비
+VF_RATE=60                                  # MB/s, 느린 장비 (상한 시간 계산용)
 NPER=0
 want 1 && NPER=$(( NPER + 4 ))      # ① 조건 4개
 want 2 && NPER=$(( NPER + 3 ))      # ② fillfactor 3개
@@ -142,12 +148,15 @@ NMEAS=$(( ROUNDS * NPER ))
 TOTMB=$(q "SELECT round(pg_total_relation_size('pgbench_accounts')/1048576.0)" 2>/dev/null)
 case "$TOTMB" in ''|*[!0-9]*) TOTMB=0;; esac
 if [ "$TOTMB" -gt 0 ] && [ "${NMEAS:-0}" -gt 0 ]; then
-  EST=$(( TOTMB * NMEAS / VF_RATE ))        # 초
+  EST=$(( TOTMB * NMEAS / VF_RATE ))        # 초 (느린 장비 기준)
+  ESTF=$(( TOTMB * NMEAS / VF_FAST ))       # 초 (빠른 장비 기준)
   if [ "$EST" -gt 1800 ] && [ "${FORCE:-0}" != "1" ]; then
     echo "  [중단] pgbench_accounts 가 ${TOTMB}MB 다(행 ${NACC})."
     echo "         이 스크립트는 measure() 마다 **VACUUM FULL** 로 테이블을 통째로 다시 쓴다."
     echo "         지금 설정(ROUNDS=$ROUNDS, ONLY=$ONLY)이면 **${NMEAS}회** 재작성한다."
-    echo "         실측 ${VF_RATE}MB/s 로 잡으면 **약 $(( EST / 60 ))분** 걸린다 — 벤치마크(${SECS}초×${NMEAS})는 그중 일부일 뿐이다."
+    echo "         재작성만 **약 $(( ESTF / 60 ))~$(( EST / 60 ))분** 이다(장비의 쓰기 속도 180~60MB/s 실측 범위)."
+    echo "         이건 **하한**이다 — 실측에서 VACUUM FULL 은 measure() 시간의 약 40% 였고,"
+    echo "         나머지는 인덱스 빌드·벤치마크(${SECS}초×${NMEAS})·ANALYZE 다."
     echo
     echo "         그리고 이 규모에서는 **측정 자체가 무너진다.** 결정하는 값은"
     echo "         **페이지당 갱신 횟수 = tps × SECS ÷ 힙 페이지 수** 다."
