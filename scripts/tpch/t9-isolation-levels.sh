@@ -137,6 +137,7 @@ cleanup() {
   q "UPDATE customer c SET c_mktsegment=b.c_mktsegment FROM t9_iso_bak b
       WHERE c.c_custkey=b.c_custkey AND c.c_mktsegment IS DISTINCT FROM b.c_mktsegment" >/dev/null 2>&1
   q "DELETE FROM lineitem WHERE l_comment='t9iso'" >/dev/null 2>&1
+  q "DROP INDEX IF EXISTS idx_t9iso" >/dev/null 2>&1
   if [ "${KEEP:-0}" != "1" ]; then
     q "DROP TRIGGER IF EXISTS t_sync_li ON lineitem;
        DROP TRIGGER IF EXISTS t_sync_ord ON orders;
@@ -157,6 +158,18 @@ echo
 echo "준비: 파생 테이블과 FOR SHARE 트리거를 올린다 (약 20초)"
 qx "DROP TABLE IF EXISTS t9_iso_bak"
 qx "CREATE TABLE t9_iso_bak AS SELECT c_custkey, c_mktsegment FROM customer WHERE c_custkey <= $NCUST"
+
+# **측정 트랜잭션 안의 DELETE 가 lineitem 전체를 훑고 있었다.**
+#   DELETE FROM lineitem WHERE l_linenumber = 90+:client_id AND l_comment='t9iso'
+# lineitem PK 는 (l_orderkey, l_linenumber) 라 선행 컬럼이 l_orderkey 다 —
+# l_linenumber 단독 조건에는 못 쓴다. l_comment 인덱스도 없다. 그래서 순차 스캔이었고,
+# pg_stat_statements 에 mean 1,719ms / 467회로 잡혔다(SF=10, 6천만 행).
+# 그 1.7초가 트랜잭션 안에 있으니 **측정된 것은 격리수준이 아니라 순차 스캔**이었다.
+# 부분 인덱스로 인덱스 스캔이 되게 한다. 실험 행에만 붙으므로 거의 공짜고,
+# 생성은 1회 전체 스캔이지만 트랜잭션마다 훑는 것보다 압도적으로 싸다.
+# cleanup 에서 지운다 — 남기면 다음 실습의 lineitem 쓰기에 붙는다.
+echo "  실험 행 전용 부분 인덱스를 만든다 (없으면 DELETE 가 lineitem 을 통째로 훑는다)..."
+qx "CREATE INDEX IF NOT EXISTS idx_t9iso ON lineitem (l_linenumber) WHERE l_comment='t9iso'"
 q "SET client_min_messages=warning; DROP TABLE IF EXISTS lineitem_denorm CASCADE" >/dev/null
 qx "CREATE TABLE lineitem_denorm (
       l_orderkey BIGINT NOT NULL, l_linenumber INTEGER NOT NULL,
