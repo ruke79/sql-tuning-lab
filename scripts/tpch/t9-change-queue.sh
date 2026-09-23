@@ -228,6 +228,16 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 
 -- ── 워커: 배치를 claim 해서 진실을 다시 읽어 덮어쓴다 ──
+-- **다른 실습이 남긴 같은 이름의 함수를 먼저 지운다.**
+-- t9-notify-vs-poll.sh 는 denorm_drain 을 (OUT applied, OUT depth) 로 정의한다 —
+-- 반환형이 record 라서 여기 INT 버전이 CREATE OR REPLACE 로 **덮이지 않는다**:
+--   ERROR: cannot change return type of existing function
+-- 그런데 이 heredoc 은 2>/dev/null 이라 그 에러가 삼켜진다. 그러면 남의 함수가 그대로
+-- 살아 있고, denorm_worker 가 n := denorm_drain(batch) 에서 런타임에 죽는다:
+--   ERROR: invalid input syntax for type integer: "(0,0)"
+-- 워커는 아무것도 못 비우고 **표는 전부 0ms 로 찍힌다** — 실패가 측정값으로 둔갑한다.
+-- 실제로 notify-vs-poll 을 먼저 돌린 환경에서 그 상태가 나왔다.
+DROP FUNCTION IF EXISTS denorm_drain(INT);
 CREATE OR REPLACE FUNCTION denorm_drain(batch INT DEFAULT 500) RETURNS INT AS $$
 DECLARE ck BIGINT[]; ok BIGINT[]; lk BIGINT[]; ln INT[]; n INT; dk INT; lag NUMERIC;
 BEGIN
@@ -287,6 +297,28 @@ BEGIN
   END LOOP;
 END $$ LANGUAGE plpgsql;
 EOSQL
+
+# ── 준비가 실제로 먹었는지 확인한다 ─────────────────────────────────
+# **위 heredoc 은 2>/dev/null 이라 실패를 삼킨다.** 삼켜진 실패는 0ms 측정값으로
+# 둔갑한다 — 워커가 못 도는데 표는 멀쩡히 찍히고 해석문이 그 0 을 서술한다.
+# 실제로 t9-notify-vs-poll 이 남긴 record 반환 denorm_drain 때문에 그 상태가 나왔다.
+# 그래서 만들어 놓고 **불러 본다.** 여기서 죽는 게 0ms 표를 믿는 것보다 낫다.
+DRAIN_RET=$(sql "SELECT pg_get_function_result(oid) FROM pg_proc WHERE proname='denorm_drain'")
+if [ "$DRAIN_RET" != "integer" ]; then
+  echo "  [중단] denorm_drain 의 반환형이 'integer' 가 아니라 '${DRAIN_RET:-없음}' 이다."
+  echo "         다른 실습(t9-notify-vs-poll)이 남긴 함수가 그대로 살아 있다는 뜻이다."
+  echo "         CREATE OR REPLACE 는 반환형을 못 바꾸므로 조용히 덮이지 않았다."
+  echo "         이 상태로 두면 워커가 런타임에 죽고 **표가 전부 0 으로 찍힌다.**"
+  echo "         고치려면:  psql -U tuner -d tpch -c 'DROP FUNCTION IF EXISTS denorm_drain(INT)'"
+  exit 1
+fi
+CALL_ERR=$(PSQL -tAc "CALL denorm_worker(0.1, 10);" 2>&1 | grep -i "^ERROR" | head -1)
+if [ -n "$CALL_ERR" ]; then
+  echo "  [중단] 워커를 불러 봤더니 실패한다: $CALL_ERR"
+  echo "         준비 단계가 제대로 안 돌았다. 이 상태의 측정값은 전부 0 이 된다."
+  exit 1
+fi
+
 
 # ── 헬퍼 ──────────────────────────────────────────────────────────────
 mode(){   # off | naive | fs | queue
