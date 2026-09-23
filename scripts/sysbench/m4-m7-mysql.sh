@@ -180,6 +180,8 @@ for combo in "1:1" "1:0" "2:1" "2:0"; do
   q "SET GLOBAL innodb_flush_log_at_trx_commit=$F; SET GLOBAL sync_binlog=$S" >/dev/null
   IFS='|' read -r T A P M <<<"$(run1 8)"
   [ -z "$BASE" ] && BASE="$T"
+  # 문장을 표에서 만들려면 값을 남겨야 한다. 조합별 TPS 를 보관한다.
+  case "$combo" in 1:1) C11="$T";; 1:0) C10="$T";; 2:1) C21="$T";; 2:0) C20="$T";; esac
   [ "$F" = 1 ] && FL="켬 (=1)" || FL="끔 (=2)"
   [ "$S" = 1 ] && SL="켬 (=1)" || SL="끔 (=0)"
   printf "  %s%s%12s %10s %10s\n" "$(padr "$FL" 14)" "$(padr "$SL" 16)" "${T:-?}" "${P:-?}" \
@@ -187,10 +189,26 @@ for combo in "1:1" "1:0" "2:1" "2:0"; do
 done
 restore
 echo
-echo "  둘 중에서는 binlog 쪽이 더 비싼 게 보통이다 — 커밋마다 파일 두 개를 다루기 때문이다."
-echo "  그런데 **둘 다 꺼도 배수가 작다.** PostgreSQL 의 synchronous_commit 은 2.2배였는데."
+# **어느 쪽이 더 비싼지는 재서 말한다.** "binlog 쪽이 더 비싼 게 보통"이라고 박아 뒀는데,
+# 실측에서 redo 쪽이 더 비싼 실행이 나왔다(binlog 만 끄면 1.76배 / redo 만 끄면 2.10배).
+RB=$(awk -v a="${C10:-0}" -v b="${C11:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')   # binlog 만 끔
+RR=$(awk -v a="${C21:-0}" -v b="${C11:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')   # redo 만 끔
+RBOTH=$(awk -v a="${C20:-0}" -v b="${C11:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')
+if awk -v a="$RB" -v b="$RR" 'BEGIN{exit !(a+0>b+0)}'; then
+  echo "  이 실행에서는 **binlog 쪽이 더 비싸다** — binlog 만 꺼서 ${RB}배, redo 만 꺼서 ${RR}배."
+else
+  echo "  이 실행에서는 **redo 쪽이 더 비싸다** — redo 만 꺼서 ${RR}배, binlog 만 꺼서 ${RB}배."
+  echo "  (binlog 가 더 비싼 경우가 흔하다고들 하지만 이 장비·이 워크로드에서는 반대다.)"
+fi
+# "둘 다 꺼도 배수가 작다"고 박아 뒀는데, 11.93배가 나오는 실행이 있었다 —
+# PostgreSQL 의 2.2배보다 **크다.** 크기를 재서 말하고, 그에 맞는 질문을 던진다.
+echo "  둘 다 끄면 **${RBOTH}배**다. PostgreSQL 의 synchronous_commit 은 같은 랩에서 2.2배였다."
 echo
-echo "  왜 작은가 — 가설 둘을 세우고 둘 다 재 봤다."
+if awk -v a="$RBOTH" 'BEGIN{exit !(a+0 < 3)}'; then
+  echo "  **왜 이렇게 작은가** — 가설 둘을 세우고 둘 다 재 봤다."
+else
+  echo "  **왜 이렇게 큰가** — 배수는 엔진이 아니라 워크로드가 정한다. 가설 둘을 재 봤다."
+fi
 echo "   (가) 8스레드라 **그룹 커밋**이 fsync 를 여러 트랜잭션에 나눠 물린다."
 echo "   (나) oltp_read_write 는 14문장 중 10이 **읽기**라, 커밋이 트랜잭션에서 차지하는 몫이 작다."
 echo
@@ -202,14 +220,25 @@ for pair in "읽기+쓰기 (기본):8:$LUA" "쓰기만:8:$LUAW" "쓰기만:1:$LU
   IFS='|' read -r ON _ _ _ <<<"$(run1 "$TH" "$LU")"
   q "SET GLOBAL innodb_flush_log_at_trx_commit=2; SET GLOBAL sync_binlog=0" >/dev/null
   IFS='|' read -r OFF _ _ _ <<<"$(run1 "$TH" "$LU")"
-  printf "  %s%s%12s %12s %10s\n" "$(padr "$WL" 18)" "$(padr "$TH" 8)" "${ON:-?}" "${OFF:-?}" \
-    "$(awk -v a="${OFF:-0}" -v b="${ON:-0}" 'BEGIN{ if(b>0) printf "%.2fx", a/b }')"
+  RM=$(awk -v a="${OFF:-0}" -v b="${ON:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')
+  case "$WL:$TH" in "쓰기만:8") W8="$RM";; "쓰기만:1") W1="$RM";; *) RW="$RM";; esac
+  printf "  %s%s%12s %12s %10s\n" "$(padr "$WL" 18)" "$(padr "$TH" 8)" "${ON:-?}" "${OFF:-?}" "${RM}x"
 done
 restore
 echo
-echo "  → **(가) 그룹 커밋 가설은 기각됐다.** 쓰기만 하는 워크로드에서 스레드 1과 8의 배수가"
-echo "    거의 같다. 그룹 커밋이 원인이라면 혼자 도는 1스레드에서 배수가 훨씬 커야 한다."
-echo "  → **(나)가 맞다.** 같은 손잡이가 읽기 섞인 트랜잭션에서는 작고, 쓰기만 하면 크게 벌어진다."
+# "1과 8의 배수가 거의 같다"고 박아 뒀는데 42.12 대 25.14 가 나왔다 — 거의 같지 않다.
+# 기각 근거는 '같다'가 아니라 **방향**이다: 그룹 커밋이 원인이라면 혼자 도는 1스레드에서
+# 배수가 훨씬 커야 하는데, 오히려 8스레드 쪽이 크면 가설과 정반대다.
+if awk -v a="$W1" -v b="$W8" 'BEGIN{exit !(a+0 > b+0*1.3)}'; then
+  echo "  → **(가) 그룹 커밋 가설이 지지된다.** 쓰기만에서 1스레드 배수(${W1}배)가"
+  echo "    8스레드(${W8}배)보다 크다 — 혼자면 fsync 를 나눠 물릴 상대가 없다."
+else
+  echo "  → **(가) 그룹 커밋 가설은 기각됐다.** 쓰기만에서 1스레드 배수가 ${W1}배, 8스레드가 ${W8}배다."
+  echo "    그룹 커밋이 원인이라면 혼자 도는 1스레드에서 배수가 **훨씬 커야** 하는데 그렇지 않다"
+  echo "    (오히려 8스레드 쪽이 크다면 가설과 정반대다)."
+fi
+echo "  → **(나)가 맞다.** 같은 손잡이가 읽기 섞인 트랜잭션에서는 ${RW}배,"
+echo "    쓰기만 하면 ${W8}배로 벌어진다 — 커밋이 트랜잭션에서 차지하는 몫이 정한다."
 echo
 echo "  그래서 이 절의 결론은 엔진 비교가 아니다 — **커밋 내구성의 '값'은 트랜잭션에서 커밋이"
 echo "  차지하는 비율이 정한다.** PostgreSQL 의 2.2배와 여기의 배수를 나란히 놓고 '엔진이 다르다'고"
@@ -242,7 +271,9 @@ for cap in 1024 8; do
   W0=$(q "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_written'" | awk '{print $2}')
   IFS='|' read -r T A P M <<<"$(run1 8 "$LUAW")"
   W1=$(q "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_written'" | awk '{print $2}')
-  [ -z "$BT" ] && { BT="$T"; BM="$M"; }
+  # 문장을 표에서 만들려면 값을 남겨야 한다. 두 조건의 TPS/p99/max/기록량을 보관한다.
+  MBW=$(( (W1 - W0) / 1048576 ))
+  if [ -z "$BT" ]; then BT="$T"; BM="$M"; BP="$P"; BW="$MBW"; else NT="$T"; NM="$M"; NP="$P"; NW="$MBW"; NCAP="$cap"; fi
   printf "  %s%12s %10s %10s %14s\n" "$(padr "${cap}MB" 14)" "${T:-?}" "${P:-?}" "${M:-?}" \
     "$(awk -v a="${W1:-0}" -v b="${W0:-0}" 'BEGIN{printf "%.0f MB", (a-b)/1048576}')"
 done
@@ -253,13 +284,31 @@ echo "   redo 를 좁히면 InnoDB 는 더티 페이지를 급하게 내려야 �
 echo "   그 압력이 가장 운 나쁜 트랜잭션 하나에 몰린다. 그게 max 열이다."
 echo "   redo 기록량이 용량을 여러 번 감을 만큼 나와야 압력이 걸린 것이다 — 그래서 그 열을 같이 찍는다."
 echo
-echo "   PostgreSQL: TPS -12%, p99 +10%, **max 54배**. 여기서도 같은 모양이 나온다면"
-echo "   이건 엔진 문제가 아니라 **'로그 공간을 좁히면 스톨이 생긴다'는 구조 문제**다."
-echo "   두 엔진의 배수 크기가 다른 것은 정상이다(로그 크기도 플러시 알고리즘도 다르다)."
-echo "   **같은 것은 방향이다: 평균은 조금 나빠지고 최악은 자릿수로 나빠진다.**"
-echo
-echo "   → p99 만 보는 대시보드는 이 스톨을 통째로 놓친다."
-echo "     Millsap 의 미계상 시간(§M-3)은 실행계획에도 평균에도 p99 에도 안 나온다."
+# **PostgreSQL 의 모양을 여기 그대로 옮겨 적으면 안 된다.** 그쪽은 max 만 54배 뛰고
+# p99 는 10% 였는데, 여기서는 p99 와 max 가 나란히 3배씩 오르는 실행이 나왔다.
+# 그러면 "p99 만 보는 대시보드는 놓친다"가 이 데이터에서는 틀린 말이 된다. 재서 말한다.
+RT=$(awk -v a="$NT" -v b="$BT" 'BEGIN{ if(b>0) printf "%.0f", (a-b)*100/b }')
+RP=$(awk -v a="$NP" -v b="$BP" 'BEGIN{ if(b>0) printf "%.1f", a/b }')
+RMX=$(awk -v a="$NM" -v b="$BM" 'BEGIN{ if(b>0) printf "%.1f", a/b }')
+echo "   이 실행: TPS ${RT}%, p99 **${RP}배**, max **${RMX}배** (${NCAP}MB 기준)."
+echo "   참고로 PostgreSQL 의 max_wal_size 1GB→256MB 는 TPS -12%, p99 +10%, max 54배였다."
+# 압력이 실제로 걸렸는지부터 본다 — 기록량이 용량을 넘지 못하면 이 표는 압력 실험이 아니다.
+if [ "${NW:-0}" -lt "${NCAP:-1}" ]; then
+  echo "   ⚠️ **다만 이 실행은 로그를 한 바퀴도 못 감았다** — 기록량 ${NW}MB < 용량 ${NCAP}MB."
+  echo "     InnoDB 는 용량의 일부만 차도 비동기 플러시를 시작하므로 열화가 보이긴 하지만,"
+  echo "     '로그가 감겨 체크포인트가 강제된' 상태는 아니다. 더 세게 보려면 SECS 를 늘리거나"
+  echo "     용량을 더 줄여라. **압력을 안 만들고 결론을 쓰지 않기 위해 이 줄을 찍는다.**"
+fi
+if awk -v m="$RMX" -v pp="$RP" 'BEGIN{exit !(m+0 > pp*2)}'; then
+  echo "   ★ **max 가 p99 보다 훨씬 크게 나빠졌다**(${RMX}배 대 ${RP}배) — 압력이 가장 운 나쁜"
+  echo "     트랜잭션 하나에 몰렸다는 뜻이다. **p99 만 보는 대시보드는 이 스톨을 놓친다.**"
+  echo "     Millsap 의 미계상 시간(§M-3)은 실행계획에도 평균에도 p99 에도 안 나온다."
+else
+  echo "   ※ 이 실행에서는 **p99 와 max 가 비슷한 폭으로** 나빠졌다(${RP}배 대 ${RMX}배)."
+  echo "     PostgreSQL 쪽처럼 '최악만 자릿수로 튀는' 모양이 아니다 — 여기서는 p99 로도 잡힌다."
+  echo "     같은 것은 **방향**이다(좁히면 지연이 나빠진다). **크기와 분포는 엔진·조건마다 다르므로**"
+  echo "     'max 만 본다'를 규칙으로 옮기지 말고, 두 지표를 같이 두고 어느 쪽이 먼저 움직이는지 보라."
+fi
 echo
 fi
 
