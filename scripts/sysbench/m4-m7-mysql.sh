@@ -23,6 +23,9 @@
 #   ONLY=1 ./m4-m7-mysql.sh       # 무릎 sweep 만
 #   SECS=20 ./m4-m7-mysql.sh      # 조건당 시간(기본 10초)
 #   TABLES=8 TSIZE=200000 ./m4-m7-mysql.sh
+#   THREADS="1 2 4 8 16 32 64 128 256" ./m4-m7-mysql.sh   # ①의 스레드 목록
+#     — 코어가 많으면 기본 목록(…64)으로는 **무릎에 닿지 못한다.** 스윕의 마지막
+#       칸에서 최대 TPS 가 나오면 스크립트가 그렇다고 말하고 다음 목록을 제안한다.
 #
 # 선행 조건: sysbench 바이너리, MySQL 접속. 데이터가 없으면 만든다(sysbench_lab DB).
 # 내구성 설정은 **전역**을 건드리므로 끝에 원래 값으로 되돌린다.
@@ -31,6 +34,14 @@ set -uo pipefail
 SECS="${SECS:-10}"
 TABLES="${TABLES:-4}"
 TSIZE="${TSIZE:-100000}"
+# ①의 스레드 목록. 예전에는 루프에 `for th in 1 2 4 8 16 32 64` 로 **박혀** 있었다.
+# THREADS=... 를 앞에 붙여도 조용히 무시되고, 표는 64 까지만 나온 채 정상처럼 보였다.
+# (같은 부류를 t9-queue-tuning 에서도 겪었다 — 그쪽은 위치 인자인데 환경변수로 줬다.)
+THREADS="${THREADS:-1 2 4 8 16 32 64}"
+case "$THREADS" in
+  *[!0-9\ ]*) echo "  [중단] THREADS 는 공백으로 구분한 양의 정수여야 한다: '$THREADS'"; exit 1;;
+esac
+[ -z "${THREADS// /}" ] && { echo "  [중단] THREADS 가 비어 있다."; exit 1; }
 ONLY="${ONLY:-123}"
 MYHOST="${MYSQL_HOST:-127.0.0.1}"
 MYPORT="${MYSQL_PORT:-3306}"
@@ -122,6 +133,9 @@ BP=$(q "SELECT round(@@innodb_buffer_pool_size/1024/1024)")
 echo "§M-4 / M-6 / M-7 의 MySQL/InnoDB 판"
 echo "  MySQL $V / CPU $(nproc 2>/dev/null || echo '?') / buffer pool ${BP}MB"
 echo "  sysbench oltp_read_write, ${TABLES}테이블 × ${TSIZE}행, 조건당 ${SECS}초"
+# 실제로 쓰는 목록을 찍는다 — 예전에 THREADS 가 무시되던 때, 무시됐다는 사실이
+# 출력 어디에도 없어서 스윕이 잘린 표가 정상처럼 보였다.
+want 1 && echo "  ① 스레드 스윕: $THREADS"
 echo "  현재 내구성: flush_log_at_trx_commit=$F0 / sync_binlog=$S0 / redo=$((R0/1024/1024))MB"
 echo
 
@@ -134,20 +148,49 @@ echo
 # (어느 줄이 무릎인지는 스크립트가 단정하지 않는다. 워크로드마다 기준이 다르다.)
 printf "  %s%10s %9s %9s %9s %11s %11s\n" "$(padr 스레드 8)" "$(padl TPS 10)" "$(padl avg 9)" "$(padl p99 9)" "$(padl max 9)" "$(padl "직전 TPS×" 11)" "$(padl "직전 지연×" 11)"
 printf "  %s\n" "--------------------------------------------------------------------------------"
-BEST=0; BESTT=""; PT=""; PA=""
-for th in 1 2 4 8 16 32 64; do
+# 첫 줄을 버릴 워밍업 한 번. 스윕의 첫 칸은 버퍼 풀이 차가워서 혼자 느리게 나오고,
+# 그러면 '직전 대비 배수' 열의 두 번째 줄이 터무니없이 커진다(실측: SECS=5 에서
+# 1스레드 18.77 tps · max 2,007ms → 2스레드 배수 12.15x). 배수로 무릎을 짚는 표라
+# 그 한 칸이 열 전체의 의미를 흔든다.
+run1 4 >/dev/null 2>&1
+
+BEST=0; BESTT=""; PT=""; PA=""; LASTT=""; KNEE=""
+for th in $THREADS; do
   IFS='|' read -r T A P M <<<"$(run1 "$th")"
   awk -v a="${T:-0}" -v b="$BEST" 'BEGIN{exit !(a>b)}' && { BEST="$T"; BESTT="$th"; }
-  RT=$(awk -v a="${T:-0}" -v b="${PT:-0}" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else printf "-" }')
-  RA=$(awk -v a="${A:-0}" -v b="${PA:-0}" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else printf "-" }')
+  # 배수를 **숫자로** 먼저 내고 표시는 그 다음이다. 예전에는 "1.44x" 문자열만 만들어
+  # 찍고 버려서, 무릎에 닿았는지를 스크립트가 판정할 수 없었다.
+  RTn=$(awk -v a="${T:-0}" -v b="${PT:-0}" 'BEGIN{ if(b>0) printf "%.4f", a/b; else printf "0" }')
+  RAn=$(awk -v a="${A:-0}" -v b="${PA:-0}" 'BEGIN{ if(b>0) printf "%.4f", a/b; else printf "0" }')
+  RT=$(awk -v r="$RTn" 'BEGIN{ if(r>0) printf "%.2fx", r; else printf "-" }')
+  RA=$(awk -v r="$RAn" 'BEGIN{ if(r>0) printf "%.2fx", r; else printf "-" }')
+  # 무릎 너머의 정의 — 처리량은 거의 안 따라오는데(1.3배 미만) 지연은 크게 는다(1.5배 초과).
+  if [ -z "$KNEE" ] && awk -v t="$RTn" -v a="$RAn" 'BEGIN{exit !(t>0 && a>0 && t<1.3 && a>1.5)}'; then
+    KNEE="$th"
+  fi
   printf "  %s%10s %9s %9s %9s %11s %11s\n" "$(padr "$th" 8)" "${T:-?}" "${A:-?}" "${P:-?}" "${M:-?}" "$RT" "$RA"
-  PT="$T"; PA="$A"
+  PT="$T"; PA="$A"; LASTT="$th"
 done
 echo
 echo "  최대 TPS 는 스레드 ${BESTT} 에서 나왔다 (CPU $(nproc 2>/dev/null || echo '?')개)."
+# 스윕의 **마지막 칸**에서 최대가 나왔다면 그건 '무릎이 거기'가 아니라 **아직 안 왔다**는 뜻이다.
+# 그 구분을 안 하면 "무릎은 64" 라는 결론이 스윕 길이에서 나온 것이 되어 버린다.
+NEXT=$(awk -v l="${LASTT:-64}" 'BEGIN{ s=""; for(i=1;i<=3;i++){ l*=2; s=s" "l } print s }')
+if [ -n "$KNEE" ]; then
+  echo "  **무릎은 스레드 ${KNEE} 에서 넘었다** — 거기서 처리량 배수가 1.3 아래로 떨어지고"
+  echo "  지연 배수가 1.5 를 넘었다."
+elif [ "$BESTT" = "$LASTT" ]; then
+  echo "  ⚠️ **스윕의 마지막 칸에서 최대가 나왔다 — 무릎에 닿지 못했다.**"
+  echo "  이 표로는 '무릎이 ${LASTT}' 라고 말할 수 없다. 그건 측정이 아니라 **스윕 길이**다."
+  echo "  더 늘려서 다시 재라:  THREADS=\"$THREADS$NEXT\" $0"
+else
+  echo "  처리량이 ${BESTT} 이후 줄긴 했지만, '처리량 정체 + 지연 급증' 조건을 만족한 줄은 없다."
+  echo "  **무릎을 이 표로 짚을 수 없다** — 조건당 ${SECS}초가 짧아 흔들렸을 수 있다(SECS 를 올려 보라)."
+fi
 echo
 echo "  읽는 법 — **오른쪽 두 열이 무릎을 가리킨다.** 스레드를 두 배로 올렸을 때"
 echo "   'TPS× 는 1 에 가까워지는데 지연× 는 2 에 가까워지는' 줄부터가 무릎 너머다."
+echo "   위 판정은 **TPS× < 1.3 이면서 지연× > 1.5** 인 첫 줄을 무릎으로 본 것이다."
 echo "   거기서부터는 더 넣은 동시성이 처리량이 아니라 **대기열 길이**로만 간다."
 echo
 echo "   pgbench(tpcb-like)에서는 4→8 에서 **TPS 가 실제로 줄었다.** 여기서는 그런 구간이"

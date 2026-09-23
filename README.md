@@ -455,7 +455,13 @@ ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
 ```bash
 ./scripts/sysbench/m4-m7-mysql.sh               # 전부 (약 8분)
 ONLY=1 ./scripts/sysbench/m4-m7-mysql.sh        # 무릎 sweep 만
+THREADS="1 2 4 8 16 32 64 128 256" ./scripts/sysbench/m4-m7-mysql.sh   # 스레드 목록
 ```
+
+> **코어가 많으면 기본 목록(…64)으로는 무릎에 닿지 못한다.** CPU 32개 장비에서는 64 까지
+> 계속 `TPS× > 지연×` 라 무릎 근처에도 못 간다. 스윕의 마지막 칸에서 최대 TPS 가 나오면
+> 스크립트가 **"무릎에 닿지 못했다"** 고 말하고 다음 목록을 제안한다 —
+> 그 문장이 없으면 "무릎은 64" 라는 결론이 측정이 아니라 **스윕 길이**에서 나온 것이 된다.
 
 > **무릎은 pgbench 와 같은 자리(코어 수 4)에 있었지만 증상이 다르다** — pgbench 는 4→8 에서
 > TPS 가 줄고, 여기서는 줄지 않고 포화한다(읽기가 많아 CPU 가 비는 틈을 메운다).
