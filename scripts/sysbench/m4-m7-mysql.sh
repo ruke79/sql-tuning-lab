@@ -203,6 +203,16 @@ if [ "${MC0:-0}" -lt "$NEED" ]; then
   if [ "${MCN:-0}" -ge "$NEED" ]; then
     MC_RAISED=1
     echo "  → 이 실행 동안만 ${MCN} 로 올렸다(끝나면 ${MC0} 로 되돌린다)."
+  elif [ "${MCN:-0}" -gt "${MC0:-0}" ]; then
+    # **오른 건 올랐는데 원하는 만큼은 아니다.** MySQL 은 open_files_limit 이 모자라면
+    # max_connections 를 말없이 깎아서 받는다. 이걸 '권한 부족'이라고 말하면
+    # 고칠 수 없는 조언이 된다 — 되읽은 값이 그 구분을 준다.
+    echo "  → 서버가 ${MCN} 까지만 받았다(요청 ${NEED}). 권한 문제가 아니라 **서버가 깎은 것**이다."
+    echo "     open_files_limit=$(q "SELECT @@open_files_limit") 이 흔한 원인이다 —"
+    echo "     연결마다 파일 서술자가 필요하다. 늘리려면 mysqld 의 open_files_limit 을 올려라(재기동)."
+    MC_RAISED=1
+    trim_threads "$(( MCN - 20 ))"
+    MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
   else
     echo "  → 올리지 못했다(권한 부족일 수 있다: SYSTEM_VARIABLES_ADMIN)."
     echo "     전부 재려면 서버에서 먼저:  SET GLOBAL max_connections=$NEED;"
