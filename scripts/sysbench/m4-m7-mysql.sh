@@ -106,11 +106,17 @@ R0=$(q "SELECT @@innodb_redo_log_capacity")
 # 아예 못 붙는다(error 1040) — 기본값이 151 이라 256 스레드부터 걸린다.
 MC0=$(q "SELECT @@max_connections")
 MC_RAISED=0
+# max_prepared_stmt_count 도 같은 종류의 벽이다. sysbench 는 **연결마다 준비문을 여러 개**
+# 잡는데(--tables 에 비례한다) 기본 상한이 16382 다. max_connections 를 올려서 붙기는
+# 했는데 거기서 막히면 `FATAL: mysql_stmt_prepare() failed` 가 난다 — 실측: 512 스레드.
+MPS0=$(q "SELECT @@max_prepared_stmt_count")
+MPS_RAISED=0
 restore() {
   q "SET GLOBAL innodb_flush_log_at_trx_commit=$F0" >/dev/null 2>&1
   q "SET GLOBAL sync_binlog=$S0" >/dev/null 2>&1
   q "SET GLOBAL innodb_redo_log_capacity=$R0" >/dev/null 2>&1
-  [ "$MC_RAISED" = "1" ] && q "SET GLOBAL max_connections=$MC0" >/dev/null 2>&1
+  [ "$MC_RAISED" = "1" ]  && q "SET GLOBAL max_connections=$MC0" >/dev/null 2>&1
+  [ "$MPS_RAISED" = "1" ] && q "SET GLOBAL max_prepared_stmt_count=$MPS0" >/dev/null 2>&1
   return 0
 }
 trap restore EXIT
@@ -177,6 +183,17 @@ if ! echo "$THREADS" | awk '{ for(i=2;i<=NF;i++) if ($i != $(i-1)*2) exit 1 }'; 
   echo "  전제로 한 값이라, 이 목록에서는 칸마다 의미가 다르다. 무릎 판정도 그만큼 느슨하게 읽어라."
   echo
 fi
+# 못 재는 칸은 **목록에서 지운다.** 빈 줄을 남기면 아래 판정이 그걸 0 으로 읽는다.
+trim_threads() {   # $1 = 허용 최대 스레드
+  local cap="$1" keep="" drop="" th
+  for th in $THREADS; do
+    if [ "$th" -le "$cap" ]; then keep="$keep $th"; else drop="$drop $th"; fi
+  done
+  echo "     **잴 수 없는 칸을 목록에서 뺀다:${drop:- (없음)}**"
+  THREADS="${keep# }"
+  [ -z "$THREADS" ] && { echo "  [중단] 남는 칸이 없다."; exit 1; }
+  echo "     이번 스윕: $THREADS"
+}
 MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
 NEED=$(( MAXTH + 20 ))          # sysbench 워커 + 이 스크립트의 mysql 호출 여유
 if [ "${MC0:-0}" -lt "$NEED" ]; then
@@ -187,31 +204,61 @@ if [ "${MC0:-0}" -lt "$NEED" ]; then
     MC_RAISED=1
     echo "  → 이 실행 동안만 ${MCN} 로 올렸다(끝나면 ${MC0} 로 되돌린다)."
   else
-    # 못 올리면 **재지 못할 칸을 지운다.** 빈 줄을 남기면 아래 판정이 그걸 읽는다.
-    KEEPTH=""; DROPTH=""
-    for th in $THREADS; do
-      if [ "$(( th + 20 ))" -le "${MC0:-0}" ]; then KEEPTH="$KEEPTH $th"; else DROPTH="$DROPTH $th"; fi
-    done
     echo "  → 올리지 못했다(권한 부족일 수 있다: SYSTEM_VARIABLES_ADMIN)."
-    echo "     **잴 수 없는 칸을 목록에서 뺀다:${DROPTH:- (없음)}**"
     echo "     전부 재려면 서버에서 먼저:  SET GLOBAL max_connections=$NEED;"
-    THREADS="${KEEPTH# }"
-    [ -z "$THREADS" ] && { echo "  [중단] 남는 칸이 없다."; exit 1; }
-    echo "     이번 스윕: $THREADS"
+    trim_threads "$(( ${MC0:-0} - 20 ))"
+    MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
   fi
   echo
 fi
+# 첫 줄을 버릴 워밍업 한 번. 스윕의 첫 칸은 버퍼 풀이 차가워서 혼자 느리게 나오고,
+# 그러면 '직전 대비 배수' 열의 두 번째 줄이 터무니없이 커진다(실측: SECS=5 에서
+# 1스레드 18.77 tps · max 2,007ms → 2스레드 배수 12.15x). 배수로 무릎을 짚는 표라
+# 그 한 칸이 열 전체의 의미를 흔든다.
+#
+# 그리고 이 워밍업에서 **스레드 하나가 준비문을 몇 개 잡는지 잰다.** 추정하지 않는다 —
+# --tables 에 따라 달라지고, 틀리면 아래 상한 계산이 통째로 틀린다.
+WARM_TH=4
+run1 "$WARM_TH" >/dev/null 2>&1 &
+WARMPID=$!
+PSMAX=0
+while kill -0 "$WARMPID" 2>/dev/null; do
+  PSN=$(q "SHOW GLOBAL STATUS LIKE 'Prepared_stmt_count'" | awk '{print $2}')
+  case "${PSN:-}" in ''|*[!0-9]*) ;; *) [ "$PSN" -gt "$PSMAX" ] && PSMAX="$PSN";; esac
+  sleep 1
+done
+wait "$WARMPID" 2>/dev/null
+# 실측(--tables=4): 32스레드에서 Prepared_stmt_count 1184 → 스레드당 **37** 이고,
+# 그것이 9×tables+1 과 정확히 맞는다. 표본이 스레드가 다 붙기 전에 찍힐 수 있으므로
+# **작게 나오면 그 모양을 바닥으로 쓴다** — 적게 잡으면 상한을 적게 올려 또 죽는다.
+PER=$(( (PSMAX + WARM_TH - 1) / WARM_TH ))
+FLOORPS=$(( 9 * TABLES + 1 ))
+[ "$PER" -lt "$FLOORPS" ] && PER="$FLOORPS"
+
+NEEDPS=$(( MAXTH * PER * 12 / 10 + 500 ))   # 20% 여유 — 올리는 건 상한일 뿐 할당이 아니다
+if [ "${MPS0:-0}" -lt "$NEEDPS" ]; then
+  echo "  max_prepared_stmt_count=$MPS0 인데 이 스윕은 최대 ${MAXTH}스레드 × ${PER}개 = 약 $(( MAXTH * PER ))개가 필요하다"
+  echo "  (스레드당 ${PER}개는 워밍업에서 **재서** 얻은 값이다 — tables=${TABLES})."
+  echo "  그대로면 붙기는 해도 준비 단계에서 죽는다(FATAL: mysql_stmt_prepare() failed)."
+  q "SET GLOBAL max_prepared_stmt_count=$NEEDPS" >/dev/null 2>&1
+  MPSN=$(q "SELECT @@max_prepared_stmt_count")
+  if [ "${MPSN:-0}" -ge "$NEEDPS" ]; then
+    MPS_RAISED=1
+    echo "  → 이 실행 동안만 ${MPSN} 로 올렸다(끝나면 ${MPS0} 로 되돌린다)."
+  else
+    echo "  → 올리지 못했다. 전부 재려면 서버에서 먼저:  SET GLOBAL max_prepared_stmt_count=$NEEDPS;"
+    trim_threads "$(( (${MPS0:-0} - 200) / PER ))"
+  fi
+  echo
+fi
+
+# 표 머리는 **사전 점검이 다 끝난 뒤에** 찍는다. 앞에 두면 "…로 올렸다" 같은 줄이
+# 표 안에 끼어 들어가 표처럼 보이지 않는다.
 # 무릎은 절대값이 아니라 **직전 대비 배수**로 보인다 — 스레드를 두 배로 올렸을 때
 # 처리량이 얼마나 따라오고 지연이 얼마나 늘었는가. 그래서 그 두 열을 같이 찍는다.
 # (어느 줄이 무릎인지는 스크립트가 단정하지 않는다. 워크로드마다 기준이 다르다.)
 printf "  %s%10s %9s %9s %9s %11s %11s\n" "$(padr 스레드 8)" "$(padl TPS 10)" "$(padl avg 9)" "$(padl p99 9)" "$(padl max 9)" "$(padl "직전 TPS×" 11)" "$(padl "직전 지연×" 11)"
 printf "  %s\n" "--------------------------------------------------------------------------------"
-# 첫 줄을 버릴 워밍업 한 번. 스윕의 첫 칸은 버퍼 풀이 차가워서 혼자 느리게 나오고,
-# 그러면 '직전 대비 배수' 열의 두 번째 줄이 터무니없이 커진다(실측: SECS=5 에서
-# 1스레드 18.77 tps · max 2,007ms → 2스레드 배수 12.15x). 배수로 무릎을 짚는 표라
-# 그 한 칸이 열 전체의 의미를 흔든다.
-run1 4 >/dev/null 2>&1
-
 BEST=0; BESTT=""; PT=""; PA=""; LASTT=""; KNEE=""; FAILED=""; FAILWHY=""; SUCC=""
 for th in $THREADS; do
   IFS='|' read -r T A P M <<<"$(run1 "$th")"
