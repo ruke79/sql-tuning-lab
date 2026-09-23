@@ -102,10 +102,16 @@ fi
 F0=$(q "SELECT @@innodb_flush_log_at_trx_commit")
 S0=$(q "SELECT @@sync_binlog")
 R0=$(q "SELECT @@innodb_redo_log_capacity")
+# max_connections 도 전역이라 같이 원복한다. ①에서 스레드가 이 값을 넘으면 sysbench 가
+# 아예 못 붙는다(error 1040) — 기본값이 151 이라 256 스레드부터 걸린다.
+MC0=$(q "SELECT @@max_connections")
+MC_RAISED=0
 restore() {
   q "SET GLOBAL innodb_flush_log_at_trx_commit=$F0" >/dev/null 2>&1
   q "SET GLOBAL sync_binlog=$S0" >/dev/null 2>&1
   q "SET GLOBAL innodb_redo_log_capacity=$R0" >/dev/null 2>&1
+  [ "$MC_RAISED" = "1" ] && q "SET GLOBAL max_connections=$MC0" >/dev/null 2>&1
+  return 0
 }
 trap restore EXIT
 
@@ -115,18 +121,35 @@ trap restore EXIT
 # 먼저 잡혀서 p99 자리에 99 가, max 자리에 아무것도 안 들어갔다(실제로 그랬다).
 # 필드 위치로 집는다.
 # $2 를 주면 그 lua 로 돌린다(기본은 oltp_read_write).
+# **실패를 빈 값으로 흘려보내지 않는다.** sysbench 가 못 붙으면(예: max_connections 초과)
+# tps 자리가 비고, 표에는 '?' 가 찍힌다. 그 '?' 를 0 으로 읽으면 아래 판정이
+# "처리량이 줄었다"로 말한다 — **측정 실패를 측정 결과로 narrate 하는 것**이다.
+# 실패하면 사유를 RUN1_ERR 에 담고 tps 자리를 비운 채 돌려준다.
+# 사유는 **파일로** 남긴다. run1 은 $(...) 안에서 불리므로 서브셸이고,
+# 거기서 변수에 담으면 호출한 쪽에는 안 남는다 — 이 랩에서 이미 겪은 함정이다
+# (첫 판에서 실제로 '사유:' 줄이 통째로 비었다).
+RUN1_ERRF="${TMPDIR:-/tmp}/m4run1err.$$"
 run1() {
-  local th="$1" lua="${2:-$LUA}" out
+  local th="$1" lua="${2:-$LUA}" out res
+  : > "$RUN1_ERRF"
   out=$(sysbench "$lua" --db-driver=mysql --mysql-host="$MYHOST" --mysql-port="$MYPORT" \
         --mysql-user="$MYUSER" --mysql-password="$MYPASS" --mysql-db="$DB" \
         --tables="$TABLES" --table-size="$TSIZE" --percentile=99 \
         --threads="$th" --time="$SECS" --report-interval=0 run 2>&1)
-  echo "$out" | awk '
+  res=$(echo "$out" | awk '
     /transactions:/ && /per sec/ { gsub(/[()]/,""); tps=$3 }
     /^[ \t]*avg:/ && !a { a=$2 }
     /^[ \t]*max:/ && !m { m=$2 }
     /99th percentile:/  { p=$NF }
-    END { printf "%s|%s|%s|%s", tps, a, p, m }'
+    END { printf "%s|%s|%s|%s", tps, a, p, m }')
+  case "$res" in
+    # 'unable to connect ... aborting' 보다 'error 1040: Too many connections' 가 먼저다 —
+    # 앞엣것은 증상이고 뒤엣것이 사유다. 고칠 수 있는 쪽을 보여준다.
+    "|"*) { echo "$out" | grep -iE '^(FATAL|ERROR).*error [0-9]+' | head -1
+            echo "$out" | grep -iE '^(FATAL|ERROR)' | head -1
+            echo "sysbench 가 결과를 내지 않았다"; } | grep -m1 . > "$RUN1_ERRF";;
+  esac
+  echo "$res"
 }
 
 BP=$(q "SELECT round(@@innodb_buffer_pool_size/1024/1024)")
@@ -143,6 +166,41 @@ echo
 if want 1; then
 echo "── ① M-4 대기열 이론 — 무릎이 어디인가 ──"
 echo
+# **돌리기 전에 붙을 수 있는지 본다.** sysbench 는 스레드마다 연결을 하나 연다.
+# max_connections(기본 151)를 넘으면 error 1040 으로 아예 못 붙고, 그 칸은 빈 줄이 된다.
+# 실측: CPU 32 장비에서 THREADS=... 256 512 를 줬더니 128 까지 재고 256·512 는 '?' 였다.
+# 2분을 다 쓰고 나서야 알게 되는 일이라, 먼저 재고 먼저 말한다.
+# '직전 대비 배수' 두 열은 **스레드를 두 배로 올렸다**는 전제 위에 있다. 목록이
+# 두 배씩이 아니면 그 열은 비교 가능한 값이 아닌데, 표는 똑같이 생겨서 그냥 읽힌다.
+if ! echo "$THREADS" | awk '{ for(i=2;i<=NF;i++) if ($i != $(i-1)*2) exit 1 }'; then
+  echo "  [주의] 스레드 목록이 2배씩이 아니다 — '직전 TPS×/지연×' 두 열은 **두 배씩 올릴 때**를"
+  echo "  전제로 한 값이라, 이 목록에서는 칸마다 의미가 다르다. 무릎 판정도 그만큼 느슨하게 읽어라."
+  echo
+fi
+MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
+NEED=$(( MAXTH + 20 ))          # sysbench 워커 + 이 스크립트의 mysql 호출 여유
+if [ "${MC0:-0}" -lt "$NEED" ]; then
+  echo "  max_connections=$MC0 인데 이 스윕의 최대 스레드는 ${MAXTH} 다 — 그대로면 못 붙는다(error 1040)."
+  q "SET GLOBAL max_connections=$NEED" >/dev/null 2>&1
+  MCN=$(q "SELECT @@max_connections")
+  if [ "${MCN:-0}" -ge "$NEED" ]; then
+    MC_RAISED=1
+    echo "  → 이 실행 동안만 ${MCN} 로 올렸다(끝나면 ${MC0} 로 되돌린다)."
+  else
+    # 못 올리면 **재지 못할 칸을 지운다.** 빈 줄을 남기면 아래 판정이 그걸 읽는다.
+    KEEPTH=""; DROPTH=""
+    for th in $THREADS; do
+      if [ "$(( th + 20 ))" -le "${MC0:-0}" ]; then KEEPTH="$KEEPTH $th"; else DROPTH="$DROPTH $th"; fi
+    done
+    echo "  → 올리지 못했다(권한 부족일 수 있다: SYSTEM_VARIABLES_ADMIN)."
+    echo "     **잴 수 없는 칸을 목록에서 뺀다:${DROPTH:- (없음)}**"
+    echo "     전부 재려면 서버에서 먼저:  SET GLOBAL max_connections=$NEED;"
+    THREADS="${KEEPTH# }"
+    [ -z "$THREADS" ] && { echo "  [중단] 남는 칸이 없다."; exit 1; }
+    echo "     이번 스윕: $THREADS"
+  fi
+  echo
+fi
 # 무릎은 절대값이 아니라 **직전 대비 배수**로 보인다 — 스레드를 두 배로 올렸을 때
 # 처리량이 얼마나 따라오고 지연이 얼마나 늘었는가. 그래서 그 두 열을 같이 찍는다.
 # (어느 줄이 무릎인지는 스크립트가 단정하지 않는다. 워크로드마다 기준이 다르다.)
@@ -154,9 +212,17 @@ printf "  %s\n" "---------------------------------------------------------------
 # 그 한 칸이 열 전체의 의미를 흔든다.
 run1 4 >/dev/null 2>&1
 
-BEST=0; BESTT=""; PT=""; PA=""; LASTT=""; KNEE=""
+BEST=0; BESTT=""; PT=""; PA=""; LASTT=""; KNEE=""; FAILED=""; FAILWHY=""; SUCC=""
 for th in $THREADS; do
   IFS='|' read -r T A P M <<<"$(run1 "$th")"
+  # 실패한 칸은 **표에만 남기고 계산에서 뺀다.** 예전에는 빈 값이 0 으로 읽혀
+  # "처리량이 줄었다"는 판정을 만들었다 — 재지 못한 것을 재서 줄었다고 말한 셈이다.
+  if [ -z "${T:-}" ]; then
+    FAILED="$FAILED $th"
+    [ -z "$FAILWHY" ] && FAILWHY=$(cat "$RUN1_ERRF" 2>/dev/null)
+    printf "  %s%10s %9s %9s %9s %11s %11s\n" "$(padr "$th" 8)" "측정실패" "-" "-" "-" "-" "-"
+    continue
+  fi
   awk -v a="${T:-0}" -v b="$BEST" 'BEGIN{exit !(a>b)}' && { BEST="$T"; BESTT="$th"; }
   # 배수를 **숫자로** 먼저 내고 표시는 그 다음이다. 예전에는 "1.44x" 문자열만 만들어
   # 찍고 버려서, 무릎에 닿았는지를 스크립트가 판정할 수 없었다.
@@ -169,23 +235,46 @@ for th in $THREADS; do
     KNEE="$th"
   fi
   printf "  %s%10s %9s %9s %9s %11s %11s\n" "$(padr "$th" 8)" "${T:-?}" "${A:-?}" "${P:-?}" "${M:-?}" "$RT" "$RA"
-  PT="$T"; PA="$A"; LASTT="$th"
+  PT="$T"; PA="$A"; LASTT="$th"; SUCC="$SUCC $th"
 done
+SUCC="${SUCC# }"
+rm -f "$RUN1_ERRF"
 echo
+# 실패한 칸이 있으면 **그 사실부터** 말한다. 아래 판정은 성공한 칸까지만의 이야기다.
+if [ -n "$FAILED" ]; then
+  echo "  ⚠️ **재지 못한 칸이 있다:${FAILED}**"
+  [ -n "$FAILWHY" ] && echo "     사유: $FAILWHY"
+  echo "     아래 판정은 ${LASTT:-?} 까지만의 이야기다 — 빈 칸을 '처리량이 줄었다'로 읽으면 안 된다."
+  echo
+fi
+if [ -z "$BESTT" ]; then
+  echo "  [중단] 한 칸도 재지 못했다."
+else
 echo "  최대 TPS 는 스레드 ${BESTT} 에서 나왔다 (CPU $(nproc 2>/dev/null || echo '?')개)."
 # 스윕의 **마지막 칸**에서 최대가 나왔다면 그건 '무릎이 거기'가 아니라 **아직 안 왔다**는 뜻이다.
 # 그 구분을 안 하면 "무릎은 64" 라는 결론이 스윕 길이에서 나온 것이 되어 버린다.
-NEXT=$(awk -v l="${LASTT:-64}" 'BEGIN{ s=""; for(i=1;i<=3;i++){ l*=2; s=s" "l } print s }')
+# 다음 목록은 **성공한 칸들에 이어서** 만든다. 처음엔 THREADS 뒤에 LASTT 의 2·4·8배를
+# 그냥 붙였더니, 실패한 칸이 섞인 목록에서 `1 2 4 256 8 16 32` 같은 순서 뒤엉킨 제안이 나왔다.
+NEXT=$(awk -v cur="$SUCC" 'BEGIN{
+  n=split(cur, a, " "); mx=0
+  for(i=1;i<=n;i++){ if(a[i]+0>mx) mx=a[i]+0; s=s (s?" ":"") a[i] }
+  for(i=1;i<=3;i++){ mx*=2; s=s" "mx }
+  print s }')
 if [ -n "$KNEE" ]; then
   echo "  **무릎은 스레드 ${KNEE} 에서 넘었다** — 거기서 처리량 배수가 1.3 아래로 떨어지고"
   echo "  지연 배수가 1.5 를 넘었다."
+elif [ -n "$FAILED" ]; then
+  echo "  ⚠️ **잰 칸 중 마지막(${LASTT})에서 최대가 나왔다 — 무릎에 닿지 못했다.**"
+  echo "  그런데 못 늘린 이유는 스윕이 짧아서가 아니라 **위의 측정 실패** 때문이다."
+  echo "  먼저 그 사유를 고쳐야 한다 — 그 전에는 이 표로 무릎을 말할 수 없다."
 elif [ "$BESTT" = "$LASTT" ]; then
   echo "  ⚠️ **스윕의 마지막 칸에서 최대가 나왔다 — 무릎에 닿지 못했다.**"
   echo "  이 표로는 '무릎이 ${LASTT}' 라고 말할 수 없다. 그건 측정이 아니라 **스윕 길이**다."
-  echo "  더 늘려서 다시 재라:  THREADS=\"$THREADS$NEXT\" $0"
+  echo "  더 늘려서 다시 재라:  THREADS=\"$NEXT\" $0"
 else
   echo "  처리량이 ${BESTT} 이후 줄긴 했지만, '처리량 정체 + 지연 급증' 조건을 만족한 줄은 없다."
   echo "  **무릎을 이 표로 짚을 수 없다** — 조건당 ${SECS}초가 짧아 흔들렸을 수 있다(SECS 를 올려 보라)."
+fi
 fi
 echo
 echo "  읽는 법 — **오른쪽 두 열이 무릎을 가리킨다.** 스레드를 두 배로 올렸을 때"
