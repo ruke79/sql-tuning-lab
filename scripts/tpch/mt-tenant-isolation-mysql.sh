@@ -394,12 +394,37 @@ echo "  → tpcds 판 ⑥에서 '풀 모델의 진짜 문제는 CPU 가 아니�
 echo "     PostgreSQL 에서는 그 해법이 CLUSTER(일회성, 이후 다시 흐트러짐)였다."
 echo "     InnoDB 에서는 PK 설계가 곧 물리 배치라 **그 상태가 유지된다.** 이게 엔진 차이다."
 echo
-echo "  대가 — 보조 인덱스가 PK 를 담으므로 PK 가 넓어지면 보조 인덱스도 넓어진다:"
-myv tpch -e "SELECT table_name AS '테이블',
-       ROUND(data_length/1048576) AS '데이터MB', ROUND(index_length/1048576) AS '인덱스MB'
-     FROM information_schema.tables WHERE table_schema='tpch' AND table_name IN ('li_a','li_ac');"
-echo "  (두 표의 인덱스 개수가 달라 총량을 그대로 비교하면 안 된다 — A 에는 테넌트 보조"
-echo "   인덱스가 하나 더 있다. 요점은 A′ 의 k_cust 한 개가 담는 PK 가 12바이트로 넓어졌다는 것이다.)"
+# 대가를 말하려면 **같은 인덱스 둘**을 비교해야 한다. 예전에는 표 총량(index_length)을
+# 찍어 놓고 "PK 가 넓어지면 보조 인덱스도 넓어진다"고 했는데, A 에는 k_ten 이 하나 더 있어
+# 총량은 오히려 A 가 크게 나온다 — **주장과 반대 방향의 표를 근거로 내밀고 있었다.**
+# li_a 와 li_ac 에 똑같이 있는 k_cust(o_custkey) 하나만 견준다. 정의도 행 수도 같고
+# 다른 것은 담고 있는 PK 뿐이라, 차이가 나오면 그게 PK 폭이다.
+echo "  대가 — InnoDB 의 보조 인덱스는 행 위치가 아니라 **PK 값**을 담는다."
+echo "  li_a 와 li_ac 에 똑같이 있는 k_cust(o_custkey) 한 개만 견준다(다른 것은 PK 뿐이다):"
+myv tpch -e "SELECT table_name AS '테이블', index_name AS '인덱스',
+       ROUND(stat_value*@@innodb_page_size/1048576,1) AS 'MB'
+     FROM mysql.innodb_index_stats
+     WHERE database_name='tpch' AND table_name IN ('li_a','li_ac') AND stat_name='size'
+     ORDER BY table_name, (index_name='PRIMARY') DESC, index_name;" 2>/dev/null
+KC_A=$(q "SELECT ROUND(stat_value*@@innodb_page_size/1048576,1) FROM mysql.innodb_index_stats
+          WHERE database_name='tpch' AND table_name='li_a' AND index_name='k_cust' AND stat_name='size'" 2>/dev/null)
+KC_AC=$(q "SELECT ROUND(stat_value*@@innodb_page_size/1048576,1) FROM mysql.innodb_index_stats
+           WHERE database_name='tpch' AND table_name='li_ac' AND index_name='k_cust' AND stat_name='size'" 2>/dev/null)
+if [ -n "${KC_A:-}" ] && [ -n "${KC_AC:-}" ] && awk -v a="$KC_A" 'BEGIN{exit !(a>0)}'; then
+  KC_R=$(awk -v a="$KC_A" -v b="$KC_AC" 'BEGIN{printf "%.2f", b/a}')
+  if awk -v r="$KC_R" 'BEGIN{exit !(r>1.05)}'; then
+    echo "  → 같은 k_cust 가 A ${KC_A}MB → A′ ${KC_AC}MB 로 **${KC_R}배 넓어졌다.** PK 가"
+    echo "     (l_orderkey,l_linenumber)에서 (l_nationkey,l_orderkey,l_linenumber)로 늘어난 몫이다."
+    echo "     A′ 의 이득은 공짜가 아니다 — **보조 인덱스를 많이 쓰는 워크로드에서는 이게 청구서다.**"
+  else
+    echo "  → 같은 k_cust 가 A ${KC_A}MB / A′ ${KC_AC}MB 로 ${KC_R}배다 — 이 규모에서는"
+    echo "     PK 폭이 보조 인덱스 크기로 잘 안 비친다. 페이지 단위라 컬럼 하나가 묻힐 수 있다."
+  fi
+else
+  echo "  (mysql.innodb_index_stats 를 못 읽었다 — 인덱스별 크기 비교를 건너뛴다.)"
+fi
+echo "  ※ 표 총량(index_length)으로 비교하면 안 된다 — A 에는 테넌트 보조 인덱스 k_ten 이"
+echo "     하나 더 있어서 총량은 오히려 A 가 크다. 그러면 주장과 반대 방향의 표가 된다."
 echo
 fi
 
