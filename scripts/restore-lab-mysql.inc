@@ -221,10 +221,34 @@ restore_mysql() {
   chk_data tpcds store_sales tpcds "generate --sales=$SALES"
 
   # sysbench_lab 은 gradle 이 아니라 sysbench 바이너리가 채운다 — 명령이 다르다.
+  #
+  # **DB 가 없는 것과 비어 있는 것을 갈라야 한다.** 예전에는 information_schema.tables 만
+  # 세고 0 이면 "비어 있다, sysbench prepare 를 돌려라"고 안내했는데, DB 자체가 없으면
+  # 그 안내가 막다른 길이다 — **sysbench 는 DB 를 만들어 주지 않는다**(실측: error 1049
+  # Unknown database). 그러면 `restore-lab 이 시킨 명령이 Unknown database 로 죽는` 상태가
+  # 된다. tpch/tpcds 는 chk_data 가 DB 를 만들어 주는데 여기만 빠져 있었다.
+  local SBDB; SBDB=$(m "SELECT count(*) FROM information_schema.schemata WHERE schema_name='sysbench_lab'")
+  if [ "${SBDB:-0}" != "1" ]; then
+    if [ "$MODE" = "--check" ]; then
+      warn "DB sysbench_lab 이 없다 — 이 상태로는 sysbench prepare 도 Unknown database 로 죽는다"
+      say  "       ./scripts/restore-lab.sh --mysql   # DB 부터 만든다"
+    else
+      act "DB sysbench_lab 을 만든다"
+      m  "CREATE DATABASE sysbench_lab CHARACTER SET utf8mb4" >/dev/null 2>&1 \
+        || mr "CREATE DATABASE sysbench_lab CHARACTER SET utf8mb4" >/dev/null 2>&1
+      SBDB=$(m "SELECT count(*) FROM information_schema.schemata WHERE schema_name='sysbench_lab'")
+      if [ "${SBDB:-0}" != "1" ]; then
+        warn "DB sysbench_lab 을 못 만들었다 — $MYUSER 에게 CREATE 권한이 없고 root 접속도 안 된다"
+        say  "       MYSQL_ROOT_PASS=<비번> ./scripts/restore-lab.sh --mysql"
+      else
+        CHANGED=1
+      fi
+    fi
+  fi
   local SB; SB=$(m "SELECT count(*) FROM information_schema.tables WHERE table_schema='sysbench_lab'")
   if [ "${SB:-0}" -gt 0 ]; then
     ok "sysbench_lab 테이블 ${SB}개 (M-4~M-7 용)"
-  else
+  elif [ "${SBDB:-0}" = "1" ]; then
     warn "sysbench_lab 이 비어 있다 — scripts/sysbench/m4-m7-mysql.sh 가 못 돈다"
     say  "       sysbench oltp_read_write --mysql-host=$MYHOST --mysql-user=tuner --mysql-password=tuner \\"
     say  "         --mysql-db=sysbench_lab --tables=4 --table-size=1000000 prepare"
