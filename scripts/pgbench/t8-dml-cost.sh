@@ -413,43 +413,124 @@ fi
 if want 3; then
 echo "── ③ 그 비용은 언제 TPS 로 나타나는가 ──"
 echo
-echo "  ①에서 HOT 이 무너지고 WAL 이 두 배가 되는데도 TPS 는 거의 그대로다."
-echo "  **그게 이 절의 주제다** — 비용은 실재하는데 전역 지표가 그걸 삼킨다(Millsap 8장)."
-echo "  삼키는 이유는 병목이 딴 데 있어서다. 부하를 올려 병목을 옮기면 드러나는지 본다."
+echo "  인덱스가 HOT 을 깨고 WAL 을 늘리는 것은 ①에서 봤다. 그 비용이 **TPS 에는**"
+echo "  얼마나 비치는가가 이 절의 주제다. 병목이 딴 데 있으면 전역 지표가 국소 변화를"
+echo "  삼킨다(Millsap 8장). 부하를 올려 병목을 옮기면 드러나는지 본다."
 echo
 DDL3="CREATE INDEX x_a ON pgbench_accounts(abalance); CREATE INDEX x_ba ON pgbench_accounts(bid,abalance); CREATE INDEX x_f ON pgbench_accounts(filler)"
 printf "  %s%12s %12s %10s %14s\n" "$(padr "동시 클라이언트" 18)" "$(padl 기준 12)" "$(padl 인덱스3개 12)" "$(padl 배수 10)" "$(padl "기준의 편차" 14)"
 printf "  %s\n" "-------------------------------------------------------------------------"
-for c in 8 16 32 64; do
-  CLIENTS="$c"; A=0; B=0; Amin=""
+CLIST3="${CLIST3:-8 16 32 64}"
+declare -A RAT3 DEV3
+C1=""
+for c in $CLIST3; do
+  CLIENTS="$c"; A=0; B=0; Amin=""; AH=""; AW=""; BH=""; BW=""
   # 라운드마다 두 조건을 **교차**한다. 한 조건을 몰아서 재면 시간대 드리프트가 섞인다.
   # 그리고 기준 조건의 라운드 간 **편차**를 같이 남긴다 — 조건 차이가 그 폭 안이면
   # "차이가 있다"고 말할 수 없기 때문이다. 배수만 찍으면 노이즈를 발견으로 읽게 된다.
+  #
+  # TPS 말고 HOT·WAL 도 받아 둔다. 예전에는 measure() 의 첫 칸만 쓰고 나머지를 버린 뒤,
+  # 아래 결론에서 "HOT 은 68->0, WAL 은 +75" 를 **박아** 놓고 말했다. 그건 다른
+  # 장비·다른 회차의 숫자였고, 이 실행의 표와 어긋나도 알 길이 없었다.
   for r in $(seq 1 "$ROUNDS"); do
-    clean_idx;                       x=$(measure); x="${x%%|*}"
-    awk -v a="$x" -v b="$A" 'BEGIN{exit !(a>b)}' && A="$x"
-    { [ -z "$Amin" ] || awk -v a="$x" -v b="$Amin" 'BEGIN{exit !(a<b)}'; } && Amin="$x"
-    clean_idx; q "$DDL3" >/dev/null;  y=$(measure); y="${y%%|*}"
-    awk -v a="$y" -v b="$B" 'BEGIN{exit !(a>b)}' && B="$y"
+    clean_idx;                       x=$(measure); IFS='|' read -r xt xh xw xf xp <<<"$x"
+    if awk -v a="$xt" -v b="$A" 'BEGIN{exit !(a>b)}'; then A="$xt"; AH="$xh"; AW="$xw"; fi
+    { [ -z "$Amin" ] || awk -v a="$xt" -v b="$Amin" 'BEGIN{exit !(a<b)}'; } && Amin="$xt"
+    clean_idx; q "$DDL3" >/dev/null;  y=$(measure); IFS='|' read -r yt yh yw yf yp <<<"$y"
+    if awk -v a="$yt" -v b="$B" 'BEGIN{exit !(a>b)}'; then B="$yt"; BH="$yh"; BW="$yw"; fi
   done
+  RAT3[$c]=$(awk -v a="$A" -v b="$B" 'BEGIN{ if(a>0) printf "%.2f", b/a; else printf "0" }')
+  DEV3[$c]=$(awk -v hi="$A" -v lo="${Amin:-0}" 'BEGIN{ if(lo>0) printf "%.0f", 100*(hi-lo)/hi; else printf "0" }')
+  # 첫 단계의 HOT·WAL 을 남긴다 — ③만 돌려도(ONLY=3) 이 절 안에서 대조할 수 있어야 한다.
+  if [ -z "$C1" ]; then C1="$c"; C1AH="$AH"; C1AW="$AW"; C1BH="$BH"; C1BW="$BW"; fi
   printf "  %s%12s %12s %10s %14s\n" "$(padr "clients=$c" 18)" "$A" "$B" \
-    "$(awk -v a="$A" -v b="$B" 'BEGIN{ if(a>0) printf "%.2fx", b/a }')" \
-    "$(awk -v hi="$A" -v lo="${Amin:-0}" 'BEGIN{ if(lo>0) printf "±%.0f%%", 100*(hi-lo)/hi }')"
+    "${RAT3[$c]}x" "±${DEV3[$c]}%"
 done
 clean_idx
 echo
 echo "  CPU $(nproc 2>/dev/null || echo '?') 개짜리 장비다. **배수를 오른쪽 편차와 나란히 읽어야 한다** —"
 echo "  차이가 편차 안이면 '차이가 있다'고 말할 수 없다."
 echo
-echo "  이 환경에서 네 번 돌려 본 결과: clients 8~32 의 배수는 회차마다 순서가 뒤바뀌어"
-echo "  **추세로 읽을 수 없었다.** clients=64 가 매번 가장 낮긴 했지만(0.89~0.93),"
-echo "  클라이언트를 늘릴수록 기준 자체의 편차도 같이 커져서(±1% → ±10%) 그 차이마저"
-echo "  노이즈 폭 안이다. CPU 4개에 64 클라이언트면 16배 과다구독이니 당연한 일이다."
+# ── 아래는 전부 위 표에서 뽑는다. ──
+# 예전에는 "네 번 돌려 본 결과 … 0.89~0.93 … ±1% → ±10% … HOT 은 68%→0%" 를 그대로
+# 박아 뒀었다. 다른 장비·다른 회차의 이야기였고, 이 실행의 표와 어긋나도 아무도 모른다.
+if [ "${ROUNDS:-1}" -lt 2 ]; then
+  echo "  [주의] ROUNDS=$ROUNDS 라 '기준의 편차' 열은 전부 ±0% 다 — 최대와 최소가 **같은 한 값**이라서다."
+  echo "  측정이 안정적이라는 뜻이 **아니라** 노이즈 폭을 모른다는 뜻이다. 아래 판정은 그만큼 잠정적이다."
+  echo "  폭까지 보려면 ROUNDS=3 이상으로 다시 재라."
+  echo
+fi
+LOC=""; LOR=""; HIR=""; MONO=1; PREV=""
+for c in $CLIST3; do
+  r="${RAT3[$c]}"
+  if [ -z "$LOR" ] || awk -v a="$r" -v b="$LOR" 'BEGIN{exit !(a<b)}'; then LOR="$r"; LOC="$c"; fi
+  if [ -z "$HIR" ] || awk -v a="$r" -v b="$HIR" 'BEGIN{exit !(a>b)}'; then HIR="$r"; fi
+  if [ -n "$PREV" ] && awk -v a="$r" -v b="$PREV" 'BEGIN{exit !(a>b+0.02)}'; then MONO=0; fi
+  PREV="$r"
+done
+DROP=$(awk -v r="${LOR:-1}" 'BEGIN{printf "%.0f", (1-r)*100}')
+DEVL="${DEV3[${LOC:-0}]:-0}"
+# 최저 배수 하나로 결론을 내면 튄 한 점이 발견이 된다. 중앙값도 같이 뽑아 둔다.
+MEDR=$(for c in $CLIST3; do echo "${RAT3[$c]}"; done | sort -n | awk '
+  {a[NR]=$1}
+  END{ if(NR==0)      printf "1"
+       else if(NR%2)  printf "%.2f", a[(NR+1)/2]
+       else           printf "%.2f", (a[NR/2]+a[NR/2+1])/2 }')
+MDROP=$(awk -v r="${MEDR:-1}" 'BEGIN{printf "%.0f", (1-r)*100}')
+SPREAD=$(awk -v h="${HIR:-1}" -v l="${LOR:-1}" 'BEGIN{printf "%.0f", (h-l)*100}')
+echo "  이 실행에서 배수의 폭은 ${LOR}x(clients=$LOC) ~ ${HIR}x, 중앙값 ${MEDR}x 다."
+# 판정 순서가 중요하다. 먼저 '노이즈 폭 안인가'를 보고, 그 다음에야 추세를 말한다.
+# 순서를 뒤집었더니 "단조로 낮아졌다 — 부하를 올리니 넘어왔다" 바로 밑에
+# "차이가 있다고 말할 수 없다" 가 붙는 자기모순 문단이 나왔다.
+# 그리고 **단조인 것만으로는 부족하다** — 1.00 → 0.99 도 단조다. 폭도 같이 본다.
+INNOISE=0
+if [ "${ROUNDS:-1}" -ge 2 ] && [ "${DEVL:-0}" -gt 0 ] && [ "${DROP:-0}" -le "${DEVL:-0}" ]; then INNOISE=1; fi
+if [ "$INNOISE" = "1" ]; then
+  echo "  가장 큰 하락 ${DROP}%(clients=$LOC) 조차 그 지점의 기준 편차 ±${DEVL}% 안이다 —"
+  echo "  **'차이가 있다'고 말할 수 없다.** 추세를 말할 단계가 아니다."
+  REPR="$MDROP"; REPW="중앙값 기준"
+elif [ "$MONO" = "1" ] && [ "${SPREAD:-0}" -ge 5 ]; then
+  echo "  클라이언트가 늘수록 배수가 단조로 낮아졌고 폭도 ${SPREAD}%p 다 —"
+  echo "  부하를 올리니 비용이 TPS 쪽으로 넘어왔다."
+  REPR="$DROP"; REPW="가장 나쁜 지점(clients=$LOC) 기준"
+elif [ "$MONO" = "1" ]; then
+  echo "  순서는 단조지만 폭이 ${SPREAD}%p 뿐이다 — **클라이언트를 바꿔도 배수가"
+  echo "  의미 있게 움직이지 않았다.** 단조라는 말을 추세로 읽으면 안 된다."
+  REPR="$MDROP"; REPW="중앙값 기준"
+else
+  echo "  클라이언트 순서대로 낮아지지는 않았다 — **추세로 읽을 수 없다.** 배수의 오르내림이"
+  echo "  인덱스가 아니라 스케줄링·캐시 상태를 보고 있을 수 있다."
+  REPR="$MDROP"; REPW="중앙값 기준"
+  if awk -v m="${MEDR:-1}" -v l="${LOR:-1}" 'BEGIN{exit !(m-l>0.1)}'; then
+    echo "  clients=$LOC 한 지점만 ${LOR}x 로 튄다 — **한 점을 추세로 읽지 않는다.**"
+    if [ "${ROUNDS:-1}" -lt 2 ]; then
+      echo "  ROUNDS=$ROUNDS 이라 그 한 번이 노이즈인지 가릴 방법이 이 실행에는 없다."
+    fi
+  fi
+fi
 echo
-echo "  → 그래서 이 절의 결론은 '부하를 올리면 드러난다'가 아니라 그 반대다:"
-echo "     **TPS 로는 이 비용을 잡을 수 없다.** HOT 은 68%→0%, 레코드 WAL 은 +75% 인데"
-echo "     같은 변화가 TPS 에는 3~10% 로만 비친다. 전역 지표가 국소 변화를 삼킨 것이다(Millsap 8장)."
-echo "     'TPS 안 떨어지던데요'는 측정이 아니라 **지표를 잘못 고른 것**이다."
+# 같은 조건에서 HOT·WAL 은 얼마나 움직였나 — TPS 와 나란히 놓아야 '삼킨다'를 말할 수 있다.
+HOTD=$(awk -v a="${C1AH:-0}" -v b="${C1BH:-0}" 'BEGIN{printf "%.0f", a-b}')
+WALD=$(awk -v a="${C1AW:-0}" -v b="${C1BW:-0}" 'BEGIN{ if(a>0) printf "%+.0f", (b-a)*100/a; else printf "?" }')
+TL=$(awk -v r="${RAT3[${C1:-0}]:-1}" 'BEGIN{printf "%.0f", (1-r)*100}')
+echo "  → clients=$C1 에서 무엇이 얼마나 움직였나:"
+echo "     HOT 비율 ${C1AH:-?}% → ${C1BH:-?}%  ·  UPDATE 당 WAL ${C1AW:-?}B → ${C1BW:-?}B (${WALD}%)  ·  TPS 는 ${TL}% 하락."
+# HOT 이 안 움직였으면 '삼킨다'도 '비쳤다'도 말할 수 없다 — 비교할 국소 변화가 없다.
+# 갱신 컬럼(abalance)을 담은 인덱스를 셋이나 얹고도 HOT 이 그대로라면 전제가 깨진 것이다.
+if [ "${HOTD:-0}" -le 2 ]; then
+  echo "     그런데 HOT 이 ${C1AH:-?}% → ${C1BH:-?}% 로 **거의 안 움직였다.**"
+  echo "     abalance 를 담은 인덱스를 얹었는데 HOT 이 그대로라면 이 절의 전제가 안 선 것이다 —"
+  echo "     비교할 국소 변화가 없으니 '삼킨다'도 '비쳤다'도 말할 수 없다."
+  echo "     ①·②를 같이 돌려(ONLY=123) 페이지당 갱신 횟수와 fillfactor 부터 확인하라."
+elif [ "${REPR:-0}" -lt "$(( HOTD / 3 ))" ]; then
+  echo "     HOT 은 ${HOTD}%p 가 무너졌는데 TPS 는 ${REPW} ${REPR}% 다."
+  echo "     **전역 지표가 국소 변화를 삼킨 것이다(Millsap 8장).** 'TPS 안 떨어지던데요'는"
+  echo "     측정이 아니라 **지표를 잘못 고른 것**이다."
+else
+  echo "     이 실행에서는 TPS 에도 ${REPW} ${REPR}% 가 비쳤다 — clients=$C1 에서는 ${TL}% 였다."
+  echo "     **그래도 TPS 가 먼저 움직인 것은 아니다.** 먼저·더 크게 움직인 것은 HOT(${HOTD}%p)과"
+  echo "     WAL(${WALD}%)이고, TPS 는 병목을 옮긴 뒤에야 따라왔다."
+fi
 echo "     인덱스의 청구서는 HOT 비율과 WAL 에 찍힌다. 거기를 봐야 한다."
 echo
 fi

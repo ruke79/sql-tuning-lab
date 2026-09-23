@@ -504,14 +504,14 @@ printf "    %-44s %8s ms\n" "B  파티션 — 파티션을 넘는다"         "$
 echo
 BULKN=$(q "SELECT count(*) FROM li_a WHERE l_nationkey=$CN")
 echo "  (나) 대량 이관 — 국가 $CN 전체(${BULKN}행)를 $T_OTHER 로. 테넌트 통합·이관 시나리오:"
+NI_A=$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_a'")
+NI_AC=$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_ac'")
 M_BA=$(amort_ms "UPDATE li_a SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)
-printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A  비정규화" "$M_BA" \
-  "$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_a'")"
+printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A  비정규화" "$M_BA" "$NI_A"
 M_BAC=$(amort_ms "UPDATE li_ac SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)
-printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A′ PK 선두" "$M_BAC" \
-  "$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_ac'")"
-printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "B  파티션" \
-  "$(amort_ms "UPDATE li_part SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)" \
+printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "A′ PK 선두" "$M_BAC" "$NI_AC"
+M_BB=$(amort_ms "UPDATE li_part SET l_nationkey=$T_OTHER WHERE l_nationkey=$CN" 3)
+printf "    %-44s %8s ms  (보조 인덱스 %s개)\n" "B  파티션" "$M_BB" \
   "$(q "SELECT count(DISTINCT index_name)-1 FROM information_schema.statistics WHERE table_schema='tpch' AND table_name='li_part'")"
 echo
 echo "  행이 실제로 파티션을 넘는가:"
@@ -521,7 +521,14 @@ q "START TRANSACTION;
    ROLLBACK;"
 echo
 BULK_RATIO=$(awk -v a="$M_BA" -v c="$M_BAC" 'BEGIN{ if(a+0>0) printf "%.2f", c/a; else print "?" }')
-echo "  해석 — ②에서 A′ 가 이긴 그 결정의 청구서가 여기 있다. 단 **규모에 따라 다르다.**"
+# ②의 결과를 여기서 단정하지 않는다. ONLY=6 으로 돌리면 ②는 안 돌았고, 돌았더라도
+# A′ 가 이겼는지는 그때 잰 S_RATIO 가 말한다. "②에서 A′ 가 이긴" 을 박아 두면
+# A′ 가 진 실행에서도 그대로 찍힌다.
+if [ -n "${S_RATIO:-}" ] && awk -v r="$S_RATIO" 'BEGIN{exit !(r>1)}'; then
+  echo "  해석 — ②에서 A′ 가 이긴(${S_RATIO}배) 그 결정의 청구서가 여기 있다. 단 **규모에 따라 다르다.**"
+else
+  echo "  해석 — 테넌트를 PK 선두에 놓는(A′) 결정의 청구서가 여기 있다. 단 **규모에 따라 다르다.**"
+fi
 # (가)의 문장도 재서 쓴다. 예전에는 "네 전략이 사실상 같다"가 박혀 있었다.
 # 고치면서 한 번 더 틀렸다 — "B 가 가장 비싸다"로 바꿨더니 A′ 5.32 / B 5.31 인 실행에서
 # 그대로 찍혔다. **최댓값이 누구인지도 재야 한다.** 가정하면 같은 실수가 반복된다.
@@ -545,10 +552,28 @@ else
   echo "     셋의 최대/최소가 ${P_SPREAD}배이고 가장 비싼 쪽은 **${P_TOP}** 다."
   echo "     다만 절대값이 한 자릿수 ms 라 이 차이로 전략을 고를 일은 드물다 — (나)를 볼 것."
 fi
-echo "   · (나) 대량 이관에서 갈린다. A′ 가 A 보다 느린데, **보조 인덱스가 하나 더 적은데도**"
-echo "     그렇다는 것이 핵심이다. InnoDB 에서 PK 를 바꾸는 UPDATE 는 제자리 수정이 아니라"
-echo "     클러스터드 인덱스에서 지우고 다시 넣는 일이고, 그 행을 가리키던 보조 인덱스"
-echo "     엔트리도 새 PK 값으로 고쳐야 한다. 인덱스 수로 설명되지 않는 몫이 그것이다."
+# (나)도 재서 쓴다. 여기에는 "A′ 가 A 보다 느린데 보조 인덱스가 하나 더 적은데도 그렇다"가
+# 박혀 있었다. 방향(A′>A)도, 인덱스 수 관계(A′<A)도 **둘 다 가정**이었다. 둘 다 잰다.
+echo "   · (나) 대량 이관 — A ${M_BA} / A′ ${M_BAC} / B ${M_BB} ms (${BULKN}행)."
+if awk -v r="${BULK_RATIO:-1}" 'BEGIN{exit !(r>1.1)}'; then
+  echo "     **A′ 가 A 보다 ${BULK_RATIO}배 느리다.**"
+  if [ "${NI_AC:-0}" -le "${NI_A:-0}" ]; then
+    echo "     보조 인덱스가 A ${NI_A}개 / A′ ${NI_AC}개로 **A′ 가 더 적은데도** 그렇다는 것이 핵심이다."
+  else
+    echo "     다만 보조 인덱스가 A ${NI_A}개 / A′ ${NI_AC}개라 **인덱스 수로도 설명이 된다** —"
+    echo "     이 실행만으로 PK 변경 비용과 인덱스 수를 분리할 수는 없다."
+  fi
+  echo "     InnoDB 에서 PK 를 바꾸는 UPDATE 는 제자리 수정이 아니라 클러스터드 인덱스에서"
+  echo "     지우고 다시 넣는 일이고, 그 행을 가리키던 보조 인덱스 엔트리도 새 PK 값으로 고쳐야 한다."
+elif awk -v r="${BULK_RATIO:-1}" 'BEGIN{exit !(r<0.91)}'; then
+  echo "     **A′ 가 오히려 A 보다 빠르다(${BULK_RATIO}배).** 이 실행에서는 PK 변경의 비용이"
+  echo "     드러나지 않았다 — 옮긴 행이 ${BULKN}행으로 적거나, 보조 인덱스 수 차이"
+  echo "     (A ${NI_A}개 / A′ ${NI_AC}개)가 그걸 덮었을 수 있다. 방향을 그대로 적어 둔다."
+else
+  echo "     둘이 사실상 같다(A′/A ${BULK_RATIO}배). **이 규모에서는 PK 변경 비용이 안 드러났다** —"
+  echo "     여기서 '대량 이관에서 갈린다'고 말하면 측정에 없는 것을 말하는 것이다."
+  echo "     SAMPLE 을 키우거나 더 큰 테넌트를 골라 다시 재라."
+fi
 echo "   → 조회를 위해 테넌트를 PK 선두에 놓는 결정은 **테넌트가 잘 안 바뀔 때** 옳다."
 echo "     tpcds 의 매장이라면 좋은 선택이고, 고객의 국가처럼 움직이는 축이라면"
 if [ -n "${S_RATIO:-}" ]; then
