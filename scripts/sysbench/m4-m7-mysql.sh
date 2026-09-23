@@ -195,6 +195,34 @@ trim_threads() {   # $1 = 허용 최대 스레드
   echo "     이번 스윕: $THREADS"
 }
 MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
+
+# **이 벽은 서버가 아니라 클라이언트에 있다.** sysbench 는 스레드마다 소켓을 하나 여는데
+# 그 프로세스의 파일 서술자 한도(ulimit -n, 리눅스 기본 soft 1024)를 넘으면
+#   FATAL: error 2004: Can't create TCP/IP socket (24)
+# 가 난다 — 24 는 EMFILE(Too many open files)이다. SQL 로는 못 고친다.
+# bash 는 soft 를 hard 까지 올릴 수 있으므로 여기서 올린다.
+# (개발 컨테이너는 soft 가 20000 이라 이 벽이 안 보였다 — **내 환경이 더 관대해서
+#  못 잡은 결함**이다. 그래서 값을 재서 말한다.)
+FD_S=$(ulimit -Sn 2>/dev/null); FD_H=$(ulimit -Hn 2>/dev/null)
+NEEDFD=$(( MAXTH + 64 ))
+if [ "${FD_S:-unlimited}" != "unlimited" ] && [ "${FD_S:-0}" -lt "$NEEDFD" ]; then
+  echo "  ulimit -n(soft)=$FD_S 인데 이 스윕의 최대 스레드는 ${MAXTH} 다 — 소켓을 못 연다(error 2004 / errno 24)."
+  if [ "${FD_H:-0}" = "unlimited" ] || [ "${FD_H:-0}" -ge "$NEEDFD" ]; then
+    ulimit -n "$NEEDFD" 2>/dev/null
+    FD_S=$(ulimit -Sn 2>/dev/null)
+  fi
+  if [ "${FD_S:-unlimited}" = "unlimited" ] || [ "${FD_S:-0}" -ge "$NEEDFD" ]; then
+    echo "  → 이 프로세스에서만 ${FD_S} 로 올렸다(hard=${FD_H}). 셸을 나가면 원래대로다."
+  else
+    echo "  → hard 한도(${FD_H})가 모자라 못 올린다. 이건 **서버가 아니라 이 셸**의 한도다:"
+    echo "     ulimit -n $NEEDFD   # hard 가 허락하면 즉시"
+    echo "     또는 /etc/security/limits.conf 에 nofile 을 올리고 다시 로그인"
+    trim_threads "$(( ${FD_S:-64} - 64 ))"
+    MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
+  fi
+  echo
+fi
+
 NEED=$(( MAXTH + 20 ))          # sysbench 워커 + 이 스크립트의 mysql 호출 여유
 if [ "${MC0:-0}" -lt "$NEED" ]; then
   echo "  max_connections=$MC0 인데 이 스윕의 최대 스레드는 ${MAXTH} 다 — 그대로면 못 붙는다(error 1040)."
@@ -320,6 +348,12 @@ NEXT=$(awk -v cur="$SUCC" 'BEGIN{
 if [ -n "$KNEE" ]; then
   echo "  **무릎은 스레드 ${KNEE} 에서 넘었다** — 거기서 처리량 배수가 1.3 아래로 떨어지고"
   echo "  지연 배수가 1.5 를 넘었다."
+  # 무릎이 **잰 마지막 칸**이면 그 뒤가 없다. 조건을 만족한 건 맞지만, 한 칸으로 판정한
+  # 것이라 다음 칸에서 되돌아올 수도 있다. 그 차이를 말해 둔다.
+  if [ "$KNEE" = "$LASTT" ]; then
+    echo "  다만 그 줄이 **잰 마지막 칸**이다 — 조건은 만족했지만 한 칸짜리 근거다."
+    echo "  한 칸 더 재서 확인하라:  THREADS=\"$NEXT\" $0"
+  fi
 elif [ -n "$FAILED" ]; then
   echo "  ⚠️ **잰 칸 중 마지막(${LASTT})에서 최대가 나왔다 — 무릎에 닿지 못했다.**"
   echo "  그런데 못 늘린 이유는 스윕이 짧아서가 아니라 **위의 측정 실패** 때문이다."
