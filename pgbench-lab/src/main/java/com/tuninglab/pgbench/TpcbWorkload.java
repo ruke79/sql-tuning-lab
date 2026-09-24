@@ -56,6 +56,10 @@ public class TpcbWorkload {
         AtomicBoolean stop = new AtomicBoolean(false);
         AtomicLong committed = new AtomicLong();
         AtomicLong errors = new AtomicLong();
+        // **죽은 워커를 센다.** 예전에는 catch 에서 로그만 찍고 끝이라, 워커가 절반 죽어도
+        // errors=0 에 TPS 가 멀쩡히 찍혔다. 실측(32코어, clients=256): 56개가
+        // "Connection is not available" 로 죽었는데 errors=0, TPS=12,820 이었다.
+        AtomicLong died = new AtomicLong();
         List<Long> latenciesMicro = java.util.Collections.synchronizedList(new ArrayList<>());
 
         ExecutorService pool = Executors.newFixedThreadPool(clients);
@@ -83,7 +87,9 @@ public class TpcbWorkload {
                         }
                     }
                 } catch (SQLException e) {
-                    log.error("worker died: {}", e.getMessage());
+                    died.incrementAndGet();
+                    // 워커마다 한 줄씩 찍으면 수백 줄이 쏟아져 결과가 파묻힌다. 첫 줄만 남긴다.
+                    if (died.get() == 1) log.error("worker died: {}", e.getMessage());
                 }
                 return null;
             });
@@ -103,6 +109,14 @@ public class TpcbWorkload {
                 syncCommit == null ? "(서버 기본값)" : (syncCommit ? "on" : "off"));
         log.info("committed={}, errors={}, TPS={}", committed.get(), errors.get(),
                 String.format("%.1f", committed.get() / elapsed));
+        // 죽은 워커가 있으면 **이 줄은 측정이 아니다.** 살아 있던 워커 수가 중간에 줄었으므로
+        // 'clients=N 의 처리량'이라고 부를 수 없고, 그대로 표에 넣으면 무릎처럼 보인다.
+        if (died.get() > 0) {
+            log.error("[무효] 워커 {}/{} 가 도중에 죽었다 — 위 TPS 는 clients={} 의 측정이 아니다.",
+                    died.get(), clients, clients);
+            log.error("       죽은 워커는 errors 에 안 잡힌다(커넥션을 못 얻어 트랜잭션을 시작도 못 했다).");
+            log.error("       대개 원인은 커넥션 풀/서버 상한이다: SHOW max_connections;");
+        }
         if (!lat.isEmpty()) {
             log.info("latency avg={}ms p50={}ms p95={}ms p99={}ms max={}ms",
                     ms(lat.stream().mapToLong(Long::longValue).sum() / lat.size()),

@@ -63,7 +63,9 @@ public class PgbenchApplication implements CommandLineRunner {
                 case "run" -> {
                     // --scale 은 **적재 규모가 아니라 키를 뽑는 범위**다. 적재된 것과 다르면
                     // 에러 없이 다른 것을 재게 되므로, 다르면 여기서 멈추고 뜻을 물어본다.
-                    if (checkScale(jdbc, scale, args.getInt("force", 0) == 1)) {
+                    if (checkScale(jdbc, scale, args.getInt("force", 0) == 1)
+                            && checkConnections(jdbc, args.getInt("clients", 8),
+                                                args.getInt("force", 0) == 1)) {
                         // --sync-commit=on|off 를 주면 그 값으로 세션에 건다(안 주면 서버 기본값).
                         // 서버 설정은 건드리지 않으므로 재시작도 원복도 필요 없다.
                         String sc = args.get("sync-commit", null);
@@ -113,6 +115,52 @@ public class PgbenchApplication implements CommandLineRunner {
      *
      * <p>적재 규모는 pgbench_branches 의 행 수와 같다(fill 이 scale 개를 넣는다).
      */
+    /**
+     * **돌리기 전에 붙을 수 있는지 본다.** clients 를 늘리면 풀도 같이 커지는데(clients+2),
+     * 서버의 max_connections 를 넘으면 Hikari 가 커넥션을 못 채우고 남은 워커들이
+     * connectionTimeout(10초) 뒤에 죽는다. 그런데 **그 죽음은 errors 에 안 잡힌다** —
+     * 실측(32코어, clients=256, max_connections=200): 워커 56개가 죽었는데 errors=0,
+     * TPS=12,820 이 찍혔고 표에서는 '256 에서 꺾였다'처럼 보였다. 20초를 다 쓰고 나서야
+     * 알게 되는 일이라, 먼저 재고 먼저 말한다.
+     *
+     * max_connections 는 PostgreSQL 에서 **재시작이 필요한** 설정이라 여기서 올릴 수 없다.
+     * 그래서 올려 주는 대신 멈추고, 무엇을 해야 하는지 말한다.
+     */
+    private boolean checkConnections(JdbcTemplate jdbc, int clients, boolean force) {
+        Integer max, used;
+        try {
+            max = jdbc.queryForObject("SELECT setting::int FROM pg_settings WHERE name='max_connections'",
+                    Integer.class);
+            used = jdbc.queryForObject("SELECT count(*)::int FROM pg_stat_activity", Integer.class);
+        } catch (Exception e) {
+            log.warn("max_connections 를 못 읽었습니다 — 커넥션 사전 점검을 건너뜁니다 ({})", e.getMessage());
+            return true;
+        }
+        if (max == null) return true;
+        int need = clients + 2;
+        // superuser_reserved_connections 만큼은 일반 사용자가 못 쓴다.
+        Integer reserved = null;
+        try {
+            reserved = jdbc.queryForObject(
+                    "SELECT setting::int FROM pg_settings WHERE name='superuser_reserved_connections'",
+                    Integer.class);
+        } catch (Exception ignore) { /* 없으면 0 으로 본다 */ }
+        int usable = max - (reserved == null ? 0 : reserved) - (used == null ? 0 : used);
+        if (need <= usable) return true;
+
+        log.error("clients={} 이면 커넥션이 {}개 필요한데 지금 쓸 수 있는 것은 약 {}개입니다.",
+                clients, need, Math.max(0, usable));
+        log.error("  max_connections={} / 이미 사용 중 {} / superuser 예약 {}",
+                max, used, reserved == null ? 0 : reserved);
+        log.error("  이대로 돌리면 남는 워커가 커넥션을 못 얻어 10초 뒤에 죽습니다.");
+        log.error("  **그리고 죽은 워커는 errors 에 안 잡힙니다** — errors=0 에 TPS 가 멀쩡히 찍히고,");
+        log.error("  표에서는 '이 지점에서 꺾였다'처럼 보입니다. 측정이 아니라 풀이 막힌 것입니다.");
+        log.error("  늘리려면 (재시작 필요): ALTER SYSTEM SET max_connections = {}; 뒤 서버 재시작",
+                need + (reserved == null ? 0 : reserved) + 20);
+        log.error("  그냥 돌려 보려면: --force=1  (결과는 측정으로 쓰지 마세요)");
+        return force;
+    }
+
     private boolean checkScale(JdbcTemplate jdbc, int scale, boolean force) {
         Integer loaded;
         try {
