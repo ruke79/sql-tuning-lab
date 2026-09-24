@@ -157,7 +157,15 @@ run1() {
     # 을 낸다. 워커 스레드마다 lua 를 다시 여는데 그 open 이 EMFILE 로 실패한 것이라,
     # **파일은 멀쩡한데 "없다"고 말한다.** 실측: 1024스레드에서 ulimit -n 1088·1400 이면
     # 이 메시지가 나오고 2304 면 사라진다. 그대로 보여주면 파일을 찾으러 가게 된다.
-    "|"*) { if echo "$out" | grep -q "Cannot find benchmark" && [ -f "$lua" ]; then
+    #
+    # 'Worker threads failed to initialize within 30 seconds' 는 **늘릴 수 없는 벽**이다.
+    # sysbench 1.0 에 --thread-init-timeout 같은 옵션이 없고 30 이 코드에 박혀 있다
+    # (`sysbench --help` 에 timeout 류가 하나도 없고, 바이너리에 형식 문자열만 있다).
+    # 그러니 "올려라"가 아니라 **초기화 일감을 줄여라**가 유일한 조언이다.
+    "|"*) { if echo "$out" | grep -q "failed to initialize within"; then
+              echo "FATAL: 워커 초기화가 30초를 넘겼다 — sysbench 1.0 에는 이 30초를 늘리는 옵션이 없다(코드 고정). 준비문 약 $(( ${PER:-0} * th ))개(스레드당 ${PER:-?}개 × ${th})를 그 안에 다 잡아야 한다. TABLES 를 줄여라(스레드당 9×tables+1)"
+            fi
+            if echo "$out" | grep -q "Cannot find benchmark" && [ -f "$lua" ]; then
               echo "FATAL: '$lua' 가 없다고 하지만 파일은 있다 — 파일 서술자 고갈(EMFILE)이다. ulimit -n 을 올려라"
             fi
             echo "$out" | grep -iE '^(FATAL|ERROR).*error [0-9]+' | head -1
