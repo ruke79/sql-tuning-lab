@@ -151,7 +151,16 @@ run1() {
   case "$res" in
     # 'unable to connect ... aborting' 보다 'error 1040: Too many connections' 가 먼저다 —
     # 앞엣것은 증상이고 뒤엣것이 사유다. 고칠 수 있는 쪽을 보여준다.
-    "|"*) { echo "$out" | grep -iE '^(FATAL|ERROR).*error [0-9]+' | head -1
+    #
+    # 그리고 **가장 거짓말 같은 메시지를 먼저 잡는다.** 서술자가 바닥나면 sysbench 는
+    #   FATAL: Cannot find benchmark '...oltp_read_write.lua': no such ... file or module
+    # 을 낸다. 워커 스레드마다 lua 를 다시 여는데 그 open 이 EMFILE 로 실패한 것이라,
+    # **파일은 멀쩡한데 "없다"고 말한다.** 실측: 1024스레드에서 ulimit -n 1088·1400 이면
+    # 이 메시지가 나오고 2304 면 사라진다. 그대로 보여주면 파일을 찾으러 가게 된다.
+    "|"*) { if echo "$out" | grep -q "Cannot find benchmark" && [ -f "$lua" ]; then
+              echo "FATAL: '$lua' 가 없다고 하지만 파일은 있다 — 파일 서술자 고갈(EMFILE)이다. ulimit -n 을 올려라"
+            fi
+            echo "$out" | grep -iE '^(FATAL|ERROR).*error [0-9]+' | head -1
             echo "$out" | grep -iE '^(FATAL|ERROR)' | head -1
             echo "sysbench 가 결과를 내지 않았다"; } | grep -m1 . > "$RUN1_ERRF";;
   esac
@@ -204,7 +213,10 @@ MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
 # (개발 컨테이너는 soft 가 20000 이라 이 벽이 안 보였다 — **내 환경이 더 관대해서
 #  못 잡은 결함**이다. 그래서 값을 재서 말한다.)
 FD_S=$(ulimit -Sn 2>/dev/null); FD_H=$(ulimit -Hn 2>/dev/null)
-NEEDFD=$(( MAXTH + 64 ))
+# **스레드당 하나로는 모자란다.** 워커는 소켓 하나 말고 lua 스크립트도 따로 연다.
+# 실측(1024스레드): soft 1088·1400 은 실패하고 2304 에서 그 실패가 사라졌다.
+# 그래서 2배 + 여유로 잡는다. 처음엔 MAXTH+64 로 잡았다가 1024 에서 또 걸렸다.
+NEEDFD=$(( MAXTH * 2 + 256 ))
 if [ "${FD_S:-unlimited}" != "unlimited" ] && [ "${FD_S:-0}" -lt "$NEEDFD" ]; then
   echo "  ulimit -n(soft)=$FD_S 인데 이 스윕의 최대 스레드는 ${MAXTH} 다 — 소켓을 못 연다(error 2004 / errno 24)."
   if [ "${FD_H:-0}" = "unlimited" ] || [ "${FD_H:-0}" -ge "$NEEDFD" ]; then
@@ -217,13 +229,16 @@ if [ "${FD_S:-unlimited}" != "unlimited" ] && [ "${FD_S:-0}" -lt "$NEEDFD" ]; th
     echo "  → hard 한도(${FD_H})가 모자라 못 올린다. 이건 **서버가 아니라 이 셸**의 한도다:"
     echo "     ulimit -n $NEEDFD   # hard 가 허락하면 즉시"
     echo "     또는 /etc/security/limits.conf 에 nofile 을 올리고 다시 로그인"
-    trim_threads "$(( ${FD_S:-64} - 64 ))"
+    trim_threads "$(( (${FD_S:-256} - 256) / 2 ))"
     MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
   fi
   echo
 fi
 
-NEED=$(( MAXTH + 20 ))          # sysbench 워커 + 이 스크립트의 mysql 호출 여유
+# 워커 하나에 연결 하나가 원칙이지만 **앞 칸의 연결이 다 닫히기 전에 다음 칸이 시작된다.**
+# 실측: 1024스레드 칸에서 Max_used_connections 가 1201 까지 갔다(상한 1200 에 막혔다).
+# 그래서 25% + 50 을 얹는다. 이 스크립트 자신의 mysql 호출 몫도 여기 들어 있다.
+NEED=$(( MAXTH + MAXTH / 4 + 50 ))
 if [ "${MC0:-0}" -lt "$NEED" ]; then
   echo "  max_connections=$MC0 인데 이 스윕의 최대 스레드는 ${MAXTH} 다 — 그대로면 못 붙는다(error 1040)."
   q "SET GLOBAL max_connections=$NEED" >/dev/null 2>&1
@@ -239,12 +254,12 @@ if [ "${MC0:-0}" -lt "$NEED" ]; then
     echo "     open_files_limit=$(q "SELECT @@open_files_limit") 이 흔한 원인이다 —"
     echo "     연결마다 파일 서술자가 필요하다. 늘리려면 mysqld 의 open_files_limit 을 올려라(재기동)."
     MC_RAISED=1
-    trim_threads "$(( MCN - 20 ))"
+    trim_threads "$(( (MCN - 50) * 4 / 5 ))"
     MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
   else
     echo "  → 올리지 못했다(권한 부족일 수 있다: SYSTEM_VARIABLES_ADMIN)."
     echo "     전부 재려면 서버에서 먼저:  SET GLOBAL max_connections=$NEED;"
-    trim_threads "$(( ${MC0:-0} - 20 ))"
+    trim_threads "$(( (${MC0:-0} - 50) * 4 / 5 ))"
     MAXTH=$(echo "$THREADS" | tr ' ' '\n' | sort -n | tail -1)
   fi
   echo
