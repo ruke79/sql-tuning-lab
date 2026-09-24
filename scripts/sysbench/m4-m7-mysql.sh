@@ -352,7 +352,13 @@ echo
 if [ -n "$FAILED" ]; then
   echo "  ⚠️ **재지 못한 칸이 있다:${FAILED}**"
   [ -n "$FAILWHY" ] && echo "     사유: $FAILWHY"
-  echo "     아래 판정은 ${LASTT:-?} 까지만의 이야기다 — 빈 칸을 '처리량이 줄었다'로 읽으면 안 된다."
+  # 한 칸도 못 쟀으면 '어디까지의 이야기'라는 말 자체가 성립하지 않는다.
+  # 그냥 두면 "아래 판정은 ? 까지만의 이야기다" 가 찍혔다.
+  if [ -n "$LASTT" ]; then
+    echo "     아래 판정은 ${LASTT} 까지만의 이야기다 — 빈 칸을 '처리량이 줄었다'로 읽으면 안 된다."
+  else
+    echo "     **판정할 칸이 남지 않았다.**"
+  fi
   echo
 fi
 if [ -z "$BESTT" ]; then
