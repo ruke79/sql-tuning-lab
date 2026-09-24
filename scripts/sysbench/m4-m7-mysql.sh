@@ -448,11 +448,14 @@ echo "    sync_binlog: 1=커밋마다 binlog fsync, 0=OS 에 맡김"
 echo
 printf "  %s%s%12s %10s %10s\n" "$(padr "redo fsync" 14)" "$(padr "binlog fsync" 16)" "$(padl TPS 12)" "$(padl p99 10)" "$(padl 배수 10)"
 printf "  %s\n" "----------------------------------------------------------------------"
-BASE=""
+BASE=""; FAIL2=""
 for combo in "1:1" "1:0" "2:1" "2:0"; do
   F="${combo%%:*}"; S="${combo##*:}"
   q "SET GLOBAL innodb_flush_log_at_trx_commit=$F; SET GLOBAL sync_binlog=$S" >/dev/null
   IFS='|' read -r T A P M <<<"$(run1 8)"
+  # ①에서 고친 것과 같은 구멍이 ②③에도 있었다 — 실패하면 T 가 비고, 아래 배수 계산이
+  # 빈 값을 0 으로 읽어 "redo 만 꺼서 배, binlog 만 꺼서 배" 처럼 숫자 없는 문장을 찍는다.
+  [ -z "${T:-}" ] && FAIL2="$FAIL2 ${F}/${S}"
   [ -z "$BASE" ] && BASE="$T"
   # 문장을 표에서 만들려면 값을 남겨야 한다. 조합별 TPS 를 보관한다.
   case "$combo" in 1:1) C11="$T";; 1:0) C10="$T";; 2:1) C21="$T";; 2:0) C20="$T";; esac
@@ -468,7 +471,12 @@ echo
 RB=$(awk -v a="${C10:-0}" -v b="${C11:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')   # binlog 만 끔
 RR=$(awk -v a="${C21:-0}" -v b="${C11:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')   # redo 만 끔
 RBOTH=$(awk -v a="${C20:-0}" -v b="${C11:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')
-if awk -v a="$RB" -v b="$RR" 'BEGIN{exit !(a+0>b+0)}'; then
+if [ -n "$FAIL2" ]; then
+  echo "  ⚠️ **재지 못한 조합이 있다:${FAIL2}** (flush_log_at_trx_commit/sync_binlog)"
+  echo "     배수를 계산할 수 없다 — 아래 해석은 건너뛴다. 빈 칸을 0 으로 읽으면"
+  echo "     '어느 쪽이 더 비싸다'가 근거 없이 찍힌다."
+  echo
+elif awk -v a="$RB" -v b="$RR" 'BEGIN{exit !(a+0>b+0)}'; then
   echo "  이 실행에서는 **binlog 쪽이 더 비싸다** — binlog 만 꺼서 ${RB}배, redo 만 꺼서 ${RR}배."
 else
   echo "  이 실행에서는 **redo 쪽이 더 비싸다** — redo 만 꺼서 ${RR}배, binlog 만 꺼서 ${RB}배."
@@ -476,7 +484,9 @@ else
 fi
 # "둘 다 꺼도 배수가 작다"고 박아 뒀는데, 11.93배가 나오는 실행이 있었다 —
 # PostgreSQL 의 2.2배보다 **크다.** 크기를 재서 말하고, 그에 맞는 질문을 던진다.
-echo "  둘 다 끄면 **${RBOTH}배**다. PostgreSQL 의 synchronous_commit 은 같은 랩에서 2.2배였다."
+if [ -z "$FAIL2" ]; then
+echo "  둘 다 끄면 **${RBOTH}배**다. PostgreSQL 의 synchronous_commit 은 같은 랩에서 2.2배였다"
+echo "  (이 수치는 이 랩의 pgbench 판 실측값이다 — 이번 실행에서 잰 것이 아니다)."
 echo
 if awk -v a="$RBOTH" 'BEGIN{exit !(a+0 < 3)}'; then
   echo "  **왜 이렇게 작은가** — 가설 둘을 세우고 둘 다 재 봤다."
@@ -495,15 +505,24 @@ for pair in "읽기+쓰기 (기본):8:$LUA" "쓰기만:8:$LUAW" "쓰기만:1:$LU
   q "SET GLOBAL innodb_flush_log_at_trx_commit=2; SET GLOBAL sync_binlog=0" >/dev/null
   IFS='|' read -r OFF _ _ _ <<<"$(run1 "$TH" "$LU")"
   RM=$(awk -v a="${OFF:-0}" -v b="${ON:-0}" 'BEGIN{ if(b>0) printf "%.2f", a/b }')
+  [ -z "${ON:-}" ] || [ -z "${OFF:-}" ] && FAIL2B="${FAIL2B:-} ${WL}/${TH}스레드"
   case "$WL:$TH" in "쓰기만:8") W8="$RM";; "쓰기만:1") W1="$RM";; *) RW="$RM";; esac
-  printf "  %s%s%12s %12s %10s\n" "$(padr "$WL" 18)" "$(padr "$TH" 8)" "${ON:-?}" "${OFF:-?}" "${RM}x"
+  printf "  %s%s%12s %12s %10s\n" "$(padr "$WL" 18)" "$(padr "$TH" 8)" "${ON:-?}" "${OFF:-?}" "${RM:-?}x"
 done
 restore
 echo
+if [ -n "${FAIL2B:-}" ]; then
+  echo "  ⚠️ **재지 못한 줄이 있다:${FAIL2B}** — 배수가 비어 있어 두 가설을 판정할 수 없다."
+  echo "     여기서 멈춘다. 빈 값으로 '지지/기각'을 찍으면 근거 없는 판정이 남는다."
+else
 # "1과 8의 배수가 거의 같다"고 박아 뒀는데 42.12 대 25.14 가 나왔다 — 거의 같지 않다.
 # 기각 근거는 '같다'가 아니라 **방향**이다: 그룹 커밋이 원인이라면 혼자 도는 1스레드에서
 # 배수가 훨씬 커야 하는데, 오히려 8스레드 쪽이 크면 가설과 정반대다.
-if awk -v a="$W1" -v b="$W8" 'BEGIN{exit !(a+0 > b+0*1.3)}'; then
+#
+# ⚠️ 여기 `b+0*1.3` 이라고 썼었다. awk 에서 `*` 가 `+` 보다 먼저라 **`b+0` 즉 그냥 b** 다.
+# 30% 여유를 두려던 것이 **한 번도 적용된 적이 없고**, W1 이 W8 보다 조금이라도 크면
+# '지지된다'가 찍혔다. 괄호를 안 쳐서 생긴, 출력만 봐서는 절대 안 보이는 결함이다.
+if awk -v a="$W1" -v b="$W8" 'BEGIN{exit !(a+0 > b*1.3)}'; then
   echo "  → **(가) 그룹 커밋 가설이 지지된다.** 쓰기만에서 1스레드 배수(${W1}배)가"
   echo "    8스레드(${W8}배)보다 크다 — 혼자면 fsync 를 나눠 물릴 상대가 없다."
 else
@@ -511,8 +530,21 @@ else
   echo "    그룹 커밋이 원인이라면 혼자 도는 1스레드에서 배수가 **훨씬 커야** 하는데 그렇지 않다"
   echo "    (오히려 8스레드 쪽이 크다면 가설과 정반대다)."
 fi
-echo "  → **(나)가 맞다.** 같은 손잡이가 읽기 섞인 트랜잭션에서는 ${RW}배,"
-echo "    쓰기만 하면 ${W8}배로 벌어진다 — 커밋이 트랜잭션에서 차지하는 몫이 정한다."
+# **(나)도 재야 한다.** 여기 "→ **(나)가 맞다.**" 가 조건 없이 박혀 있었다.
+# (나)는 '커밋 비중이 크면 배수도 크다'는 주장이므로, 쓰기 전용의 배수가 읽기 섞인 쪽보다
+# 실제로 커야 지지된다. 두 값이 비슷하게 나온 실행에서도 "맞다"가 찍혔을 것이다.
+if awk -v w="$W8" -v r="$RW" 'BEGIN{exit !(r+0>0 && w+0 > r*1.3)}'; then
+  echo "  → **(나)가 지지된다.** 같은 손잡이가 읽기 섞인 트랜잭션에서는 ${RW}배,"
+  echo "    쓰기만 하면 ${W8}배로 벌어진다 — 커밋이 트랜잭션에서 차지하는 몫이 정한다."
+elif awk -v w="$W8" -v r="$RW" 'BEGIN{exit !(r+0>0 && w+0 > r)}'; then
+  echo "  → **(나)는 방향만 맞다.** 쓰기 전용이 ${W8}배, 읽기 섞인 쪽이 ${RW}배로 크긴 한데"
+  echo "    30% 여유를 넘지 못했다 — 이 실행만으로 '커밋 비중이 정한다'고 말하기엔 약하다."
+else
+  echo "  → **(나)도 이 실행에서는 지지되지 않는다.** 쓰기 전용 ${W8}배, 읽기 섞인 쪽 ${RW}배로"
+  echo "    벌어지지 않았다. 커밋 비중 말고 다른 것이 배수를 정하고 있다는 뜻이다."
+fi
+fi
+fi   # ← 2×2 표가 온전할 때만 도는 해석 블록의 끝
 echo
 echo "  그래서 이 절의 결론은 엔진 비교가 아니다 — **커밋 내구성의 '값'은 트랜잭션에서 커밋이"
 echo "  차지하는 비율이 정한다.** PostgreSQL 의 2.2배와 여기의 배수를 나란히 놓고 '엔진이 다르다'고"
@@ -539,16 +571,22 @@ echo "  **압력을 안 만들고 '영향 없음'을 결론으로 쓸 뻔했다.
 echo
 printf "  %s%12s %10s %10s %14s\n" "$(padr "redo 용량" 14)" "$(padl TPS 12)" "$(padl p99 10)" "$(padl max 10)" "$(padl "redo 기록량" 14)"
 printf "  %s\n" "--------------------------------------------------------------------------"
-BT=""; BM=""
+BT=""; BM=""; FAIL3=""; CAPWARN=""
 for cap in 1024 8; do
   q "SET GLOBAL innodb_redo_log_capacity=$((cap*1024*1024))" >/dev/null
+  # **요청한 용량과 실제 용량이 같은지 확인한다.** 서버가 안 받거나 깎으면 표의 왼쪽 열이
+  # 거짓말을 한다 — "8MB 에서 이렇게 나빠졌다"의 8MB 가 사실이 아닌 채로.
+  CAPN=$(q "SELECT round(@@innodb_redo_log_capacity/1048576)")
+  case "${CAPN:-}" in ''|*[!0-9]*) CAPN="?";; esac
+  [ "${CAPN}" != "$cap" ] && CAPWARN="${CAPWARN} ${cap}MB→실제${CAPN}MB"
   W0=$(q "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_written'" | awk '{print $2}')
   IFS='|' read -r T A P M <<<"$(run1 8 "$LUAW")"
   W1=$(q "SHOW GLOBAL STATUS LIKE 'Innodb_os_log_written'" | awk '{print $2}')
+  [ -z "${T:-}" ] && FAIL3="$FAIL3 ${cap}MB"
   # 문장을 표에서 만들려면 값을 남겨야 한다. 두 조건의 TPS/p99/max/기록량을 보관한다.
   MBW=$(( (W1 - W0) / 1048576 ))
-  if [ -z "$BT" ]; then BT="$T"; BM="$M"; BP="$P"; BW="$MBW"; else NT="$T"; NM="$M"; NP="$P"; NW="$MBW"; NCAP="$cap"; fi
-  printf "  %s%12s %10s %10s %14s\n" "$(padr "${cap}MB" 14)" "${T:-?}" "${P:-?}" "${M:-?}" \
+  if [ -z "$BT" ]; then BT="$T"; BM="$M"; BP="$P"; BW="$MBW"; else NT="$T"; NM="$M"; NP="$P"; NW="$MBW"; NCAP="$CAPN"; fi
+  printf "  %s%12s %10s %10s %14s\n" "$(padr "${CAPN}MB" 14)" "${T:-?}" "${P:-?}" "${M:-?}" \
     "$(awk -v a="${W1:-0}" -v b="${W0:-0}" 'BEGIN{printf "%.0f MB", (a-b)/1048576}')"
 done
 restore
@@ -561,6 +599,16 @@ echo
 # **PostgreSQL 의 모양을 여기 그대로 옮겨 적으면 안 된다.** 그쪽은 max 만 54배 뛰고
 # p99 는 10% 였는데, 여기서는 p99 와 max 가 나란히 3배씩 오르는 실행이 나왔다.
 # 그러면 "p99 만 보는 대시보드는 놓친다"가 이 데이터에서는 틀린 말이 된다. 재서 말한다.
+if [ -n "$CAPWARN" ]; then
+  echo "   ⚠️ **요청한 용량과 실제 용량이 다르다:${CAPWARN}**"
+  echo "     왼쪽 열은 실제 값으로 찍었다. 서버가 안 받았거나 깎은 것이다."
+  echo
+fi
+if [ -n "$FAIL3" ]; then
+  echo "   ⚠️ **재지 못한 조건이 있다:${FAIL3}** — 두 조건을 견줄 수 없어 해석을 건너뛴다."
+  echo "     빈 값으로 배수를 내면 'p99 배, max 배' 같은 숫자 없는 문장이 남는다."
+  echo
+else
 RT=$(awk -v a="$NT" -v b="$BT" 'BEGIN{ if(b>0) printf "%.0f", (a-b)*100/b }')
 RP=$(awk -v a="$NP" -v b="$BP" 'BEGIN{ if(b>0) printf "%.1f", a/b }')
 RMX=$(awk -v a="$NM" -v b="$BM" 'BEGIN{ if(b>0) printf "%.1f", a/b }')
@@ -583,6 +631,7 @@ else
   echo "     같은 것은 **방향**이다(좁히면 지연이 나빠진다). **크기와 분포는 엔진·조건마다 다르므로**"
   echo "     'max 만 본다'를 규칙으로 옮기지 말고, 두 지표를 같이 두고 어느 쪽이 먼저 움직이는지 보라."
 fi
+fi   # ← 두 조건을 다 잰 경우에만 도는 해석 블록의 끝
 echo
 fi
 
