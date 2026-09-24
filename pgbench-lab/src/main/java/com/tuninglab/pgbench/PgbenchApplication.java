@@ -155,8 +155,14 @@ public class PgbenchApplication implements CommandLineRunner {
         log.error("  이대로 돌리면 남는 워커가 커넥션을 못 얻어 10초 뒤에 죽습니다.");
         log.error("  **그리고 죽은 워커는 errors 에 안 잡힙니다** — errors=0 에 TPS 가 멀쩡히 찍히고,");
         log.error("  표에서는 '이 지점에서 꺾였다'처럼 보입니다. 측정이 아니라 풀이 막힌 것입니다.");
+        // 이 값은 **이번 한 칸**에만 맞는다. 스윕을 도는 사람은 다음 칸에서 또 막혀
+        // 재시작을 두 번 하게 된다 — 그러지 않도록 목록의 최대값으로 잡으라고 말한다.
+        // (PostgreSQL 의 max_connections 는 재시작이 필요하니 한 번에 끝내야 한다.)
         log.error("  늘리려면 (재시작 필요): ALTER SYSTEM SET max_connections = {}; 뒤 서버 재시작",
                 need + (reserved == null ? 0 : reserved) + 20);
+        log.error("  **스윕을 돌 거면 목록의 가장 큰 clients 기준으로 한 번에 잡으세요** —");
+        log.error("  이 값은 clients={} 한 칸에만 맞습니다. 재시작이 필요한 설정이라 두 번 하게 됩니다.",
+                clients);
         log.error("  그냥 돌려 보려면: --force=1  (결과는 측정으로 쓰지 마세요)");
         return force;
     }
