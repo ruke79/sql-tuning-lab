@@ -167,6 +167,54 @@ cd docker && docker compose up -d && cd ..
 
 ## 모듈별 사용법
 
+### :common — 모든 모듈이 의존하는 공통 유틸
+
+실행형 모듈(`:tpch`/`:tpcds`/`:pgbench-lab`/`:sysbench-lab`/`:clickhouse-lab`) 다섯이
+전부 이 모듈 하나에 의존한다. 직접 실행하는 CLI 는 없고, 각 모듈의 `generate → schema →
+load → index/analyze → run` 파이프라인이 공통으로 쓰는 부품을 모아 둔 라이브러리다.
+
+```mermaid
+graph TD
+    subgraph "연결/파싱"
+        args["Args<br/>(--key=value 파서)"]
+        ds["DataSources<br/>(HikariCP 팩토리)"]
+        dialect["Dialect<br/>(POSTGRES/MYSQL/CLICKHOUSE)"]
+    end
+
+    subgraph "스키마/통계"
+        ssr["SqlScriptRunner<br/>(.sql 스크립트 실행)"]
+        check["SchemaCheck<br/>(run/index 전 테이블 존재 확인)"]
+        stats["Statistics<br/>(ANALYZE / VACUUM ANALYZE)"]
+    end
+
+    subgraph "데이터 적재"
+        files["DataFiles<br/>(병렬 생성기의 분할 파일 탐색)"]
+        loader["DelimitedFileLoader<br/>(구분자 파일 → JDBC 배치 INSERT)"]
+    end
+
+    subgraph "벤치마크"
+        qb["QueryBenchmark<br/>(warmup + 반복 실행, latency 통계)"]
+        explain["ExplainService<br/>(DBMS별 EXPLAIN 수집)"]
+        qrr["QueryResourceRunner<br/>(classpath:queries/*.sql 전체 실행)"]
+        result["BenchmarkResult<br/>(record: name/iterations/rowCount/...)"]
+    end
+
+    dialect --> ssr
+    dialect --> check
+    dialect --> stats
+    dialect --> loader
+    dialect --> explain
+
+    files --> loader
+    qrr --> qb
+    qrr --> explain
+    qb --> result
+
+    ds -. "모든 withJdbc() 호출의 시작점" .-> ssr
+    ds -. "모든 withJdbc() 호출의 시작점" .-> loader
+    ds -. "모든 withJdbc() 호출의 시작점" .-> qrr
+```
+
 ### :tpch — 다중 테이블 조인 / 서브쿼리 / 파티셔닝 / Parallel Scan
 
 ```bash
@@ -569,6 +617,39 @@ graph LR
 
 **1억 건**: 약 30일치 `load --from=2024-01-01 --to=2024-01-30 --hours=0-23` (시간당 10~20만 이벤트)
 **30억 건+**: `scripts/clickhouse/load-official-github-events.sh` (공식 s3 스냅샷, 디스크 200GB+)
+
+### :verify-core — 검증 케이스의 공통 실행기
+
+`:verify-lab` 과 `:verify-lab-kafka` 둘 다 이 모듈에 의존한다. DB/브로커 어디에도 직접 붙지
+않는 게 설계 원칙이다 — 케이스를 **등록·실행·판정**하는 틀만 제공하고, 실제 실행과 그
+결과를 어디에 적재할지는 전적으로 랩(`verify-lab`) 쪽 결정이다(`VerificationResultJdbcSink`
+가 `:verify-core` 가 아니라 `:verify-lab` 에 있는 이유).
+
+```mermaid
+graph TD
+    case["VerificationCase (abstract)<br/>id()·category()·question()·claim()<br/>+ verify(Evidence) 를 구현해 상속"]
+    evidence["Evidence<br/>(케이스가 실행 중 모은 증거)"]
+    verdict["Verdict<br/>CONFIRMED / REFUTED / INCONCLUSIVE"]
+    result["VerificationResult (record)<br/>id·category·question·claim·verdict·evidence·elapsedMillis"]
+    registry["VerificationRegistry<br/>(Spring Bean 으로 등록된<br/>VerificationCase 를 자동 수집)"]
+    runner["VerificationRunner<br/>runAll() · runCategory() · runOne(id)"]
+    filter["CaseFilter<br/>(verify.only=DB-14 같은<br/>선택 표현식 해석)"]
+    report["VerificationReport<br/>(콘솔/마크다운 출력)"]
+    controller["VerificationController<br/>(/verify/cases, /verify/run REST)"]
+
+    case -- "execute()" --> evidence
+    case -- "execute()" --> verdict
+    evidence --> result
+    verdict --> result
+
+    case -. "@Component 스캔" .-> registry
+    registry --> runner
+    filter -. "어떤 id/category 를 돌릴지" .-> runner
+    runner --> result
+    result --> report
+    runner --> controller
+    registry --> controller
+```
 
 ## :verify-lab — 면접 답변 검증 (51케이스 + Grafana)
 
