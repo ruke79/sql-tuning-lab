@@ -597,8 +597,76 @@ tpcds/           TPC-DS (PostgreSQL/MySQL, store_sales 채널 9 테이블)
 pgbench-lab/     pgbench TPC-B 워크로드 (PostgreSQL)
 sysbench-lab/    sysbench oltp_read_write 워크로드 (MySQL)
 clickhouse-lab/  GitHub Archive (ClickHouse)
+verify-core/     면접 답변 검증 공통 (JdbcTemplate 실행기, 결과 적재)
+verify-lab/      검증 케이스 51종 (spring/jpa/concurrency/jvm/db(PostgreSQL) + Grafana)
+verify-lab-kafka/ 검증 케이스 중 실물 Kafka 브로커 연계분 (7건)
 docker/          DB 3종 compose + 튜닝 파라미터 파일
-scripts/         공식 도구(dbgen/dsdgen/pgbench/sysbench/s3) 연동 스크립트
+scripts/         공식 도구(dbgen/dsdgen/pgbench/sysbench/s3) 연동 + 튜닝 실습 스크립트
+docs/            튜닝 서적 ↔ 실습 매핑, 작업 인계 기록
+```
+
+```mermaid
+graph TD
+    subgraph "Gradle 모듈"
+        common["common<br/>(QueryBenchmark · ExplainService ·<br/>DelimitedFileLoader · DataSources)"]
+        tpch["tpch<br/>(TPC-H 데이터 생성/적재)"]
+        tpcds["tpcds<br/>(TPC-DS 데이터 생성/적재)"]
+        pgbench["pgbench-lab<br/>(TPC-B 워크로드)"]
+        sysbench["sysbench-lab<br/>(oltp_read_write 워크로드)"]
+        clickhouse["clickhouse-lab<br/>(GitHub Archive)"]
+        vcore["verify-core<br/>(검증 실행기 공통)"]
+        vlab["verify-lab<br/>(검증 케이스 51종, DB 25건)"]
+        vkafka["verify-lab-kafka<br/>(실물 Kafka 브로커 7건)"]
+
+        tpch --> common
+        tpcds --> common
+        pgbench --> common
+        sysbench --> common
+        clickhouse --> common
+        vlab --> vcore
+        vkafka --> vcore
+    end
+
+    subgraph "DB 3종 (docker/docker-compose.yml)"
+        pg[("PostgreSQL 16")]
+        my[("MySQL 8.4")]
+        ch[("ClickHouse 24.8")]
+    end
+
+    kafka[("Kafka<br/>(scripts/verify/kafka-local.sh<br/>또는 docker/verify/compose.yaml)")]
+
+    subgraph "실습 스크립트 (scripts/)"
+        s_tpch["scripts/tpch/<br/>t2·t6·t8·t9·mt-* (조인·격리·락·멀티테넌시)"]
+        s_tpcds["scripts/tpcds/<br/>t2·t4·t6~t9·mt-* (스타 조인·파티션)"]
+        s_pgbench["scripts/pgbench/<br/>t8-dml-cost · t-shared-buffers · t-wal-flush"]
+        s_sysbench["scripts/sysbench/<br/>m4-m7-mysql (대기열·커밋·redo)"]
+        s_official["scripts/*/gen-official-*, load-*, run-official-*<br/>(공식 dbgen/dsdgen/pgbench/sysbench 연동)"]
+    end
+
+    docs["docs/2003-오라일리-튜닝북-실습-매핑.md<br/>docs/작업-인계노트.md"]
+
+    tpch -. "schema/load/index" .-> pg
+    tpch -. "schema/load/index" .-> my
+    tpcds -. "schema/load/index" .-> pg
+    tpcds -. "schema/load/index" .-> my
+    pgbench -- "TPC-B 트랜잭션" --> pg
+    sysbench -- "oltp_read_write" --> my
+    clickhouse -- "GH Archive 적재/쿼리" --> ch
+    vlab -- "verifylab DB 생성 +<br/>51 케이스 실행" --> pg
+    vkafka -- "실물 브로커 7건" --> kafka
+
+    s_tpch -. "적재된 TPC-H 스키마에 부하" .-> pg
+    s_tpch -. "적재된 TPC-H 스키마에 부하" .-> my
+    s_tpcds -. "적재된 TPC-DS 스키마에 부하" .-> pg
+    s_pgbench -- "pgbench 공식 바이너리" --> pg
+    s_sysbench -- "sysbench 공식 바이너리" --> my
+    s_official -. "공식 분포로 재적재" .-> tpch
+    s_official -. "공식 분포로 재적재" .-> tpcds
+
+    docs -. "실측값·해석 반영" .-> s_tpch
+    docs -. "실측값·해석 반영" .-> s_tpcds
+    docs -. "실측값·해석 반영" .-> s_pgbench
+    docs -. "실측값·해석 반영" .-> s_sysbench
 ```
 
 ## 참고
