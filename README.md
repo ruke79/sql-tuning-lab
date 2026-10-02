@@ -712,6 +712,50 @@ graph TD
 
 자세한 내용: [`verify-lab/README.md`](verify-lab/README.md)
 
+### :verify-lab-kafka — MSA 답변을 실물 브로커로 검증
+
+`verify-lab` 의 MSA 케이스가 브로커를 자바 코드로 흉내 낸 것과 달리, 이 모듈은 같은
+명제를 **실제 Kafka 브로커**에 걸어 확인한다. 원래 주제 8개(파티션 순서 보증·컨슈머 랙·
+DLQ 재처리·Exactly-Once·리밸런스·오토스케일 한계·핫 파티션·Avro 스키마 호환성) 중
+7개가 케이스로 구현돼 있다(리밸런스와 오토스케일 한계가 `RebalanceCase` 하나로 묶였다).
+
+```bash
+# 브로커: 도커 또는 로컬 KRaft (둘 중 하나)
+docker compose -f docker/verify/compose.yaml up -d kafka
+./scripts/verify/kafka-local.sh start          # Docker 없이
+
+./gradlew :verify-lab-kafka:test               # 브로커 없으면 실패가 아니라 '건너뜀'
+./gradlew :verify-lab-kafka:test -Dverify.only=KAFKA-05   # 하나만
+```
+
+이 환경 실행 결과: **7건 전부 CONFIRMED** (로컬 KRaft 3.9.1).
+
+```mermaid
+graph TD
+    subgraph "verify-lab-kafka"
+        brokers["Brokers<br/>(Admin/Producer/Consumer 생성)"]
+        avail["KafkaAvailability<br/>(접속 실패 → Evidence 에<br/>INCONCLUSIVE 로 기록)"]
+        cases["7 케이스<br/>ConsumerLagCase · ExactlyOnceCase ·<br/>HeadOfLineBlockingCase · HotPartitionCase ·<br/>PartitionOrderingCase · RebalanceCase ·<br/>SchemaCompatibilityCase"]
+        sink["PlainJdbcResultSink<br/>(DriverManager 직결 —<br/>Spring DataSource 를 안 쓴다)"]
+    end
+
+    cases -- "브로커 접속 실패" --> avail
+    cases -- "@Component 스캔" --> registry["VerificationRegistry<br/>(verify-core, 이 모듈 전용 인스턴스)"]
+    brokers -. "bootstrap.servers" .-> cases
+    registry --> runner["VerificationRunner<br/>(verify-core)"]
+    runner --> suite["KafkaVerificationSuiteTest<br/>(@SpringBootTest, 케이스마다<br/>독립된 @TestFactory 동적 테스트)"]
+    suite -- "브로커 없음" --> skip["Assumptions<br/>→ 실패가 아니라 건너뜀"]
+    suite --> result["VerificationResult"]
+    result --> md["build/reports/verification-kafka.md"]
+    result --> sink
+
+    kb[("Kafka 브로커<br/>(compose 또는 kafka-local.sh)")]
+    brokers -. "접속" .-> kb
+
+    sink -. "verify-lab 과 **같은**<br/>verify_result 테이블" .-> tbl[("verify_result<br/>(PostgreSQL)")]
+    tbl --> grafana["Grafana<br/>'kafka' 분류가<br/>수정 없이 같은 대시보드에 나타남"]
+```
+
 ## DB 파라미터 튜닝
 
 - PostgreSQL: `docker/postgres/postgresql.conf` 수정 → `docker compose restart postgres`
