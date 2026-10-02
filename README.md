@@ -177,6 +177,17 @@ cd docker && docker compose up -d && cd ..
 ./gradlew :tpch:bootRun --args="index  --db=postgres"
 ```
 
+```mermaid
+graph LR
+    gen["generate --sf=N<br/>TpchDataGenerator"] --> tbl[(".tbl 파일<br/>./data/tpch")]
+    schema["schema --db=X<br/>SqlScriptRunner"] --> db[("tpch 스키마<br/>PostgreSQL/MySQL")]
+    tbl --> load["load --db=X<br/>DelimitedFileLoader"] --> db
+    db --> idx["index --db=X<br/>SqlScriptRunner + ANALYZE"] --> db
+    db --> an["analyze/vacuum<br/>Statistics"] --> db
+    db -. "SchemaCheck.ready" .-> run
+    run["run --query=qNN<br/>QueryResourceRunner<br/>(QueryBenchmark · ExplainService)"] --> out["TPS/지연 + EXPLAIN"]
+```
+
 수록 쿼리: Q1(대량 집계) Q3(3-way 조인+Top-N) Q5(6-way 조인) Q6(범위 스캔)
 Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 
@@ -254,6 +265,16 @@ Q9(LIKE+인라인뷰) Q13(outer join) Q18(IN 서브쿼리+HAVING)
 ./gradlew :tpcds:bootRun --args="run    --db=postgres --explain=true"
 ```
 
+```mermaid
+graph LR
+    gen["generate --sales=N<br/>TpcdsDataGenerator"] --> tbl[(".dat 파일<br/>./data/tpcds")]
+    schema["schema --db=X<br/>SqlScriptRunner"] --> db[("tpcds 스타 스키마<br/>PostgreSQL/MySQL, 9테이블")]
+    tbl --> load["load --db=X<br/>DelimitedFileLoader"] --> db
+    db --> idx["index --db=X<br/>SqlScriptRunner + ANALYZE"] --> db
+    db -. "SchemaCheck.ready" .-> run
+    run["run --query=qNN_*<br/>QueryResourceRunner"] --> out["TPS/지연 + EXPLAIN"]
+```
+
 수록 쿼리: q03(기본 star join) q07(dim 4개) q19(6-way+비등가) q67(윈도우 rank)
 
 > 쿼리 이름이 tpch 와 다르다 — `--query=q03` 은 tpcds 에 없고 `q03_brand_by_year` 로 써야 한다.
@@ -322,6 +343,19 @@ WSL에서는 `/mnt/c`, `/mnt/d` 대신 리눅스 네이티브 경로에 생성�
 ./gradlew :pgbench-lab:bootRun --args="reset-stats"
 ./gradlew :pgbench-lab:bootRun --args="run --clients=8 --seconds=30 --scale=10"
 ./gradlew :pgbench-lab:bootRun --args="monitor"    # buffer hit / HOT 비율 / checkpoint / 락 대기
+```
+
+```mermaid
+graph LR
+    init["init --scale=N<br/>fill()"] --> db[("pgbench_lab<br/>PostgreSQL")]
+    db --> chk1{"checkScale<br/>적재 규모와<br/>--scale 일치?"}
+    chk1 -- "불일치" --> stop1["중단 + 안내<br/>(--force=1 로 강행 가능)"]
+    chk1 -- "일치" --> chk2{"checkConnections<br/>max_connections<br/>충분?"}
+    chk2 -- "부족" --> stop2["중단 + 필요 값 안내<br/>(--force=1 로 강행 가능)"]
+    chk2 -- "충분" --> run["run --clients=N<br/>TpcbWorkload<br/>(HikariPool 워커 N개)"]
+    run -- "워커가 도중에 죽었나" --> invalid["[무효] 로그<br/>(errors 엔 안 잡힘)"]
+    run --> result["TPS/avg/p95/p99/max"]
+    db --> monitor["monitor<br/>PgMonitor"] --> stats["buffer hit·HOT 비율·<br/>checkpoint·lock 대기"]
 ```
 
 **1억 건**: `--scale=1000` (Java 적재도 가능하지만 공식이 빠름: `scripts/pgbench/run-official-pgbench.sh init 1000`)
@@ -449,6 +483,17 @@ ONLY=2 ./scripts/pgbench/t8-dml-cost.sh         # fillfactor 절만
 ./gradlew :sysbench-lab:bootRun --args="monitor"   # buffer pool hit / row lock waits / redo 설정
 ```
 
+```mermaid
+graph LR
+    conn["접속 시도"] --> exists{"sysbench_lab<br/>DB 존재?"}
+    exists -- "아니오" --> create["ensureDatabase<br/>(서버에 직접 접속해 생성)"] --> prepare
+    exists -- "예" --> prepare["prepare --tables=N<br/>SysbenchTables"]
+    prepare --> db[("sysbench_lab<br/>MySQL/InnoDB")]
+    db --> run["run --threads=N [--hot=true]<br/>OltpWorkload"]
+    run --> result["TPS/지연<br/>(--hot=true: 행 1개로 핫로우 경합)"]
+    db --> monitor["monitor<br/>InnodbMonitor"] --> stats["buffer pool hit·<br/>row lock waits·redo 설정"]
+```
+
 §M-4/M-6/M-7(무릎·커밋 비용·redo 압력)의 MySQL 판은 스크립트로 자동화되어 있다.
 `sysbench` 가 없으면 `apt-get install -y sysbench`, 데이터가 없으면 스크립트가 만든다:
 
@@ -513,6 +558,15 @@ THREADS="1 2 4 8 16 32 64 128 256" ./scripts/sysbench/m4-m7-mysql.sh   # 스레�
 ./gradlew :clickhouse-lab:bootRun --args="experiment --name=orderby"
 ```
 
+```mermaid
+graph LR
+    schema["schema"] --> db[("gh_events<br/>ClickHouse")]
+    load["load --from=.. --hours=..<br/>GhArchiveLoader<br/>(GitHub Archive)"] --> db
+    db --> run["run --query=qNN<br/>[--explain=true]"] --> out["쿼리 결과/EXPLAIN"]
+    db --> exp["experiment --name=<br/>compression|mv|orderby"] --> variant[("압축/정렬/MV<br/>변형 테이블")]
+    variant --> compare["compare-compression<br/>CompressionReport"] --> report["LZ4 vs ZSTD 등 비교표"]
+```
+
 **1억 건**: 약 30일치 `load --from=2024-01-01 --to=2024-01-30 --hours=0-23` (시간당 10~20만 이벤트)
 **30억 건+**: `scripts/clickhouse/load-official-github-events.sh` (공식 s3 스냅샷, 디스크 200GB+)
 
@@ -533,6 +587,45 @@ docker compose -f docker/verify/compose.yaml up -d
 
 Kafka 검증(`:verify-lab-kafka`, 실물 브로커 8케이스 중 7건 등록)도 있다 —
 `./scripts/verify/kafka-local.sh start` (Docker 없이) 또는 compose 의 kafka 서비스.
+
+```mermaid
+graph TD
+    subgraph "verify-core (공통 실행기)"
+        registry["VerificationRegistry<br/>(51 케이스 등록)"]
+        runner["VerificationRunner"]
+        case_i["VerificationCase<br/>(질문 → 실행 → Verdict)"]
+    end
+
+    subgraph "verify-lab (51케이스)"
+        spring_c["spring (7)"]
+        jpa_c["jpa (7)"]
+        conc_c["concurrency (5)"]
+        jvm_c["jvm (7)"]
+        db_c["db (25, PostgreSQL 실물)"]
+        sink["VerificationResultJdbcSink"]
+        rest["StoredRunController<br/>(/verify/run REST)"]
+    end
+
+    subgraph "verify-lab-kafka (7케이스)"
+        kafka_c["kafka (7, 실물 브로커)"]
+    end
+
+    spring_c & jpa_c & conc_c & jvm_c & db_c --> registry
+    kafka_c -.->|"브로커 없으면<br/>INCONCLUSIVE"| registry
+
+    registry --> runner --> case_i
+    case_i --> result["VerificationResult<br/>(Verdict + Evidence)"]
+
+    result --> suite["VerificationSuiteTest<br/>(@SpringBootTest, ./gradlew :verify-lab:test)"]
+    suite --> md["build/reports/verification.md"]
+    result --> rest --> sink
+
+    db_c -. "직접 실행" .-> pg[("PostgreSQL 16")]
+    kafka_c -. "직접 실행" .-> kb[("Kafka 브로커")]
+
+    sink --> tbl[("verify_result 테이블<br/>(PostgreSQL)")]
+    tbl --> grafana["Grafana<br/>(docker/verify/compose.yaml)"]
+```
 
 ![Verification Lab 대시보드](docs/img/grafana-verification-lab.png)
 
