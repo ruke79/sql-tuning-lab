@@ -756,6 +756,28 @@ graph TD
     tbl --> grafana["Grafana<br/>'kafka' 분류가<br/>수정 없이 같은 대시보드에 나타남"]
 ```
 
+### :mysql-osc — 무정지 스키마 변경(온라인 DDL) 실측 — 책 밖 주제 (§X-2)
+
+`ADD COLUMN`은 `ALGORITHM=INSTANT`라 도구가 필요 없지만, **타입을 바꾸는 변경(INT→BIGINT)은
+INSTANT도 INPLACE도 거부된다** — gh-ost·pt-online-schema-change가 존재하는 이유 그 자체다.
+이 랩은 Docker로 1 primary + 2 replica(정상 1 / `SOURCE_DELAY`로 지연시킨 1)를 띄우고,
+1,000만 행에 배경 쓰기 부하를 건 채 네이티브 `ALTER`(COPY)와 gh-ost를 각각 돌려 **쓰기
+차단 시간·청크 크기별 백필 처리량·replica lag 쓰로틀 동작**을 잰다.
+
+```bash
+./scripts/mysql-osc/setup-topology.sh   # 토폴로지 준비 (기본 1,000만 행)
+./scripts/mysql-osc/t-online-ddl.sh     # 전부 (①ADD COLUMN ②네이티브COPY ③gh-ost청크스윕 ④replica lag쓰로틀)
+./scripts/mysql-osc/teardown.sh         # 완전히 치운다
+```
+
+이 환경 실측(10,000,000행, MySQL 8.4.11): ADD COLUMN(INSTANT) 198ms·공백 71ms,
+네이티브 MODIFY(COPY) 29.9초 중 29.8초(100%)가 쓰기 차단, gh-ost는 청크 10,000에서
+74,900행/초를 내면서도 cutover 블로킹은 청크 크기와 무관하게 ~900ms대 — COPY 대비
+자릿수가 다르다. 정상 replica 대조군은 231.8초에 완료(쓰로틀 0회), 74초 지연시킨
+replica 처치군은 450초 타임아웃까지 쓰로틀 449회로 못 끝냈다. 자세한 수치와 겪은
+함정(8.4의 `mysql_native_password` 기본 비활성화, gh-ost의 replica 직접 접속 계정
+문제, Docker 익명 볼륨 고아 등)은 매핑 문서 **[§X-2](docs/2003-오라일리-튜닝북-실습-매핑.md#x-2--무정지-스키마-변경--intbigint-네이티브-copy-vs-gh-ost)**.
+
 ## DB 파라미터 튜닝
 
 - PostgreSQL: `docker/postgres/postgresql.conf` 수정 → `docker compose restart postgres`
@@ -859,6 +881,7 @@ graph TD
         s_pgbench["scripts/pgbench/<br/>t8-dml-cost · t-shared-buffers · t-wal-flush"]
         s_sysbench["scripts/sysbench/<br/>m4-m7-mysql (대기열·커밋·redo)"]
         s_official["scripts/*/gen-official-*, load-*, run-official-*<br/>(공식 dbgen/dsdgen/pgbench/sysbench 연동)"]
+        s_osc["scripts/mysql-osc/<br/>setup-topology · t-online-ddl · teardown<br/>(무정지 스키마 변경, §X-2)"]
     end
 
     docs["docs/2003-오라일리-튜닝북-실습-매핑.md<br/>docs/작업-인계노트.md"]
@@ -885,6 +908,9 @@ graph TD
     docs -. "실측값·해석 반영" .-> s_tpcds
     docs -. "실측값·해석 반영" .-> s_pgbench
     docs -. "실측값·해석 반영" .-> s_sysbench
+    docs -. "실측값·해석 반영" .-> s_osc
+
+    s_osc -- "Docker 3컨테이너<br/>(1 primary + 2 replica)" --> my
 ```
 
 ## 참고
