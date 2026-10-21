@@ -92,6 +92,21 @@ P "ALTER USER 'root'@'%' IDENTIFIED WITH mysql_native_password BY '$MYROOT_PW';
    GRANT SELECT ON performance_schema.* TO 'ghost'@'%';
    FLUSH PRIVILEGES;" >/dev/null
 
+# ⚠️ gh-ost 는 --throttle-control-replicas 로 각 replica 에 *직접* 접속해 lag 를
+# 확인한다 — 이건 복제로 전파되는 데이터가 아니라 replica 자신의 로컬 계정이
+# 필요하다는 뜻이다. 위 CREATE USER/GRANT 는 primary 의 binlog 에 찍히지만,
+# 그 직후에 읽는 바로 지금 이 위치부터 replica 가 복제를 시작하므로(파일+포지션을
+# "현재" 값으로 잡는다) **이 GRANT 보다 뒤의 binlog 만 받는다 — 즉 ghost 유저가
+# replica 에 영원히 안 생긴다**(실측: throttle-control-replicas 연결이
+# "Access denied for user 'ghost'" 로 막혔다). 복제에 기대지 말고 각 replica 에
+# 직접 만든다.
+for GR in R1 R2; do
+  $GR "CREATE USER IF NOT EXISTS 'ghost'@'%' IDENTIFIED WITH mysql_native_password BY 'ghostpass';
+       GRANT SUPER, REPLICATION SLAVE, REPLICATION CLIENT, PROCESS ON *.* TO 'ghost'@'%';
+       GRANT SELECT ON performance_schema.* TO 'ghost'@'%';
+       FLUSH PRIVILEGES;" >/dev/null
+done
+
 PRIMARY_IP=$(osc_ip osc-primary)
 # ⚠️ 바로 위 ALTER USER/FLUSH PRIVILEGES 직후 새 연결을 맺으면 가끔 일시적으로
 # 실패한다(실측: 이 자리에서 LOGFILE/LOGPOS 가 빈 채로 넘어가 복제가 영원히

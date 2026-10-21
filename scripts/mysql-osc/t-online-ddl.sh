@@ -222,9 +222,10 @@ echo
 
 echo "  [대조군] --throttle-control-replicas=replica1(지연 없음), max-lag-millis=500"
 LOG="$PROBEDIR/throttle_ctrl.log"
+rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-timeout 60 "$GHOST_BIN" \
+timeout 300 "$GHOST_BIN" \
   --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA1_IP}:3306" --max-lag-millis=500 \
@@ -243,9 +244,15 @@ restore_to_int
 echo
 echo "  [처치군] --throttle-control-replicas=replica2(지연 ${R2LAG:-?}초), max-lag-millis=500"
 LOG="$PROBEDIR/throttle_treat.log"
+# ⚠️ 대조군이 timeout 60 에 의해 강제 종료되면 gh-ost 가 정상 종료 경로를 못 타서
+# /tmp/gh-ost.*.sock 을 못 지운다. 다음 gh-ost 가 같은 소켓 경로로 바인드를
+# 시도하다 "bind: address already in use" 로 즉사한다(실측: 처치군이 256ms 만에
+# 끝나고 쓰로틀 로그가 0줄이었다 — 쓰로틀이 안 걸린 게 아니라 아예 못 뜬 것이었다).
+# 매 gh-ost 실행 직전에 지운다.
+rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-timeout 60 "$GHOST_BIN" \
+timeout 300 "$GHOST_BIN" \
   --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA2_IP}:3306" --max-lag-millis=500 \
@@ -257,10 +264,10 @@ stop_load
 DUR_TREAT=$(( T1 - T0 ))
 DONE_TREAT=$(grep -c "^# Done" "$PROBEDIR/throttle_treat.out")
 THROTTLE_LINES_TREAT=$(grep -ic "throttl" "$PROBEDIR/throttle_treat.out" | head -1)
-echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 60s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 쓰로틀 언급 ${THROTTLE_LINES_TREAT}줄"
+echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 300s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 쓰로틀 언급 ${THROTTLE_LINES_TREAT}줄"
 echo
 if [ "${THROTTLE_LINES_TREAT:-0}" -gt "${THROTTLE_LINES_CTRL:-0}" ] && [ "$DONE_TREAT" -lt 1 ]; then
-  echo "  → 대조군은 완료됐고(쓰로틀 언급 ${THROTTLE_LINES_CTRL}줄), 처치군은 60초 안에"
+  echo "  → 대조군은 완료됐고(쓰로틀 언급 ${THROTTLE_LINES_CTRL}줄), 처치군은 300초 안에"
   echo "    못 끝났다(쓰로틀 언급 ${THROTTLE_LINES_TREAT}줄) — **같은 변경, 같은 부하인데"
   echo "    replica lag 만 다르다.** 쓰로틀이 지연된 replica 를 보고 실제로 멈춘 것이다."
   echo "    대조군이 없었으면 '처치군이 느린 것'과 '쓰로틀이 작동한 것'을 구분할 수 없었다."
