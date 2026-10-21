@@ -81,18 +81,26 @@ stop_load() { exp_kill_bg; }
 
 # 부하가 **실제로** 돌고 있는지 2초 재서 확인한다. 0 이면 "부하를 걸었다"고
 # 말하면 안 된다 — 걸었다고 쓴 코드와 실제로 도는 것은 다른 문제다.
+# ⚠️ 직전에 restore_to_int()(COPY, ~30초 블로킹)나 강제 종료된 gh-ost 가 있었다면
+# 메타데이터 락/커넥션이 아주 잠깐 안 풀린 채로 start_load 가 시작될 수 있다
+# (실측: ④ 처치군 직전 restore_to_int 뒤 0 writes/s 로 한 번 그렇게 잡혔다 —
+# 몇 초 뒤엔 수동 UPDATE 가 멀쩡히 먹혔다). 0 이라고 바로 포기하지 않고 몇 번
+# 더 재서 진짜 멈춘 것인지 확인한다.
 verify_load_running() {
-  local logfile="$1" before after tps
-  before=$(wc -l < "$logfile" 2>/dev/null || echo 0)
-  sleep 2
-  after=$(wc -l < "$logfile" 2>/dev/null || echo 0)
-  tps=$(( (after - before) / 2 ))
-  echo "  배경 부하 확인: ${tps} writes/s (연결 ${LOADERS}개)"
-  if [ "$tps" -le 0 ]; then
-    echo "  [중단] 배경 부하가 안 돈다 — 이 상태로 재면 '쓰기 차단'이 무의미하다."
-    return 1
-  fi
-  return 0
+  local logfile="$1" before after tps i
+  for i in 1 2 3; do
+    before=$(wc -l < "$logfile" 2>/dev/null || echo 0)
+    sleep 2
+    after=$(wc -l < "$logfile" 2>/dev/null || echo 0)
+    tps=$(( (after - before) / 2 ))
+    if [ "$tps" -gt 0 ]; then
+      echo "  배경 부하 확인: ${tps} writes/s (연결 ${LOADERS}개)"
+      return 0
+    fi
+    echo "  배경 부하 확인: 0 writes/s — 재확인 ${i}/3"
+  done
+  echo "  [중단] 배경 부하가 안 돈다 — 이 상태로 재면 '쓰기 차단'이 무의미하다."
+  return 1
 }
 
 # 로그 파일에서 "가장 긴 연속 공백"을 ms 로 뽑는다 — COPY/cutover 의 블로킹 시간.
@@ -225,7 +233,7 @@ LOG="$PROBEDIR/throttle_ctrl.log"
 rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-timeout 300 "$GHOST_BIN" \
+timeout 450 "$GHOST_BIN" \
   --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA1_IP}:3306" --max-lag-millis=500 \
@@ -237,8 +245,8 @@ stop_load
 DUR_CTRL=$(( T1 - T0 ))
 grep -qc "^# Done" "$PROBEDIR/throttle_ctrl.out" >/dev/null
 DONE_CTRL=$(grep -c "^# Done" "$PROBEDIR/throttle_ctrl.out")
-THROTTLE_LINES_CTRL=$(grep -ic "throttl" "$PROBEDIR/throttle_ctrl.out" | head -1)
-echo "  대조군: ${DUR_CTRL}ms 소요, 완료=$([ "$DONE_CTRL" -ge 1 ] && echo 예 || echo 아니오), 쓰로틀 언급 ${THROTTLE_LINES_CTRL}줄"
+THROTTLE_LINES_CTRL=$(grep -c "State: throttled" "$PROBEDIR/throttle_ctrl.out")
+echo "  대조군: ${DUR_CTRL}ms 소요, 완료=$([ "$DONE_CTRL" -ge 1 ] && echo 예 || echo 아니오), 실제 쓰로틀 ${THROTTLE_LINES_CTRL}줄"
 restore_to_int
 
 echo
@@ -252,7 +260,7 @@ LOG="$PROBEDIR/throttle_treat.log"
 rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-timeout 300 "$GHOST_BIN" \
+timeout 450 "$GHOST_BIN" \
   --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA2_IP}:3306" --max-lag-millis=500 \
@@ -263,12 +271,12 @@ T1=$(date +%s%3N)
 stop_load
 DUR_TREAT=$(( T1 - T0 ))
 DONE_TREAT=$(grep -c "^# Done" "$PROBEDIR/throttle_treat.out")
-THROTTLE_LINES_TREAT=$(grep -ic "throttl" "$PROBEDIR/throttle_treat.out" | head -1)
-echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 300s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 쓰로틀 언급 ${THROTTLE_LINES_TREAT}줄"
+THROTTLE_LINES_TREAT=$(grep -c "State: throttled" "$PROBEDIR/throttle_treat.out")
+echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 450s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 실제 쓰로틀 ${THROTTLE_LINES_TREAT}줄"
 echo
 if [ "${THROTTLE_LINES_TREAT:-0}" -gt "${THROTTLE_LINES_CTRL:-0}" ] && [ "$DONE_TREAT" -lt 1 ]; then
-  echo "  → 대조군은 완료됐고(쓰로틀 언급 ${THROTTLE_LINES_CTRL}줄), 처치군은 300초 안에"
-  echo "    못 끝났다(쓰로틀 언급 ${THROTTLE_LINES_TREAT}줄) — **같은 변경, 같은 부하인데"
+  echo "  → 대조군은 완료됐고(실제 쓰로틀 ${THROTTLE_LINES_CTRL}줄), 처치군은 450초 안에"
+  echo "    못 끝났다(실제 쓰로틀 ${THROTTLE_LINES_TREAT}줄) — **같은 변경, 같은 부하인데"
   echo "    replica lag 만 다르다.** 쓰로틀이 지연된 replica 를 보고 실제로 멈춘 것이다."
   echo "    대조군이 없었으면 '처치군이 느린 것'과 '쓰로틀이 작동한 것'을 구분할 수 없었다."
 else
