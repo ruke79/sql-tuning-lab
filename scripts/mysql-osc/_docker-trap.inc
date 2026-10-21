@@ -22,7 +22,12 @@ osc_container_count() {
 }
 
 osc_cleanup() {
-  for c in $OSC_CONTAINERS; do docker rm -f "$c" >/dev/null 2>&1; done
+  # ⚠️ `docker rm -f`(볼륨 옵션 없이)는 컨테이너만 지우고 데이터 디렉터리의
+  # 익명 볼륨은 그대로 남긴다 — 10M행 InnoDB 데이터(컨테이너당 수GB)가 매
+  # FORCE=1 재실행마다 쌓여 디스크를 다 먹는다(실측: 이 디렉터리를 반복
+  # 재구성하다 "No space left on device" 로 컨테이너 기동 자체가 실패했다 —
+  # 익명 볼륨 46개, 29GB 가 고아로 남아 있었다). `-v` 로 컨테이너와 함께 지운다.
+  for c in $OSC_CONTAINERS; do docker rm -fv "$c" >/dev/null 2>&1; done
   docker network rm "$OSC_NET" >/dev/null 2>&1
   # gh-ost 는 작업 중단 시 소켓·스로틀 플래그 파일을 치우지 않는다.
   rm -f /tmp/gh-ost.*.sock /tmp/gh-ost.throttle 2>/dev/null
