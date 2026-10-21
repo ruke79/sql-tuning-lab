@@ -100,8 +100,13 @@ P "ALTER USER 'root'@'%' IDENTIFIED WITH mysql_native_password BY '$MYROOT_PW';
 # replica 에 영원히 안 생긴다**(실측: throttle-control-replicas 연결이
 # "Access denied for user 'ghost'" 로 막혔다). 복제에 기대지 말고 각 replica 에
 # 직접 만든다.
+# ⚠️ 처음엔 performance_schema 만 더 줬다. gh-ost 는 replica 에서도 자기가 만든
+# 고스트/체인지로그 테이블(osctest._orders_ghc)을 직접 SELECT 해서 lag 를
+# 재므로 osctest.* 도 있어야 한다(실측: "SELECT command denied ... for table
+# '_orders_ghc'" 로 계속 throttled 상태에 갇혀, 대조군조차 끝나지 않았다).
 for GR in R1 R2; do
   $GR "CREATE USER IF NOT EXISTS 'ghost'@'%' IDENTIFIED WITH mysql_native_password BY 'ghostpass';
+       GRANT ALL ON osctest.* TO 'ghost'@'%';
        GRANT SUPER, REPLICATION SLAVE, REPLICATION CLIENT, PROCESS ON *.* TO 'ghost'@'%';
        GRANT SELECT ON performance_schema.* TO 'ghost'@'%';
        FLUSH PRIVILEGES;" >/dev/null
