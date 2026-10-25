@@ -240,12 +240,34 @@ expand_contract_backfill() {
 }
 
 cutover_rename() {
-  PSQL_P -c "
-    BEGIN;
-    ALTER TABLE orders RENAME COLUMN cust_id TO cust_id_old;
-    ALTER TABLE orders RENAME COLUMN cust_id_new TO cust_id;
-    COMMIT;
-  "
+  # ⚠️ 그냥 BEGIN/RENAME/RENAME/COMMIT 으로 돌리면 ACCESS EXCLUSIVE 락을
+  # 요청한 뒤 "지금 도는 트랜잭션들이 끝날 때까지" 기다리는데, PostgreSQL 의
+  # 락 대기열은 FIFO 라 그 뒤에 도착하는 배경 UPDATE 들도 전부 이 요청 뒤에
+  # 줄을 선다(convoy) — 실측: 배치 크기와 무관하게 cutover 가 항상 ~1,034ms
+  # 로 고정돼 나왔다(gh-ost 의 6~11ms 대비 100배). gh-ost 는 짧은
+  # lock_timeout 을 걸고 실패하면 바로 물러났다가 재시도하는 방식으로 이
+  # 긴 대기 자체를 피한다 — 같은 전략을 여기도 넣는다: lock_timeout 을
+  # 짧게 주고, 그 안에 락을 못 따면 롤백하고 잠깐 쉬었다 다시 시도한다.
+  local lock_timeout_ms="${1:-50}" deadline_s="${2:-30}"
+  local deadline=$(( $(date +%s) + deadline_s )) attempt=0 out rc
+  while :; do
+    attempt=$((attempt+1))
+    out=$(PSQL_P -v ON_ERROR_STOP=1 -c "
+      SET lock_timeout = '${lock_timeout_ms}ms';
+      BEGIN;
+      ALTER TABLE orders RENAME COLUMN cust_id TO cust_id_old;
+      ALTER TABLE orders RENAME COLUMN cust_id_new TO cust_id;
+      COMMIT;
+    " 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] && { echo "$out"; return 0; }
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "$out" >&2
+      echo "  [중단] cutover 가 ${deadline_s}초 안에 락을 못 땄다." >&2
+      return 1
+    fi
+    sleep 0.05
+  done
 }
 
 if want 3; then
