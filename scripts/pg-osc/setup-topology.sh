@@ -71,7 +71,21 @@ echo "  pg-primary ready"
 
 echo
 echo "── 복제 계정 + 베이스 백업으로 replica 2개 준비 ──"
-PD "CREATE ROLE replicator WITH REPLICATION LOGIN;" >/dev/null 2>&1
+# ⚠️ 여기서 에러를 숨기면(>/dev/null 2>&1) CREATE ROLE 이 일시적으로 실패해도
+# 아무도 모른다 — 실측: 바로 이 자리에서 CREATE ROLE 이 조용히 실패했고,
+# 증상은 몇 단계 뒤(pg_basebackup 이 "role replicator does not exist")에서야
+# 나타났다. "ready for connections" 가 로그에 찍혀도 DDL 이 즉시 다 되는 건
+# 아닐 수 있다는 게 이 디렉터리에서 반복되는 교훈이다(wait_container_ready 의
+# 주석 참조) — 여기도 같은 패턴이라 재시도 + 실제 확인을 넣는다.
+for i in 1 2 3 4 5; do
+  PD "CREATE ROLE replicator WITH REPLICATION LOGIN;" >/dev/null 2>&1
+  [ "$(PD "SELECT 1 FROM pg_roles WHERE rolname='replicator';")" = "1" ] && break
+  sleep 1
+done
+if [ "$(PD "SELECT 1 FROM pg_roles WHERE rolname='replicator';")" != "1" ]; then
+  echo "  [중단] replicator 롤을 5번 재시도해도 못 만들었다."
+  exit 1
+fi
 # ⚠️ POSTGRES_HOST_AUTH_METHOD=trust 는 `host all all all trust` 한 줄만
 # pg_hba.conf 에 추가한다 — pg_hba.conf 에서 "replication" 은 database 필드의
 # "all" 에 **포함되지 않는** 별도 항목이다(공식 문서에 명시돼 있다). 그래서
