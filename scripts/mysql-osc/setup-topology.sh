@@ -19,6 +19,7 @@
 #   ROWS=1000000 ./setup-topology.sh    # 빠른 반복용 — 100만 행
 #   REPLICA_DELAY=30 ./setup-topology.sh  # replica2 지연 초 (기본 30)
 #   FORCE=1 ./setup-topology.sh         # 이미 떠 있어도 지우고 다시
+#   INNODB_BUFFER_POOL=4G ./setup-topology.sh  # 버퍼풀 크기 (기본 512M — 샌드박스 기준)
 set -uo pipefail
 cd "$(dirname "$0")"
 . ./lib.sh
@@ -26,6 +27,12 @@ cd "$(dirname "$0")"
 ROWS="${ROWS:-10000000}"
 REPLICA_DELAY="${REPLICA_DELAY:-30}"
 SC="${SC:-/tmp/mysql-osc-scratch}"
+# ⚠️ 이 값은 애초에 메모리 제한된 샌드박스 VM 기준으로 잡혔다 — 호스트 RAM 과
+# 무관하게 하드코딩돼 있었다. 좋은 하드웨어(실측: 5900X/128GB/NVMe)에서도 10M행
+# 백필이 샌드박스보다 9배 느리게 나온 사례가 있었는데, 버퍼풀이 작으면 디스크가
+# 아무리 빨라도 "불필요하게 자주 두드리는" 비효율은 못 가린다. 호스트 RAM 에
+# 맞게 늘려서 재보라 — 예: `INNODB_BUFFER_POOL=4G ./setup-topology.sh`.
+INNODB_BUFFER_POOL="${INNODB_BUFFER_POOL:-512M}"
 
 . ./_docker-trap.inc
 
@@ -40,16 +47,16 @@ fi
 osc_cleanup
 
 mkdir -p "$SC"
-cat > "$SC/my-primary.cnf" <<'EOF'
+cat > "$SC/my-primary.cnf" <<EOF
 [mysqld]
 server-id=1
 log-bin=mysql-bin
 binlog_format=ROW
 binlog_row_image=FULL
 mysql-native-password=ON
-innodb_buffer_pool_size=512M
+innodb_buffer_pool_size=$INNODB_BUFFER_POOL
 EOF
-cat > "$SC/my-replica1.cnf" <<'EOF'
+cat > "$SC/my-replica1.cnf" <<EOF
 [mysqld]
 server-id=2
 log-bin=mysql-bin
@@ -57,7 +64,7 @@ binlog_format=ROW
 read_only=ON
 log-replica-updates=ON
 mysql-native-password=ON
-innodb_buffer_pool_size=512M
+innodb_buffer_pool_size=$INNODB_BUFFER_POOL
 EOF
 cat > "$SC/my-replica2.cnf" <<EOF
 [mysqld]
@@ -67,7 +74,7 @@ binlog_format=ROW
 read_only=ON
 log-replica-updates=ON
 mysql-native-password=ON
-innodb_buffer_pool_size=512M
+innodb_buffer_pool_size=$INNODB_BUFFER_POOL
 EOF
 
 echo "── 컨테이너 3개 기동 ──"
