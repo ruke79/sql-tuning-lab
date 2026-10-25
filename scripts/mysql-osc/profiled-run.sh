@@ -29,19 +29,29 @@ MON_LOG="$LOGDIR/monitor-$TS.log"
 echo "실행 로그: $RUN_LOG"
 echo "모니터 로그: $MON_LOG"
 
-# ── 이미 돌고 있는 gh-ost 가 있으면 끝날 때까지 기다린다. 두 gh-ost 가 동시에
-#    같은 unix 소켓(/tmp/gh-ost.osctest.orders.sock)을 쓰려 하면 뒤에 뜬 쪽이
-#    "bind: address already in use" 로 즉사한다(§9 기록에 실측 있음) — 먼저
-#    뜬 걸 존중하고 기다린다. `[g]h-ost` 는 pgrep 자신이 자기 패턴에 걸리는 걸
-#    피하는 관용구다(이 디렉터리에서 pkill -f 가 자기 쉘을 죽인 전례가 있다 —
-#    같은 함정을 pgrep 에서도 피한다). ──
-if pgrep -f '[g]h-ost' >/dev/null 2>&1; then
-  echo "── 이미 돌고 있는 gh-ost 가 있다 — 끝날 때까지 기다린다 ──"
-  while pgrep -f '[g]h-ost' >/dev/null 2>&1; do
+# ── 이미 돌고 있는 t-online-ddl.sh 가 있으면 **완전히 끝날 때까지** 기다린다.
+#    ⚠️ 처음엔 gh-ost **바이너리**가 떠 있는지만 봤다 — 그런데 t-online-ddl.sh
+#    는 청크 사이사이(100→1000→10000)에 restore_to_int()(COPY, 수 초~수십 초)와
+#    배경 부하 재확인을 하는 **gh-ost 가 안 떠 있는 빈 구간**이 있다. 실측으로
+#    바로 이 구간에서 사고가 났다: 하필 그 빈 구간에 이 스크립트가 "gh-ost
+#    없네, 끝났다"고 오판하고 자기 몫을 시작해버렸고, 원래 실행이 곧이어 자기
+#    chunk=1000 을 시작하면서 **두 gh-ost 가 같은 테이블을 동시에 마이그레이션**
+#    하려다 "FATAL another gh-ost process is already migrating ... lock held
+#    by connection id ..." 로 충돌했다. gh-ost 가 아니라 **오케스트레이터
+#    스크립트 자신**(t-online-ddl.sh)이 완전히 끝났는지를 봐야 한다 — 청크
+#    사이 빈 구간에도 그 프로세스는 계속 살아있다. ──
+if pgrep -f '[t]-online-ddl.sh' >/dev/null 2>&1; then
+  echo "── 이미 돌고 있는 t-online-ddl.sh 가 있다 — 완전히 끝날 때까지 기다린다 ──"
+  while pgrep -f '[t]-online-ddl.sh' >/dev/null 2>&1; do
     sleep 5
   done
   echo "  끝났다. 이어서 시작한다."
 fi
+# gh-ost 자체도 한 번 더 — t-online-ddl.sh 가 막 끝났어도 그 자식 gh-ost 가
+# 정리 중일 수 있다(§9 의 Ctrl-C 경합 기록 참조).
+while pgrep -f '[g]h-ost' >/dev/null 2>&1; do
+  sleep 2
+done
 
 # ── monitor.sh 를 백그라운드로 띄워 같은 타임라인에 남긴다. ──
 ./monitor.sh > "$MON_LOG" 2>&1 &
