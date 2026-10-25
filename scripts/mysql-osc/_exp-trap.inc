@@ -16,6 +16,7 @@
 
 LAB_DONE=0
 EXP_PIDS=""
+GHOST_PID=""
 
 exp_kill_bg() {
   [ -z "$EXP_PIDS" ] && return 0
@@ -26,6 +27,19 @@ exp_kill_bg() {
 
 exp_cleanup() {
   exp_kill_bg
+  # ⚠️ gh-ost 는 백그라운드로 띄워서 진행률을 중계한다(ghost_run). Ctrl-C 를
+  # 누르면 gh-ost 도 같은 프로세스 그룹이라 SIGINT 를 직접 받고 **자기 스스로**
+  # 고스트/체인지로그 테이블을 정리하며 종료하려 한다. 여기서 바로 DROP 을 먼저
+  # 치면 그 자기 정리와 경합해서 gh-ost 가 "Table ... doesn't exist" 를 반복
+  # 찍으며 지저분하게 죽는다(실측: Ctrl-C 직후 `_orders_ghc` 를 두고 경합해
+  # 다섯 줄 연속 같은 에러가 났다). gh-ost 가 **스스로 끝낼 시간을 먼저** 준다.
+  if [ -n "$GHOST_PID" ] && kill -0 "$GHOST_PID" 2>/dev/null; then
+    for i in $(seq 1 10); do
+      kill -0 "$GHOST_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$GHOST_PID" 2>/dev/null && kill -9 "$GHOST_PID" 2>/dev/null
+  fi
   P "DROP TABLE IF EXISTS osctest._orders_gho, osctest._orders_ghc, osctest._orders_del;" >/dev/null 2>&1
   rm -f /tmp/gh-ost.*.sock /tmp/gh-ost.throttle 2>/dev/null
 }

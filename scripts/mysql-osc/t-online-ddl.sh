@@ -149,6 +149,7 @@ ghost_run() {
     "$GHOST_BIN" "$@" > "$out" 2>&1 &
   fi
   local pid=$! prev=""
+  GHOST_PID="$pid"
   # ⚠️ gh-ost 는 진행 상황을 1초~30초 간격으로 불규칙하게 기록한다(실측: 초반
   # 1초, 몇 분 뒤 30초 간격으로 늦춰졌다). 15초마다 폴링하면 같은 줄을 두 번
   # 찍는 경우가 흔하다 — 직전에 찍은 줄과 같으면 건너뛴다.
@@ -162,6 +163,9 @@ ghost_run() {
     fi
   done
   wait "$pid"
+  local rc=$?
+  GHOST_PID=""
+  return "$rc"
 }
 
 # 로그 파일에서 "가장 긴 연속 공백"을 ms 로 뽑는다 — COPY/cutover 의 블로킹 시간.
