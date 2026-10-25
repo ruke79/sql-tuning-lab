@@ -31,6 +31,13 @@ ONLY="${ONLY:-1234}"
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 CHUNKS="${CHUNKS:-100 1000 10000}"
 LOADERS="${LOADERS:-4}"
+# ⚠️ ④ 의 대조군/처치군 판정은 "대조군이 이 시간 안에 끝나는가"에 기대는데, 이
+# 값은 애초에 이 스크립트를 처음 만든 샌드박스(클라우드 VM)의 속도로 잡혔다.
+# 느린 디스크/노트북에서는 쓰로틀이 전혀 안 걸려도 그냥 느려서 타임아웃을 넘겨
+# "미완료"로 잘못 보일 수 있다(실측: 다른 머신에서 같은 chunk=100 백필이 9배
+# 느렸다). 환경변수로 늘릴 수 있게 둔다 — 느린 머신이면
+# `THROTTLE_TIMEOUT=1800 ./t-online-ddl.sh` 처럼 넉넉히 주고 돌려라.
+THROTTLE_TIMEOUT="${THROTTLE_TIMEOUT:-450}"
 SC="${SC:-/tmp/mysql-osc-scratch}"
 GHOST_BIN="$SC/gh-ost"
 PROBEDIR="$SC/osc-probe"
@@ -286,7 +293,7 @@ LOG="$PROBEDIR/throttle_ctrl.log"
 rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-ghost_run 450 "$PROBEDIR/throttle_ctrl.out" \
+ghost_run "$THROTTLE_TIMEOUT" "$PROBEDIR/throttle_ctrl.out" \
   --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA1_HOST}:${REPLICA1_PORT}" --max-lag-millis=500 \
@@ -313,7 +320,7 @@ LOG="$PROBEDIR/throttle_treat.log"
 rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-ghost_run 450 "$PROBEDIR/throttle_treat.out" \
+ghost_run "$THROTTLE_TIMEOUT" "$PROBEDIR/throttle_treat.out" \
   --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA2_HOST}:${REPLICA2_PORT}" --max-lag-millis=500 \
@@ -325,10 +332,10 @@ stop_load
 DUR_TREAT=$(( T1 - T0 ))
 DONE_TREAT=$(grep -c "^# Done" "$PROBEDIR/throttle_treat.out")
 THROTTLE_LINES_TREAT=$(grep -c "State: throttled" "$PROBEDIR/throttle_treat.out")
-echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 450s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 실제 쓰로틀 ${THROTTLE_LINES_TREAT}줄"
+echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 ${THROTTLE_TIMEOUT}s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 실제 쓰로틀 ${THROTTLE_LINES_TREAT}줄"
 echo
 if [ "${THROTTLE_LINES_TREAT:-0}" -gt "${THROTTLE_LINES_CTRL:-0}" ] && [ "$DONE_TREAT" -lt 1 ]; then
-  echo "  → 대조군은 완료됐고(실제 쓰로틀 ${THROTTLE_LINES_CTRL}줄), 처치군은 450초 안에"
+  echo "  → 대조군은 완료됐고(실제 쓰로틀 ${THROTTLE_LINES_CTRL}줄), 처치군은 ${THROTTLE_TIMEOUT}초 안에"
   echo "    못 끝났다(실제 쓰로틀 ${THROTTLE_LINES_TREAT}줄) — **같은 변경, 같은 부하인데"
   echo "    replica lag 만 다르다.** 쓰로틀이 지연된 replica 를 보고 실제로 멈춘 것이다."
   echo "    대조군이 없었으면 '처치군이 느린 것'과 '쓰로틀이 작동한 것'을 구분할 수 없었다."
