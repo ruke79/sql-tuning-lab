@@ -96,16 +96,37 @@ MYSQL_P() { mysql -h "$PRIMARY_HOST" -P "$PRIMARY_PORT" -uroot -p"$MYROOT_PW" "$
 # 배경 쓰기 부하 — $LOADERS 개의 독립 연결이 무작위 id 에 단건 UPDATE 를 반복한다.
 # 각 성공 시각(ms epoch)을 공유 로그에 한 줄씩 남긴다. 이 로그가 "지금 멈췄다"를
 # 재는 유일한 근거다 — gh-ost 의 진행률 출력이 아니라 **실제 쓰기가 끊긴 시간**을 본다.
+#
+# ⚠️ 처음엔 UPDATE 한 건마다 `mysql -e ...` 를 새로 fork 했다 — 즉 매 문장마다
+# 새 프로세스 + 새 TCP 연결 + 새 인증을 치렀다. 로더 4개가 이걸 반복하면
+# "실제 쓰기 부하"보다 "연결 생성 오버헤드"가 더 커질 수 있고, 이 오버헤드는
+# OS 스케줄러 상태에 좌우돼 측정값이 들쭉날쭉해진다(실측: 느린 머신에서 gh-ost
+# 백필 ETA 가 1h12m↔3h21m 처럼 구간마다 크게 출렁였다 — 디스크/버퍼풀이 아니라
+# 이 연결-생성 오버헤드가 주범이었을 가능성이 크다). 연결을 로더당 **하나만**
+# 열어 재사용한다 — stdin 으로 문장을 계속 흘려보내고, `SELECT ROW_COUNT()`
+# 출력 한 줄이 나올 때마다 그 문장이 끝났다는 신호로 타임스탬프를 찍는다.
+# ⚠️ 이제 파이프라인(생성기 | mysql | 타임스탬프 리더) 3단짜리라, EXP_PIDS 에
+# 담기는 $! 은 마지막 단(리더)의 PID 뿐이다 — 그것만 kill 하면 생성기와 mysql
+# 연결이 고아 프로세스로 남아 다음 측정과 몰래 경쟁한다.
+# ⚠️ 처음엔 서브셸 안에 `trap 'kill 0' TERM` 을 걸어 "내 프로세스 그룹 전체를
+# 죽이자"고 했는데, **job control 이 없는 일반 스크립트에서는 백그라운드
+# 서브셸이 메인 스크립트와 같은 프로세스 그룹을 공유한다** — `kill 0` 이
+# 메인 스크립트 자신까지 포함해 전체를 죽였다. 메인 스크립트가 TERM 을 받아
+# on_abort 가 돌고, 그 안에서 로더들을 다시 kill 하고, 그게 다시 `kill 0` 을
+# 쏘고… 가 무한 반복됐다(실측: "[중단]..." 이 수백 줄 찍히며 멈추지 않았다).
+# `setsid` 로 로더마다 **별도 프로세스 그룹**을 만들어 메인 스크립트와
+# 완전히 분리한다 — `kill -- -$pid` 로 그 로더의 그룹만 안전하게 죽인다.
 start_load() {
   local logfile="$1"
   : > "$logfile"
   for i in $(seq 1 "$LOADERS"); do
-    ( while true; do
-        id=$(( (RANDOM * RANDOM) % ROWS + 1 ))
-        if MYSQL_P -e "UPDATE osctest.orders SET amount=amount+1 WHERE id=$id;" >/dev/null 2>&1; then
-          date +%s%3N >> "$logfile"
-        fi
-      done ) &
+    setsid bash -c '
+      while true; do
+        id=$(( (RANDOM * RANDOM) % '"$ROWS"' + 1 ))
+        echo "UPDATE osctest.orders SET amount=amount+1 WHERE id=$id; SELECT ROW_COUNT();"
+      done | mysql -h "'"$PRIMARY_HOST"'" -P "'"$PRIMARY_PORT"'" -uroot -p"'"$MYROOT_PW"'" --batch -N 2>/dev/null \
+        | while IFS= read -r _; do date +%s%3N >> "'"$logfile"'"; done
+    ' &
     EXP_PIDS="$EXP_PIDS $!"
   done
 }

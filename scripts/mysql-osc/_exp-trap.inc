@@ -20,7 +20,10 @@ GHOST_PID=""
 
 exp_kill_bg() {
   [ -z "$EXP_PIDS" ] && return 0
-  for pid in $EXP_PIDS; do kill "$pid" 2>/dev/null; done
+  # start_load() 는 이제 로더마다 setsid 로 별도 프로세스 그룹을 만든다 —
+  # `kill -- -$pid` 로 그 그룹 전체(생성기+mysql+리더)를 죽인다. 음수 PID
+  # 문법이라 일반 PID 에 그냥 kill 해도 되는 건 섞어 쓰면 안 된다.
+  for pid in $EXP_PIDS; do kill -- "-$pid" 2>/dev/null; done
   wait $EXP_PIDS 2>/dev/null
   EXP_PIDS=""
 }
@@ -44,8 +47,13 @@ exp_cleanup() {
   rm -f /tmp/gh-ost.*.sock /tmp/gh-ost.throttle 2>/dev/null
 }
 
+ON_ABORT_RUNNING=0
 on_abort() {
   [ "${LAB_DONE:-0}" = "1" ] && return 0
+  # 재진입 방지 — 신호가 겹쳐 들어와도(예: 과거의 kill 0 버그 같은 것) on_abort
+  # 가 자기 자신을 다시 부르는 연쇄를 막는다.
+  [ "${ON_ABORT_RUNNING:-0}" = "1" ] && return 0
+  ON_ABORT_RUNNING=1
   echo
   echo "  [중단] 배경 부하/프로브를 끄고 gh-ost 잔여 테이블·스로틀 파일을 치운다."
   echo "         (컨테이너는 그대로 둔다 — 지우려면 ./teardown.sh)"
