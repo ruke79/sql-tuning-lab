@@ -20,6 +20,7 @@
 #   REPLICA_DELAY=30 ./setup-topology.sh  # replica2 지연 초 (기본 30)
 #   FORCE=1 ./setup-topology.sh         # 이미 떠 있어도 지우고 다시
 #   INNODB_BUFFER_POOL=4G ./setup-topology.sh  # 버퍼풀 크기 (기본 512M — 샌드박스 기준)
+#   FSYNC_MODE=fast ./setup-topology.sh        # 커밋마다 fsync 끄기 (실험 전용, 기본 durable)
 set -uo pipefail
 cd "$(dirname "$0")"
 . ./lib.sh
@@ -33,6 +34,23 @@ SC="${SC:-/tmp/mysql-osc-scratch}"
 # 아무리 빨라도 "불필요하게 자주 두드리는" 비효율은 못 가린다. 호스트 RAM 에
 # 맞게 늘려서 재보라 — 예: `INNODB_BUFFER_POOL=4G ./setup-topology.sh`.
 INNODB_BUFFER_POOL="${INNODB_BUFFER_POOL:-512M}"
+
+# ⚠️ 버퍼풀을 16G 까지 올려도 처리량이 안 뛰는 사례가 실측됐다 — 모니터링
+# (monitor.sh)으로 보니 버퍼풀 히트율 100%·사용량 10%(남아돈다)인데도 처리량이
+# fsync/초와 거의 1:1로 붙어 다녔다. MySQL 기본값(`sync_binlog=1`,
+# `innodb_flush_log_at_trx_commit=1`)은 **커밋마다 fsync** 를 강제한다 — 디스크
+# 대역폭이 아니라 fsync 1회의 지연시간이 상한을 만든다. **실험용으로만**(크래시
+# 시 최근 커밋 유실 가능 — 운영에 쓰지 말 것) 이 둘을 끄고 재서 fsync 가 진짜
+# 병목인지 확인한다: `FSYNC_MODE=fast ./setup-topology.sh`.
+FSYNC_MODE="${FSYNC_MODE:-durable}"
+if [ "$FSYNC_MODE" = "fast" ]; then
+  FSYNC_CNF="sync_binlog=0
+innodb_flush_log_at_trx_commit=2"
+  echo "  [주의] FSYNC_MODE=fast — 커밋마다 fsync 를 안 한다. 실험 전용, 운영 설정 아님."
+else
+  FSYNC_CNF="sync_binlog=1
+innodb_flush_log_at_trx_commit=1"
+fi
 
 . ./_docker-trap.inc
 
@@ -55,6 +73,7 @@ binlog_format=ROW
 binlog_row_image=FULL
 mysql-native-password=ON
 innodb_buffer_pool_size=$INNODB_BUFFER_POOL
+$FSYNC_CNF
 EOF
 cat > "$SC/my-replica1.cnf" <<EOF
 [mysqld]
@@ -65,6 +84,7 @@ read_only=ON
 log-replica-updates=ON
 mysql-native-password=ON
 innodb_buffer_pool_size=$INNODB_BUFFER_POOL
+$FSYNC_CNF
 EOF
 cat > "$SC/my-replica2.cnf" <<EOF
 [mysqld]
@@ -75,6 +95,7 @@ read_only=ON
 log-replica-updates=ON
 mysql-native-password=ON
 innodb_buffer_pool_size=$INNODB_BUFFER_POOL
+$FSYNC_CNF
 EOF
 
 echo "── 컨테이너 3개 기동 ──"
