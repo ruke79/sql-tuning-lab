@@ -240,34 +240,23 @@ expand_contract_backfill() {
 }
 
 cutover_rename() {
-  # ⚠️ 그냥 BEGIN/RENAME/RENAME/COMMIT 으로 돌리면 ACCESS EXCLUSIVE 락을
-  # 요청한 뒤 "지금 도는 트랜잭션들이 끝날 때까지" 기다리는데, PostgreSQL 의
-  # 락 대기열은 FIFO 라 그 뒤에 도착하는 배경 UPDATE 들도 전부 이 요청 뒤에
-  # 줄을 선다(convoy) — 실측: 배치 크기와 무관하게 cutover 가 항상 ~1,034ms
-  # 로 고정돼 나왔다(gh-ost 의 6~11ms 대비 100배). gh-ost 는 짧은
-  # lock_timeout 을 걸고 실패하면 바로 물러났다가 재시도하는 방식으로 이
-  # 긴 대기 자체를 피한다 — 같은 전략을 여기도 넣는다: lock_timeout 을
-  # 짧게 주고, 그 안에 락을 못 따면 롤백하고 잠깐 쉬었다 다시 시도한다.
-  local lock_timeout_ms="${1:-50}" deadline_s="${2:-30}"
-  local deadline=$(( $(date +%s) + deadline_s )) attempt=0 out rc
-  while :; do
-    attempt=$((attempt+1))
-    out=$(PSQL_P -v ON_ERROR_STOP=1 -c "
-      SET lock_timeout = '${lock_timeout_ms}ms';
-      BEGIN;
-      ALTER TABLE orders RENAME COLUMN cust_id TO cust_id_old;
-      ALTER TABLE orders RENAME COLUMN cust_id_new TO cust_id;
-      COMMIT;
-    " 2>&1)
-    rc=$?
-    [ "$rc" -eq 0 ] && { echo "$out"; return 0; }
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "$out" >&2
-      echo "  [중단] cutover 가 ${deadline_s}초 안에 락을 못 땄다." >&2
-      return 1
-    fi
-    sleep 0.05
-  done
+  # ⚠️ 한때 여기 lock_timeout(50ms) + 재시도를 넣었다 — gh-ost 식 전략을
+  # 따라한 것이었는데, **실측해보니 역효과였다**: cutover 가 1,034ms 에서
+  # 29,236~29,780ms 로 약 29배 악화됐다. 이유: 배경 로더 4개가 끊김 없이
+  # 연속으로 UPDATE 를 쏘는 상황에서는 50ms 짜리 빈 틈이 거의 없어 거의
+  # 매번 실패했고, PostgreSQL 의 락 대기열은 FIFO 라 **실패해서 물러나는
+  # 시도조차 그 대기 중엔 뒤따라오는 새 UPDATE 들을 줄 세운다** — "짧게
+  # 수백 번 실패"의 누적 차단 시간이 "길게 한 번 기다림"보다 훨씬 커졌다.
+  # gh-ost 가 MySQL 에서 이 전략으로 성공하는 건 MySQL 의 cutover 메커니즘
+  # 자체가 다르기 때문이지, 이 재시도 패턴을 PostgreSQL 에 그대로 옮긴다고
+  # 똑같이 된다는 보장이 없었다 — 가설을 틀렸다고 실측으로 확인했으니
+  # 단순한 버전으로 되돌린다.
+  PSQL_P -c "
+    BEGIN;
+    ALTER TABLE orders RENAME COLUMN cust_id TO cust_id_old;
+    ALTER TABLE orders RENAME COLUMN cust_id_new TO cust_id;
+    COMMIT;
+  "
 }
 
 if want 3; then
