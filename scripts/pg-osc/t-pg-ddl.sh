@@ -130,6 +130,9 @@ restore_to_int() {
   PSQL_P -c "ALTER TABLE orders DROP COLUMN IF EXISTS cust_id_new, DROP COLUMN IF EXISTS cust_id_old;" >/dev/null 2>&1
   PSQL_P -c "DROP TRIGGER IF EXISTS cust_id_sync ON orders;" >/dev/null 2>&1
   PSQL_P -c "DROP FUNCTION IF EXISTS cust_id_sync_fn();" >/dev/null 2>&1
+  # §9 후속5 에서 autovacuum_enabled=false 로 꺼 두고 측정하므로, 다음 섹션이
+  # 그 설정을 물려받지 않도록 매번 기본값으로 되돌린다.
+  PSQL_P -c "ALTER TABLE orders RESET (autovacuum_enabled);" >/dev/null 2>&1
 }
 
 echo "현재 cust_id 타입: $(P "SELECT data_type FROM information_schema.columns WHERE table_name='orders' AND column_name='cust_id';")"
@@ -192,6 +195,15 @@ expand_contract_backfill() {
   # 바뀔 때마다 카운터가 새로 시작하므로). 벽시계 데드라인으로 재야 배치
   # 경계와 무관하게 정확하다.
   local deadline=$(( $(date +%s) + THROTTLE_TIMEOUT ))
+
+  # §9 후속5 실측: 대량 백필(수백만 행 UPDATE)은 dead tuple 을 autovacuum
+  # 임계치 너머로 쌓고, 그 autovacuum(VACUUM ANALYZE)이 cutover(RENAME)의
+  # AccessExclusiveLock 과 충돌해 ~1초(deadlock_timeout 기본값, autovacuum
+  # 이 자기 자신을 취소하기 전까지 다른 백엔드를 막는 체크 주기) 가까이
+  # 묶이는 게 cutover 가 매번 "약 1초"로 고정됐던 진짜 원인이었다(직접
+  # pg_locks 를 찍어서 확인했다 — watch-locks.sh). 백필 동안은 꺼 두고,
+  # cutover 가 끝난 뒤에 수동으로 켜고 돌린다.
+  PSQL_P -c "ALTER TABLE orders SET (autovacuum_enabled = false);" >> "$out" 2>&1
 
   PSQL_P -c "ALTER TABLE orders ADD COLUMN cust_id_new BIGINT;" >> "$out" 2>&1 || return 1
   PSQL_P -c "
@@ -281,6 +293,10 @@ for b in $BATCHES; do
   cutover_rename >> "$OUT" 2>&1
   CT1=$(date +%s%3N)
   T1=$(date +%s%3N)
+  # cutover 가 끝난 뒤에 autovacuum 을 다시 켜고 수동으로 한 번 돌린다 — 이건
+  # "마이그레이션이 끝났다고 볼 수 있는 시점" 이후의 뒷정리라 DUR/CUTGAP 측정
+  # 구간 밖에서 한다(실제 운영에서도 비동기로 해도 되는 일이다).
+  PSQL_P -c "ALTER TABLE orders RESET (autovacuum_enabled); VACUUM ANALYZE orders;" >> "$OUT" 2>&1
   sleep 1
   stop_load
   DUR=$(( T1 - T0 ))
@@ -320,7 +336,10 @@ DUR_CTRL=$(( T1 - T0 ))
 DONE_CTRL=$([ "$RC_CTRL" -eq 0 ] && echo 1 || echo 0)
 THROTTLE_LINES_CTRL=$(grep -c "\[쓰로틀\]" "$OUT" 2>/dev/null); THROTTLE_LINES_CTRL=${THROTTLE_LINES_CTRL:-0}
 echo "  대조군: ${DUR_CTRL}ms 소요, 완료=$([ "$DONE_CTRL" -ge 1 ] && echo 예 || echo 아니오), 실제 쓰로틀 ${THROTTLE_LINES_CTRL}줄"
-[ "$DONE_CTRL" = 1 ] && cutover_rename >/dev/null 2>&1
+if [ "$DONE_CTRL" = 1 ]; then
+  cutover_rename >/dev/null 2>&1
+  PSQL_P -c "ALTER TABLE orders RESET (autovacuum_enabled); VACUUM ANALYZE orders;" >/dev/null 2>&1
+fi
 restore_to_int
 
 echo
@@ -336,7 +355,10 @@ DUR_TREAT=$(( T1 - T0 ))
 DONE_TREAT=$([ "$RC_TREAT" -eq 0 ] && echo 1 || echo 0)
 THROTTLE_LINES_TREAT=$(grep -c "\[쓰로틀\]" "$OUT" 2>/dev/null); THROTTLE_LINES_TREAT=${THROTTLE_LINES_TREAT:-0}
 echo "  처치군: ${DUR_TREAT}ms 소요(타임아웃 ${THROTTLE_TIMEOUT}s 안에 $([ "$DONE_TREAT" -ge 1 ] && echo 완료 || echo 미완료)), 실제 쓰로틀 ${THROTTLE_LINES_TREAT}줄"
-[ "$DONE_TREAT" = 1 ] && cutover_rename >/dev/null 2>&1
+if [ "$DONE_TREAT" = 1 ]; then
+  cutover_rename >/dev/null 2>&1
+  PSQL_P -c "ALTER TABLE orders RESET (autovacuum_enabled); VACUUM ANALYZE orders;" >/dev/null 2>&1
+fi
 echo
 if [ "${THROTTLE_LINES_TREAT:-0}" -gt "${THROTTLE_LINES_CTRL:-0}" ] && [ "$DONE_TREAT" -lt 1 ]; then
   echo "  → 대조군은 완료됐고(쓰로틀 ${THROTTLE_LINES_CTRL}줄), 처치군은 ${THROTTLE_TIMEOUT}초 안에"
