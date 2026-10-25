@@ -148,12 +148,18 @@ ghost_run() {
   else
     "$GHOST_BIN" "$@" > "$out" 2>&1 &
   fi
-  local pid=$!
+  local pid=$! prev=""
+  # ⚠️ gh-ost 는 진행 상황을 1초~30초 간격으로 불규칙하게 기록한다(실측: 초반
+  # 1초, 몇 분 뒤 30초 간격으로 늦춰졌다). 15초마다 폴링하면 같은 줄을 두 번
+  # 찍는 경우가 흔하다 — 직전에 찍은 줄과 같으면 건너뛴다.
   while kill -0 "$pid" 2>/dev/null; do
     sleep 15
     kill -0 "$pid" 2>/dev/null || break
     local last; last=$(grep "^Copy:" "$out" 2>/dev/null | tail -1)
-    [ -n "$last" ] && echo "    [진행] $last"
+    if [ -n "$last" ] && [ "$last" != "$prev" ]; then
+      echo "    [진행] $last"
+      prev="$last"
+    fi
   done
   wait "$pid"
 }
