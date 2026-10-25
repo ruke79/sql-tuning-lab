@@ -47,17 +47,43 @@ if [ "${NUP:-0}" -lt 3 ]; then
   exit 1
 fi
 
-PRIMARY_IP=$(osc_ip osc-primary)
-REPLICA1_IP=$(osc_ip osc-replica1)
-REPLICA2_IP=$(osc_ip osc-replica2)
+# ⚠️ 배경 부하(호스트의 mysql 클라이언트)와 gh-ost(호스트 바이너리)는 컨테이너
+# **브리지 IP 에 직접** 접속하면 Linux 도커 호스트에서만 되고, Docker Desktop
+# (macOS/Windows)은 호스트→브리지 라우팅이 안 돼 전부 "접속 실패"로 멈춘다
+# (실측: 다른 머신에서 이걸로 "0 writes/s" 만 보이고 원인이 전혀 안 드러났다 —
+# MYSQL_P 의 `2>/dev/null` 가 진짜 에러를 삼켰다). setup-topology.sh 가 공개한
+# 127.0.0.1 포트(primary=3307, replica1=3308, replica2=3309)로 접속한다 —
+# 플랫폼과 무관하게 동작한다.
+PRIMARY_HOST=127.0.0.1; PRIMARY_PORT=3307
+REPLICA1_HOST=127.0.0.1; REPLICA1_PORT=3308
+REPLICA2_HOST=127.0.0.1; REPLICA2_PORT=3309
+
+# ⚠️ 전제 점검 — 10,000,000행을 다 적재한 **뒤** 실험 단계에서 막히면 낭비가 크다.
+# 호스트에 mysql 클라이언트가 있는지, 공개된 포트로 실제로 접속되는지 여기서 먼저
+# 확인하고, 실패하면 진짜 에러 메시지를 그대로 보여준다("0 writes/s"가 아니라).
+if ! command -v mysql >/dev/null 2>&1; then
+  echo "  [중단] 호스트에 mysql 클라이언트가 없다 — 배경 부하/gh-ost 접속에 필요하다."
+  exit 1
+fi
+if ! PREFLIGHT=$(mysql -h "$PRIMARY_HOST" -P "$PRIMARY_PORT" -uroot -p"$MYROOT_PW" -e "SELECT 1" 2>&1); then
+  echo "  [중단] primary(${PRIMARY_HOST}:${PRIMARY_PORT}) 접속 실패 — 실제 에러:"
+  echo "$PREFLIGHT" | sed 's/^/    /'
+  echo "         setup-topology.sh 를 최신판으로 다시 돌렸는지 확인하라(포트 공개 포함)."
+  exit 1
+fi
+
 ROWS=$(P "SELECT count(*) FROM osctest.orders" | tail -1)
 case "$ROWS" in ''|*[!0-9]*) echo "  [중단] osctest.orders 를 못 읽었다."; exit 1;; esac
 echo "§X-2 무정지 스키마 변경 — INT→BIGINT, 네이티브 vs gh-ost"
-echo "  토폴로지: primary($PRIMARY_IP) + replica1 정상($REPLICA1_IP) + replica2 지연($REPLICA2_IP)"
+echo "  토폴로지: primary(${PRIMARY_HOST}:${PRIMARY_PORT}) + replica1 정상(${REPLICA1_HOST}:${REPLICA1_PORT}) + replica2 지연(${REPLICA2_HOST}:${REPLICA2_PORT})"
 echo "  osctest.orders ${ROWS}행"
 echo
 
-MYSQL_P() { mysql -h "$PRIMARY_IP" -P 3306 -uroot -p"$MYROOT_PW" "$@" 2>/dev/null; }
+# ⚠️ 여기서도 에러를 삼키지 않는다 — 실패하면 호출부가 "0 writes/s"로만 보고,
+# 그게 바로 위 전제 점검을 추가하기 전까지 원인을 숨겼던 지점이다. 전제 점검을
+# 통과했으면 이후 실패는 진짜 일시적 문제이므로 조용히 넘기는 게 맞지만, 디버깅이
+# 필요하면 이 함수에서 2>&1 로 바꿔서 직접 보라.
+MYSQL_P() { mysql -h "$PRIMARY_HOST" -P "$PRIMARY_PORT" -uroot -p"$MYROOT_PW" "$@" 2>/dev/null; }
 
 # ══════════════════════════════════════════════════════════════════════
 # 배경 쓰기 부하 — $LOADERS 개의 독립 연결이 무작위 id 에 단건 UPDATE 를 반복한다.
@@ -111,6 +137,11 @@ max_gap_ms() {
     END { print max+0 }'
 }
 
+# ⚠️ gh-ost 는 접속에 쓴 포트(--port, 여기선 공개 포트 3307/3308/3309)와 서버가
+# `SELECT @@global.port` 로 응답하는 포트(컨테이너 내부 기준 3306 — 포트 매핑을
+# 모른다)가 다르면 "unexpected database port reported" 로 바로 죽는다(NAT/포트
+# 매핑을 쓰는 모든 구성에서 재현되는 gh-ost 고유 안전장치). gh-ost 자체에
+# `--skip-port-validation` 플래그가 있다 — 이 구성(포트 매핑)에서는 필수다.
 ensure_ghost() {
   [ -x "$GHOST_BIN" ] && return 0
   echo "  gh-ost 바이너리가 없다 — 소스에서 빌드한다(최초 1회, ~1분)."
@@ -189,11 +220,11 @@ for ch in $CHUNKS; do
   OUT="$PROBEDIR/ghost_$ch.out"
   T0=$(date +%s%3N)
   "$GHOST_BIN" \
-    --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
+    --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
     --database=osctest --table=orders \
     --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
     --chunk-size="$ch" \
-    --allow-on-master --initially-drop-ghost-table --initially-drop-old-table \
+    --allow-on-master --skip-port-validation --initially-drop-ghost-table --initially-drop-old-table \
     --execute > "$OUT" 2>&1
   RC=$?
   T1=$(date +%s%3N)
@@ -234,10 +265,10 @@ rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
 timeout 450 "$GHOST_BIN" \
-  --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
+  --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
-  --throttle-control-replicas="${REPLICA1_IP}:3306" --max-lag-millis=500 \
-  --allow-on-master --initially-drop-ghost-table --initially-drop-old-table \
+  --throttle-control-replicas="${REPLICA1_HOST}:${REPLICA1_PORT}" --max-lag-millis=500 \
+  --allow-on-master --skip-port-validation --initially-drop-ghost-table --initially-drop-old-table \
   --execute > "$PROBEDIR/throttle_ctrl.out" 2>&1
 RC_CTRL=$?
 T1=$(date +%s%3N)
@@ -261,10 +292,10 @@ rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
 timeout 450 "$GHOST_BIN" \
-  --host="$PRIMARY_IP" --port=3306 --user=ghost --password=ghostpass \
+  --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
-  --throttle-control-replicas="${REPLICA2_IP}:3306" --max-lag-millis=500 \
-  --allow-on-master --initially-drop-ghost-table --initially-drop-old-table \
+  --throttle-control-replicas="${REPLICA2_HOST}:${REPLICA2_PORT}" --max-lag-millis=500 \
+  --allow-on-master --skip-port-validation --initially-drop-ghost-table --initially-drop-old-table \
   --execute > "$PROBEDIR/throttle_treat.out" 2>&1
 RC_TREAT=$?
 T1=$(date +%s%3N)

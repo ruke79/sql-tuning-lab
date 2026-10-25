@@ -72,9 +72,15 @@ EOF
 
 echo "── 컨테이너 3개 기동 ──"
 docker network create "$OSC_NET" >/dev/null
-docker run -d --name osc-primary  --network "$OSC_NET" -v "$SC/my-primary.cnf:/etc/mysql/conf.d/custom.cnf"  -e MYSQL_ROOT_PASSWORD="$MYROOT_PW" mysql:8.4 >/dev/null
-docker run -d --name osc-replica1 --network "$OSC_NET" -v "$SC/my-replica1.cnf:/etc/mysql/conf.d/custom.cnf" -e MYSQL_ROOT_PASSWORD="$MYROOT_PW" mysql:8.4 >/dev/null
-docker run -d --name osc-replica2 --network "$OSC_NET" -v "$SC/my-replica2.cnf:/etc/mysql/conf.d/custom.cnf" -e MYSQL_ROOT_PASSWORD="$MYROOT_PW" mysql:8.4 >/dev/null
+# ⚠️ 포트를 공개한다(-p). t-online-ddl.sh 의 배경 부하(호스트의 mysql 클라이언트)와
+# gh-ost(호스트에서 도는 바이너리) 는 컨테이너의 **브리지 IP 에 직접** 접속해야 하는데,
+# 이건 Linux 도커 호스트에서만 되고 Docker Desktop(macOS/Windows) 에서는 호스트가
+# 브리지 네트워크 IP 로 라우팅이 안 된다(실측: 다른 머신에서 전부 "0 writes/s" 로
+# 조용히 멈췄다 — MYSQL_P 의 `2>/dev/null` 가 진짜 원인[연결 실패]을 삼켜 증상만
+# 보였다). 포트를 공개해 127.0.0.1 로 접속하면 플랫폼과 무관하게 동작한다.
+docker run -d --name osc-primary  --network "$OSC_NET" -p 127.0.0.1:3307:3306 -v "$SC/my-primary.cnf:/etc/mysql/conf.d/custom.cnf"  -e MYSQL_ROOT_PASSWORD="$MYROOT_PW" mysql:8.4 >/dev/null
+docker run -d --name osc-replica1 --network "$OSC_NET" -p 127.0.0.1:3308:3306 -v "$SC/my-replica1.cnf:/etc/mysql/conf.d/custom.cnf" -e MYSQL_ROOT_PASSWORD="$MYROOT_PW" mysql:8.4 >/dev/null
+docker run -d --name osc-replica2 --network "$OSC_NET" -p 127.0.0.1:3309:3306 -v "$SC/my-replica2.cnf:/etc/mysql/conf.d/custom.cnf" -e MYSQL_ROOT_PASSWORD="$MYROOT_PW" mysql:8.4 >/dev/null
 
 for c in osc-primary osc-replica1 osc-replica2; do
   wait_container_ready "$c" || exit 1
