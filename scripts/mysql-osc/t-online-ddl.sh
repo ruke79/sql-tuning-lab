@@ -31,7 +31,7 @@ ONLY="${ONLY:-1234}"
 want() { case "$ONLY" in *"$1"*) return 0;; *) return 1;; esac; }
 CHUNKS="${CHUNKS:-100 1000 10000}"
 LOADERS="${LOADERS:-4}"
-SC="${SC:-/tmp/claude-0/-home-user-db-modeling/d3dd1f58-4266-5bdf-acd9-a25044e15fc4/scratchpad}"
+SC="${SC:-/tmp/mysql-osc-scratch}"
 GHOST_BIN="$SC/gh-ost"
 PROBEDIR="$SC/osc-probe"
 mkdir -p "$PROBEDIR"
@@ -129,6 +129,28 @@ verify_load_running() {
   return 1
 }
 
+# ⚠️ gh-ost 는 10M 행 chunk=100 이면 15분 넘게 걸리는데, 그동안 화면엔 아무것도
+# 안 찍힌다(진행률은 $OUT 파일로만 간다) — "멈췄나?"를 사람이 로그 파일을 직접
+# 열어야만 답할 수 있는 상태였다(실측: 다른 머신에서 2시간째 응답이 없어 보여
+# 문의가 왔다 — 실제로는 느린 것뿐이었는지, 멈춘 것인지 화면만 보고는 알 수 없는
+# 설계였다). gh-ost 를 백그라운드로 띄우고 15초마다 그 진행률 줄을 그대로 중계한다.
+ghost_run() {
+  local tmo="$1" out="$2"; shift 2
+  if [ "$tmo" -gt 0 ] 2>/dev/null; then
+    timeout "$tmo" "$GHOST_BIN" "$@" > "$out" 2>&1 &
+  else
+    "$GHOST_BIN" "$@" > "$out" 2>&1 &
+  fi
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 15
+    kill -0 "$pid" 2>/dev/null || break
+    local last; last=$(grep "^Copy:" "$out" 2>/dev/null | tail -1)
+    [ -n "$last" ] && echo "    [진행] $last"
+  done
+  wait "$pid"
+}
+
 # 로그 파일에서 "가장 긴 연속 공백"을 ms 로 뽑는다 — COPY/cutover 의 블로킹 시간.
 max_gap_ms() {
   sort -n "$1" | awk '
@@ -219,13 +241,13 @@ for ch in $CHUNKS; do
   verify_load_running "$LOG" || { stop_load; continue; }
   OUT="$PROBEDIR/ghost_$ch.out"
   T0=$(date +%s%3N)
-  "$GHOST_BIN" \
+  ghost_run 0 "$OUT" \
     --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
     --database=osctest --table=orders \
     --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
     --chunk-size="$ch" \
     --allow-on-master --skip-port-validation --initially-drop-ghost-table --initially-drop-old-table \
-    --execute > "$OUT" 2>&1
+    --execute
   RC=$?
   T1=$(date +%s%3N)
   sleep 1
@@ -264,12 +286,12 @@ LOG="$PROBEDIR/throttle_ctrl.log"
 rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-timeout 450 "$GHOST_BIN" \
+ghost_run 450 "$PROBEDIR/throttle_ctrl.out" \
   --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA1_HOST}:${REPLICA1_PORT}" --max-lag-millis=500 \
   --allow-on-master --skip-port-validation --initially-drop-ghost-table --initially-drop-old-table \
-  --execute > "$PROBEDIR/throttle_ctrl.out" 2>&1
+  --execute
 RC_CTRL=$?
 T1=$(date +%s%3N)
 stop_load
@@ -291,12 +313,12 @@ LOG="$PROBEDIR/throttle_treat.log"
 rm -f /tmp/gh-ost.*.sock
 start_load "$LOG"; verify_load_running "$LOG" || { stop_load; exit 1; }
 T0=$(date +%s%3N)
-timeout 450 "$GHOST_BIN" \
+ghost_run 450 "$PROBEDIR/throttle_treat.out" \
   --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
   --database=osctest --table=orders --alter="MODIFY COLUMN cust_id BIGINT NOT NULL" \
   --throttle-control-replicas="${REPLICA2_HOST}:${REPLICA2_PORT}" --max-lag-millis=500 \
   --allow-on-master --skip-port-validation --initially-drop-ghost-table --initially-drop-old-table \
-  --execute > "$PROBEDIR/throttle_treat.out" 2>&1
+  --execute
 RC_TREAT=$?
 T1=$(date +%s%3N)
 stop_load

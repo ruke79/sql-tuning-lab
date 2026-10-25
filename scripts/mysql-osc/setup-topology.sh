@@ -25,7 +25,7 @@ cd "$(dirname "$0")"
 
 ROWS="${ROWS:-10000000}"
 REPLICA_DELAY="${REPLICA_DELAY:-30}"
-SC="${SC:-/tmp/claude-0/-home-user-db-modeling/d3dd1f58-4266-5bdf-acd9-a25044e15fc4/scratchpad}"
+SC="${SC:-/tmp/mysql-osc-scratch}"
 
 . ./_docker-trap.inc
 
@@ -209,8 +209,17 @@ actual=$(P "SELECT count(*) FROM osctest.orders" | tail -1)
 echo "  적재 완료: ${actual}행"
 
 wait_replica_caught_up "replica1" R1
-rep1=$(R1 "SELECT count(*) FROM osctest.orders" | tail -1)
+# ⚠️ `Seconds_Behind_Source=0` 는 초 단위 타임스탬프 비교라 "따라잡았다"고 말해도
+# 바로 앞의 트랜잭션(이 DELETE)이 아직 안 적용된 순간이 있을 수 있다(실측: IO/SQL=Yes,
+# lag=0 인데 그 직후 읽은 행 수가 트리밍 전 값 그대로였다 — 몇 초 뒤엔 맞았다).
+# 행 수를 직접 비교해 재시도한다 — 간접 신호(lag)가 아니라 실제 상태로 확인한다.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  rep1=$(R1 "SELECT count(*) FROM osctest.orders" | tail -1)
+  [ "$rep1" = "$actual" ] && break
+  sleep 1
+done
 echo "  replica1 복제 확인: ${rep1}행"
+[ "$rep1" != "$actual" ] && echo "  [경고] primary(${actual})와 replica1(${rep1}) 행 수가 10초 뒤에도 다르다."
 
 LAB_DONE=1
 echo
