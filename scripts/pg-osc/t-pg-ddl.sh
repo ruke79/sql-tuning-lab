@@ -271,6 +271,45 @@ cutover_rename() {
   "
 }
 
+# ── 연결 재사용 cutover (§X-3 "잔차" 진단 이후 추가) ──────────────────────
+# cutover_rename() 은 매번 새 psql 프로세스로 TCP+인증을 처음부터 다시 맺는다
+# — 로컬 재현(도커 없는 환경, 2,000,000행)으로 분리 재 보니 배경 부하가 있어도
+# 같은 연결 안에서의 ACCESS EXCLUSIVE 락 대기는 1ms 미만이고, 관측된
+# 44~87ms(10M행)의 거의 전부가 "매번 새 연결을 맺는 비용"이었다. gh-ost 는
+# 백필 내내 열어 둔 MySQL 연결 하나를 cutover 까지 그대로 쓴다 — 그 모양을
+# 그대로 흉내낸다: 백필이 끝나는 시점에 연결을 미리 열어 두고(CT0 측정 전),
+# 그 위에서 cutover 만 실행한다(bash coproc 로 psql 를 대화형으로 띄워 둔다).
+open_cutover_conn() {
+  coproc CUTCONN { PGPASSWORD="$PGPASS" psql -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U postgres -d pgosctest -v ON_ERROR_STOP=1 -Atq; }
+  CUTCONN_IN=${CUTCONN[1]}
+  CUTCONN_OUT=${CUTCONN[0]}
+  # ⚠️ coproc 는 포크만 하고 즉시 돌아온다 — TCP+인증이 끝나기 전에 CT0 를
+  # 찍으면 그 연결 수립 시간이 그대로 측정 구간에 섞여 들어가 "연결 재사용"의
+  # 의미가 없어진다(실측: 이 대기를 빼먹고 처음 쟀을 때 57~85ms로 수정 전과
+  # 다를 바 없이 나왔다). 연결이 실제로 응답할 때까지 기다린 뒤에야 CT0 를
+  # 찍어야 한다.
+  echo "SELECT 'ready';" >&"$CUTCONN_IN"
+  while IFS= read -r line <&"$CUTCONN_OUT"; do [ "$line" = "ready" ] && break; done
+}
+close_cutover_conn() {
+  echo '\q' >&"$CUTCONN_IN" 2>/dev/null
+  exec {CUTCONN_IN}>&- 2>/dev/null
+  wait "$CUTCONN_PID" 2>/dev/null
+}
+cutover_rename_reuse() {
+  local marker="__pgosc_cutover_done_$$__"
+  {
+    echo "BEGIN;"
+    echo "ALTER TABLE orders RENAME COLUMN cust_id TO cust_id_old;"
+    echo "ALTER TABLE orders RENAME COLUMN cust_id_new TO cust_id;"
+    echo "COMMIT;"
+    echo "SELECT '$marker';"
+  } >&"$CUTCONN_IN"
+  while IFS= read -r line <&"$CUTCONN_OUT"; do
+    [ "$line" = "$marker" ] && break
+  done
+}
+
 if want 3; then
 echo "── ③ 수동 expand-contract — 배치 크기별 백필 처리량과 cutover 블로킹 ──"
 printf "  %-10s %12s %16s %16s\n" "배치" "소요(초)" "cutover블록(ms)" "백필 행/초(추정)"
@@ -289,9 +328,11 @@ for b in $BATCHES; do
     stop_load
     continue
   fi
+  open_cutover_conn
   CT0=$(date +%s%3N)
-  cutover_rename >> "$OUT" 2>&1
+  cutover_rename_reuse
   CT1=$(date +%s%3N)
+  close_cutover_conn
   T1=$(date +%s%3N)
   # cutover 가 끝난 뒤에 autovacuum 을 다시 켜고 수동으로 한 번 돌린다 — 이건
   # "마이그레이션이 끝났다고 볼 수 있는 시점" 이후의 뒷정리라 DUR/CUTGAP 측정
