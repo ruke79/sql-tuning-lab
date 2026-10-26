@@ -884,7 +884,7 @@ graph TD
         s_osc["scripts/mysql-osc/<br/>setup-topology · t-online-ddl · teardown<br/>(무정지 스키마 변경, §X-2)"]
     end
 
-    docs["docs/2003-오라일리-튜닝북-실습-매핑.md<br/>docs/작업-인계노트.md"]
+    docs["docs/2003-오라일리-튜닝북-실습-매핑.md"]
 
     tpch -. "schema/load/index" .-> pg
     tpch -. "schema/load/index" .-> my
