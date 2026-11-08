@@ -116,17 +116,31 @@ MYSQL_P() { mysql -h "$PRIMARY_HOST" -P "$PRIMARY_PORT" -uroot -p"$MYROOT_PW" "$
 # 쏘고… 가 무한 반복됐다(실측: "[중단]..." 이 수백 줄 찍히며 멈추지 않았다).
 # `setsid` 로 로더마다 **별도 프로세스 그룹**을 만들어 메인 스크립트와
 # 완전히 분리한다 — `kill -- -$pid` 로 그 로더의 그룹만 안전하게 죽인다.
+# ⚠️ ★치명적 버그, 실측으로 발견★ — 위 "생성기 | mysql --batch | while read"
+# 구조는 **mysql 클라이언트가 피드백을 statement 마다 flush 하지 않는다는
+# 것**을 놓쳤다. mysql 클라이언트는 stdin 이 파이프(절대 EOF 가 안 옴)일 때
+# 결과를 즉시 흘리지 않고 내부 버퍼에 쌓아 두다가, 버퍼가 차거나 프로세스가
+# 끝날 때에야 한꺼번에 뱉는다 — 그 사이에 실제로 몇백 ms 가 막혀 있었어도
+# 로그엔 "거의 동시에 여러 줄"로 찍혀서 공백이 안 보인다. 실측(로컬
+# RENAME TABLE 원자적 cutover, 2M행, 이 구조 그대로): cutover 가 실제로는
+# 16~124ms 걸렸는데 이 로더로는 **매번 "최대 공백 0ms"** 로 나왔다 — 완전히
+# 숨겨진 것이다. 그런데 ③의 "cutover 블록(ms)" 열이 바로 이 max_gap_ms() 로
+# 뽑은 값이다 — gh-ost cutover 수치(X-2, 6~12ms)가 이 버그에 그대로 노출돼
+# 있었다는 뜻이다(재검증 필요 — "§X-2 cutover 재검증" 참조).
+#
+# 고친 방법: 매 statement 마다 **결과를 실제로 읽어서 확인한 뒤에야** 다음
+# statement 를 보낸다(bash coproc 로 연결을 열어 둔다) — 한 번에 하나만
+# "비행 중"이게 강제하면 배치로 묶일 수가 없다. mysql 클라이언트는 이 방식
+# (연결이 안 끊기는 상태)에서 `stdout` 을 전혀 flush 안 해서(실측: 5초를
+# 기다려도 응답이 안 왔다) `stdout -oL` 로 강제 라인버퍼링을 걸어야 한다
+# (psql 은 이 문제가 없었다 — MySQL 클라이언트만의 특성이다).
 start_load() {
   local logfile="$1"
   : > "$logfile"
   for i in $(seq 1 "$LOADERS"); do
-    setsid bash -c '
-      while true; do
-        id=$(( (RANDOM * RANDOM) % '"$ROWS"' + 1 ))
-        echo "UPDATE osctest.orders SET amount=amount+1 WHERE id=$id; SELECT ROW_COUNT();"
-      done | mysql -h "'"$PRIMARY_HOST"'" -P "'"$PRIMARY_PORT"'" -uroot -p"'"$MYROOT_PW"'" --batch -N 2>/dev/null \
-        | while IFS= read -r _; do date +%s%3N >> "'"$logfile"'"; done
-    ' &
+    LOADER_ROWS="$ROWS" LOADER_HOST="$PRIMARY_HOST" LOADER_PORT="$PRIMARY_PORT" \
+    LOADER_PW="$MYROOT_PW" LOADER_IDX="$i" LOADER_LOG="$logfile" \
+    setsid "$(dirname "$0")/_loader-body.sh" &
     EXP_PIDS="$EXP_PIDS $!"
   done
 }

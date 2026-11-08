@@ -76,23 +76,29 @@ PSQL_P() { PGPASSWORD="$PGPASS" psql -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U po
 # 배경 쓰기 부하 — MySQL 판(§9)에서 "UPDATE 한 건마다 새 연결"이 처리량을
 # 50~130/초로 깔아뭉갠 걸 실측으로 잡았다(연결당 새 TCP+인증 오버헤드가
 # 실제 부하보다 커짐). 처음부터 로더당 연결 하나를 열어 재사용한다.
-# ⚠️ psql 의 `-q`(quiet) 는 "UPDATE 1" 같은 커맨드 태그 출력 자체를 지운다
-# (MySQL 의 --batch 와 다르다 — 거기선 그 출력이 남는다). `-q` 를 쓰면 완료
-# 신호로 삼을 게 아무것도 안 나와서 로그가 영원히 0줄이다(실측: 처음 이렇게
-# 짜서 "배경 부하 확인: 0 writes/s" 로 매번 막혔다 — 연결 자체는 멀쩡했다).
+#
+# ⚠️ ★치명적 버그, 실측으로 발견★(§X-5, 온라인 인덱스 실험을 준비하며
+# 발견) — 과거 버전은 "생성기 | psql | while read" 구조였다. 이건
+# **psql/mysql 클라이언트가 입력이 처리 속도보다 빠르면 아직 안 실행된
+# 여러 statement 를 한 번에 서버로 보내고, 그 결과도 전부 끝난 뒤에야
+# 한꺼번에 뱉는다**는 걸 놓쳤다 — 그 사이 실제로 수백 ms 가 막혀 있어도
+# 로그엔 "거의 동시에 여러 줄"로 찍혀서 공백이 사라진다. 로컬 재현(2M행,
+# MySQL RENAME TABLE 로 가짜 cutover): 실제로는 16~124ms 막혔는데 이
+# 구조로는 매번 "최대 공백 0ms"로 나왔다 — **완전히 숨겨졌다**. §X-3/§X-2의
+# "cutover 블록(ms)"/"쓰기 로그 최대 공백" 열이 전부 이 max_gap_ms() 로
+# 뽑은 값이라, 그동안의 그 수치들(특히 gh-ost 6~11ms, PG CREATE INDEX
+# 수 ms)이 이 버그에 노출돼 있었다 — 재검증이 필요하다.
+#
+# 고친 방법: 매 statement 마다 결과를 실제로 읽어서 확인한 뒤에야 다음
+# statement 를 보낸다(`_loader-body.sh`, bash coproc) — 한 번에 하나만
+# "비행 중"이게 강제하면 배치로 묶일 수가 없다.
 start_load() {
   local logfile="$1"
   : > "$logfile"
   for i in $(seq 1 "$LOADERS"); do
-    setsid bash -c '
-      while true; do
-        id=$(( (RANDOM * RANDOM) % '"$ROWS"' + 1 ))
-        echo "UPDATE orders SET amount=amount+1 WHERE id=$id;"
-      done | PGPASSWORD="'"$PGPASS"'" psql -h "'"$PRIMARY_HOST"'" -p "'"$PRIMARY_PORT"'" -U postgres -d pgosctest -v ON_ERROR_STOP=0 -At 2>/dev/null \
-        | while IFS= read -r line; do
-            case "$line" in UPDATE*) date +%s%3N >> "'"$logfile"'";; esac
-          done
-    ' &
+    LOADER_ROWS="$ROWS" LOADER_HOST="$PRIMARY_HOST" LOADER_PORT="$PRIMARY_PORT" \
+    LOADER_PW="$PGPASS" LOADER_IDX="$i" LOADER_LOG="$logfile" \
+    setsid "$(dirname "$0")/_loader-body.sh" &
     EXP_PIDS="$EXP_PIDS $!"
   done
 }
