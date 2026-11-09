@@ -17,7 +17,10 @@ ROWS="${ROWS:-10000000}"
 
 existing=$(idx_container_count)
 if [ "${existing:-0}" -ge 1 ] && [ "${FORCE:-0}" != "1" ]; then
-  echo "  이미 떠 있다 — 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
+  # ⚠️ "있다"(docker ps -a)와 "떠서 돈다"는 다른 상태다 — 켜고 쓴다.
+  echo "  이미 있다 — 멈춰 있으면 켜고 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
+  docker start idx-pg >/dev/null 2>&1
+  wait_container_ready idx-pg || exit 1
   cnt=$(P "SELECT count(*) FROM orders;" 2>/dev/null)
   echo "  orders 행 수: ${cnt:-?}"
   LAB_DONE=1

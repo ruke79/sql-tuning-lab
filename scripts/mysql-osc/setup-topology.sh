@@ -56,7 +56,13 @@ fi
 
 existing=$(osc_container_count)
 if [ "${existing:-0}" -ge 3 ] && [ "${FORCE:-0}" != "1" ]; then
-  echo "  이미 ${existing}개 떠 있다 — 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
+  # ⚠️ 여기서 세는 건 `docker ps -a`(꺼져 있는 것도 포함)다 — 컨테이너가
+  # "있다"와 "떠서 돈다"는 다른 상태다(실측: 컨테이너는 있는데 멈춰 있어서
+  # 바로 뒤의 P() 가 "container ... is not running" 에러를 냈다). 재사용하기
+  # 전에 멈춰 있으면 먼저 켠다 — `docker start`는 이미 돈다면 그냥 no-op다.
+  echo "  이미 ${existing}개 있다 — 멈춰 있으면 켜고 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
+  docker start osc-primary osc-replica1 osc-replica2 >/dev/null 2>&1
+  wait_container_ready osc-primary || exit 1
   cnt=$(P "SELECT count(*) FROM osctest.orders" 2>/dev/null | tail -1)
   echo "  osctest.orders 행 수: ${cnt:-?}"
   LAB_DONE=1
