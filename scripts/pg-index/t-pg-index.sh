@@ -50,7 +50,7 @@ start_load() {
   for i in $(seq 1 "$LOADERS"); do
     LOADER_ROWS="$ROWS" LOADER_HOST="$PRIMARY_HOST" LOADER_PORT="$PRIMARY_PORT" \
     LOADER_PW="$PGPASS" LOADER_IDX="$i" LOADER_LOG="$logfile" \
-    setsid "$(dirname "$0")/_loader-body.sh" &
+    setsid ./_loader-body.sh &
     EXP_PIDS="$EXP_PIDS $!"
   done
 }
