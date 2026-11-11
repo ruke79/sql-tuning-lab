@@ -292,6 +292,12 @@ for ch in $CHUNKS; do
   start_load "$LOG"
   verify_load_running "$LOG" || { stop_load; continue; }
   OUT="$PROBEDIR/ghost_$ch.out"
+  # ⚠️ ④에서 실측으로 찾은 함정(강제종료된 gh-ost가 /tmp/gh-ost.*.sock을 못
+  # 지워 다음 실행이 "bind: address already in use"로 즉사)이 여기 ③ 청크
+  # 루프엔 적용이 안 돼 있었다 — chunk=100이 이전 실행의 잔여 소켓 때문에
+  # 즉시 죽고, 그 자신도 정상 종료가 아니라 똑같이 소켓을 못 지워서 chunk=1000,
+  # chunk=10000까지 연쇄로 실패했다(실측 보고). 매 청크 실행 직전에 지운다.
+  rm -f /tmp/gh-ost.*.sock
   T0=$(date +%s%3N)
   ghost_run 0 "$OUT" \
     --host="$PRIMARY_HOST" --port="$PRIMARY_PORT" --user=ghost --password=ghostpass \
