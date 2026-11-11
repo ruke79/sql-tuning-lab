@@ -53,7 +53,15 @@ if [ "${existing:-0}" -ge 3 ] && [ "${FORCE:-0}" != "1" ]; then
   # 겪었다 — 멈춰 있는데 바로 쿼리해서 "is not running" 에러) — 켜고 쓴다.
   echo "  이미 ${existing}개 있다 — 멈춰 있으면 켜고 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
   docker start $PG_CONTAINERS >/dev/null 2>&1
-  wait_container_ready pg-primary || exit 1
+  # ⚠️★사고 실측(mysql-osc 에서)★ — 여기서 wait 가 실패하면 trap(on_abort)이
+  # "중단"으로 간주해 **이미 있던 데이터를 통째로 지웠다**. 재사용 경로에서는
+  # 느려도 데이터를 지우면 안 된다 — trap 을 먼저 끄고 안내만 하고 나간다.
+  if ! wait_container_ready pg-primary; then
+    trap - EXIT INT TERM
+    echo "  [중단] 대량 데이터 복구가 느릴 수 있다 — 데이터는 그대로 뒀다(지우지 않음)."
+    echo "         docker logs pg-primary 로 진행 상황을 보고, 좀 더 기다린 뒤 이 스크립트를 다시 돌려라."
+    exit 1
+  fi
   cnt=$(P "SELECT count(*) FROM orders" 2>/dev/null)
   echo "  orders 행 수: ${cnt:-?}"
   LAB_DONE=1

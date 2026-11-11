@@ -22,7 +22,14 @@ if [ "${existing:-0}" -ge 1 ] && [ "${FORCE:-0}" != "1" ]; then
   # 실측으로 겪었다 — 멈춰 있는데 바로 쿼리해서 "is not running" 에러) — 켜고 쓴다.
   echo "  이미 있다 — 멈춰 있으면 켜고 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
   docker start idx-mysql >/dev/null 2>&1
-  wait_container_ready idx-mysql || exit 1
+  # ⚠️★사고 실측(mysql-osc 에서)★ — wait 실패를 "중단"으로 trap 이 처리하면
+  # **이미 있던 데이터를 지운다**. 재사용 경로에서는 지우면 안 된다.
+  if ! wait_container_ready idx-mysql; then
+    trap - EXIT INT TERM
+    echo "  [중단] 복구가 느릴 수 있다 — 데이터는 그대로 뒀다(지우지 않음)."
+    echo "         docker logs idx-mysql 로 보고, 좀 더 기다린 뒤 다시 돌려라."
+    exit 1
+  fi
   cnt=$(P "SELECT count(*) FROM idxtest.orders" 2>/dev/null | tail -1)
   echo "  idxtest.orders 행 수: ${cnt:-?}"
   LAB_DONE=1

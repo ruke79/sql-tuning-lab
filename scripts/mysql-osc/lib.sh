@@ -33,11 +33,19 @@ wait_container_ready() {
     [ "$(docker logs "$c" 2>&1 | grep -c 'ready for connections')" -ge 2 ] && break
     sleep 1
   done
-  for i in $(seq 1 20); do
+  # ⚠️ 위의 "두 번" 조건은 **첫 초기화**(임시 서버 → 재기동)에만 해당한다 —
+  # 이미 초기화된 데이터 디렉터리를 `docker start` 로 재기동할 때는 그 춤을
+  # 안 추고 mysqld 를 한 번만 띄우니 "ready for connections" 가 한 번만
+  # 찍힌다. 그러면 위 루프가 조건을 못 만족한 채 60초를 그냥 다 쓰고 넘어온다
+  # — 즉 재기동 시나리오에서는 이미 60초를 공회전한 뒤에야 아래 재시도가
+  # 시작된다. 10M행 InnoDB 복구(redo log replay)가 그보다 더 걸리는 경우가
+  # 실측으로 나왔다(재사용 경로에서 80초 전부 소진 후 실패) — 재시도 횟수를
+  # 넉넉히 늘린다(최대 4분 추가).
+  for i in $(seq 1 240); do
     docker exec "$c" mysql -uroot -p"$MYROOT_PW" -e "SELECT 1" >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  [중단] $c 가 로그엔 ready 인데 실제 접속이 20초 안에 안 된다 — docker logs $c 로 확인하라." >&2
+  echo "  [중단] $c 가 로그엔 ready 인데 실제 접속이 4분 안에 안 된다 — docker logs $c 로 확인하라." >&2
   return 1
 }
 

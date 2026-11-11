@@ -23,11 +23,14 @@ wait_container_ready() {
     [ "$(docker logs "$c" 2>&1 | grep -c 'database system is ready to accept connections')" -ge 1 ] && break
     sleep 1
   done
-  for i in $(seq 1 30); do
+  # ⚠️ mysql-osc 에서 실측으로 겪었다 — 멈춘 컨테이너를 재기동할 때 대량의
+  # 데이터(10M행)면 복구(WAL replay)에 30초보다 더 걸릴 수 있다. 재시도를
+  # 넉넉히 늘린다(최대 4분).
+  for i in $(seq 1 240); do
     docker exec -u postgres "$c" psql -U postgres -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  [중단] $c 가 로그엔 ready 인데 실제 접속이 30초 안에 안 된다 — docker logs $c 로 확인하라." >&2
+  echo "  [중단] $c 가 로그엔 ready 인데 실제 접속이 4분 안에 안 된다 — docker logs $c 로 확인하라." >&2
   return 1
 }
 

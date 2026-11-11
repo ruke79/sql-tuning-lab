@@ -12,10 +12,10 @@ wait_container_ready() {
     docker logs "$c" 2>&1 | grep -q 'database system is ready to accept connections' && break
     sleep 1
   done
-  for i in $(seq 1 20); do
+  for i in $(seq 1 240); do
     docker exec -u postgres "$c" psql -U postgres -d postgres -c "SELECT 1" >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  [중단] $c 가 로그엔 ready 인데 실제 접속이 20초 안에 안 된다." >&2
+  echo "  [중단] $c 가 로그엔 ready 인데 실제 접속이 4분 안에 안 된다." >&2
   return 1
 }

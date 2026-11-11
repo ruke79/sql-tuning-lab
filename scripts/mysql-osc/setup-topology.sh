@@ -62,7 +62,20 @@ if [ "${existing:-0}" -ge 3 ] && [ "${FORCE:-0}" != "1" ]; then
   # 전에 멈춰 있으면 먼저 켠다 — `docker start`는 이미 돈다면 그냥 no-op다.
   echo "  이미 ${existing}개 있다 — 멈춰 있으면 켜고 그대로 쓴다(FORCE=1 로 다시 만들 수 있다)."
   docker start osc-primary osc-replica1 osc-replica2 >/dev/null 2>&1
-  wait_container_ready osc-primary || exit 1
+  # ⚠️★사고 실측★ — 여기서 wait 가 실패하면 "중단"으로 간주해 trap(on_abort)이
+  # 돌면서 osc_cleanup() 이 **이미 있던 10M행 데이터를 통째로 지웠다**(docker
+  # rm -fv, 볼륨까지). 10M행 InnoDB 가 멈췄다가 재기동하면 복구(redo log
+  # replay)에 wait_container_ready() 의 기본 대기(최대 80초)보다 더 걸릴 수
+  # 있는데, 그게 "실패"가 아니라 "느린 성공"인데도 cleanup 이 발동됐다.
+  # 재사용 경로에서는 **느려도 데이터를 지우면 안 된다** — trap 을 먼저 끄고
+  # 안내만 하고 나간다(컨테이너를 그대로 둬서 사람이 `docker logs osc-primary`
+  # 로 보거나, 몇 초 더 뒤에 다시 이 스크립트를 돌리게 한다).
+  if ! wait_container_ready osc-primary; then
+    trap - EXIT INT TERM
+    echo "  [중단] 10M행 InnoDB 복구가 느릴 수 있다 — 데이터는 그대로 뒀다(지우지 않음)."
+    echo "         docker logs osc-primary 로 진행 상황을 보고, 좀 더 기다린 뒤 이 스크립트를 다시 돌려라."
+    exit 1
+  fi
   cnt=$(P "SELECT count(*) FROM osctest.orders" 2>/dev/null | tail -1)
   echo "  osctest.orders 행 수: ${cnt:-?}"
   LAB_DONE=1
