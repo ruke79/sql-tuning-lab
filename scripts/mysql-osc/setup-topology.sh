@@ -83,6 +83,15 @@ if [ "${existing:-0}" -ge 3 ] && [ "${FORCE:-0}" != "1" ]; then
 fi
 osc_cleanup
 
+# ⚠️ docker run 이 `-v 호스트경로:컨테이너경로` 에서 **호스트 쪽 경로가 아직
+# 없으면 디렉터리로 자동 생성**한다. 이전 실행이 중간에 끊기는 등으로 이
+# .cnf 파일들이 아직 안 쓰인 채로 `docker run` 이 먼저 실행된 적이 있으면,
+# 다음 실행에서 `cat > "$SC/my-primary.cnf"` 가 "Is a directory" 로 막힌다
+# (실측: 이걸로 세 파일 다 실패했고, 그 결과 커스텀 설정[mysql-native-
+# password=ON 포함]이 컨테이너에 전혀 안 들어가서 "Plugin 'mysql_native_
+# password' is not loaded" 로 복제 배선까지 줄줄이 실패했다 — 증상은
+# 두 개였지만 원인은 하나였다). 매번 새로 쓰기 전에 지운다.
+rm -rf "$SC/my-primary.cnf" "$SC/my-replica1.cnf" "$SC/my-replica2.cnf"
 mkdir -p "$SC"
 cat > "$SC/my-primary.cnf" <<EOF
 [mysqld]
