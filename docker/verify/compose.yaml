@@ -16,7 +16,7 @@ services:
       POSTGRES_USER: verifylab
       POSTGRES_PASSWORD: verifylab
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     command:
       - "postgres"
       - "-c"
@@ -37,7 +37,7 @@ services:
     ports:
       # 클라이언트는 첫 접속 뒤 브로커가 알려 주는 advertised 주소로 다시 접속하므로
       # 호스트 포트와 advertised 포트가 같아야 한다 — 그래서 이 포트만은 고정한다.
-      - "${KAFKA_PORT:-9092}:19092"
+      - "127.0.0.1:${KAFKA_PORT:-9092}:19092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -61,7 +61,7 @@ services:
     image: grafana/grafana-oss:11.2.0
     container_name: verifylab-grafana
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
