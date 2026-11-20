@@ -3,7 +3,8 @@
 ベンチマークデータセット5種（TPC-H, TPC-DS, pgbench, sysbench, GitHub Archive）で
 SQL チューニングを検証する Spring Boot（Java 17）+ Gradle マルチモジュールプロジェクトです。
 以下は実際に測定した主な結果です。詳細は
-[docs/experiments.md](docs/experiments.md) を参照してください。
+[docs/experiments-ja.md](docs/experiments-ja.md)（実測値のみを抜き出した日本語サマリ）
+または [docs/experiments.md](docs/experiments.md)（韓国語・手順と考察を含む全文）を参照してください。
 
 ## 主な実測結果
 
