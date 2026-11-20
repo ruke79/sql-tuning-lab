@@ -1,0 +1,38 @@
+NOTICE — Third-party material and benchmark disclaimers
+=======================================================
+
+The MIT License in LICENSE applies to the original code, scripts and
+documentation in this repository. It does NOT apply to the third-party
+material described below.
+
+Benchmark query text
+--------------------
+Files under `tpch/src/main/resources/queries/` and
+`tpcds/src/main/resources/queries/` are derived from the query sets published
+in the TPC-H and TPC-DS specifications. Those specifications and their query
+text are copyright of the Transaction Processing Performance Council (TPC).
+They are included here for study and reproduction purposes only and are not
+licensed under the MIT License above. See https://www.tpc.org/ for the
+applicable terms.
+
+Benchmark tools and data generators
+-----------------------------------
+This repository does NOT bundle any benchmark tool or data generator.
+The scripts under `scripts/` invoke tools that the user obtains separately,
+each under its own license:
+
+  - TPC-H dbgen / TPC-DS dsdgen, dsqgen — Transaction Processing
+    Performance Council (TPC), under the TPC's own end user licence
+  - pgbench — part of PostgreSQL, PostgreSQL License
+  - sysbench — GNU General Public License v2
+  - gh-ost — GitHub, Apache License 2.0
+  - ClickHouse — Apache License 2.0
+  - GH Archive data — see https://www.gharchive.org/ for terms
+
+Measurement results
+-------------------
+The figures published in this repository are measurements taken on the
+author's own hardware for learning purposes. They are NOT audited or
+published TPC benchmark results, must not be compared with official TPC
+results, and no TPC compliance is claimed. Where a measurement has not been
+performed, the documentation states so explicitly ("未検証" / not verified).
