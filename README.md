@@ -3,7 +3,7 @@
 ベンチマークデータセット5種（TPC-H, TPC-DS, pgbench, sysbench, GitHub Archive）で
 SQL チューニングを検証する Spring Boot（Java 17）+ Gradle マルチモジュールプロジェクトです。
 以下は実際に測定した主な結果です。詳細は
-[docs/2003-오라일리-튜닝북-실습-매핑.md](docs/2003-오라일리-튜닝북-실습-매핑.md) を参照してください。
+[docs/experiments.md](docs/experiments.md) を参照してください。
 
 ## 主な実測結果
 
@@ -26,7 +26,7 @@ gh-ost の cutover を当初「6〜12ms」と記録していましたが、背�
 書き直し、1,000万行で測り直した結果が上記の値です（約100〜200倍の差）。
 この測定バグは PostgreSQL 側の結果にも影響していたため、関連する記述もあわせて訂正しました。
 
-→ → コミットログの「gh-ost cutover 6-12ms 再検証完了」を参照`
+→ 訂正の経緯は [コミット 5e33b1e](https://github.com/ruke79/sql-tuning-lab/commit/5e33b1e) に残しています。
 
 ### PostgreSQL の cutover が常に約1,034ms だった真因
 
@@ -842,7 +842,7 @@ INSTANT도 INPLACE도 거부된다** — gh-ost·pt-online-schema-change가 존�
 자릿수가 다르다. 정상 replica 대조군은 231.8초에 완료(쓰로틀 0회), 74초 지연시킨
 replica 처치군은 450초 타임아웃까지 쓰로틀 449회로 못 끝냈다. 자세한 수치와 겪은
 함정(8.4의 `mysql_native_password` 기본 비활성화, gh-ost의 replica 직접 접속 계정
-문제, Docker 익명 볼륨 고아 등)은 매핑 문서 **[§X-2](docs/2003-오라일리-튜닝북-실습-매핑.md#x-2--무정지-스키마-변경--intbigint-네이티브-copy-vs-gh-ost)**.
+문제, Docker 익명 볼륨 고아 등)은 매핑 문서 **[§X-2](docs/experiments.md#x-2--무정지-스키마-변경--intbigint-네이티브-copy-vs-gh-ost)**.
 
 ## DB 파라미터 튜닝
 
@@ -853,7 +853,7 @@ replica 처치군은 450초 타임아웃까지 쓰로틀 449회로 못 끝냈다
 ## 튜닝 서적 기반 실습 코스
 
 Dan Tow 《SQL Tuning》, Cary Millsap 《Optimizing Oracle Performance》의 장별 개념을
-실행 가능한 실습으로 매핑한 문서: **[docs/2003-오라일리-튜닝북-실습-매핑.md](docs/2003-오라일리-튜닝북-실습-매핑.md)**
+실행 가능한 실습으로 매핑한 문서: **[docs/experiments.md](docs/experiments.md)**
 (8주 권장 코스와 Oracle 용어 → PostgreSQL/MySQL 대응표 포함)
 
 ## 튜닝 시나리오 ↔ 실습 매핑
@@ -950,7 +950,7 @@ graph TD
         s_osc["scripts/mysql-osc/<br/>setup-topology · t-online-ddl · teardown<br/>(무정지 스키마 변경, §X-2)"]
     end
 
-    docs["docs/2003-오라일리-튜닝북-실습-매핑.md"]
+    docs["docs/experiments.md"]
 
     tpch -. "schema/load/index" .-> pg
     tpch -. "schema/load/index" .-> my
